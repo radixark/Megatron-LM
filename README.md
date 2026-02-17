@@ -1,3 +1,5 @@
+NOTE: This is a fork of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) to accommodate non-merged patches to Megatron.
+
 <div align="center">
 
 Megatron-LM and Megatron Core
