@@ -42,6 +42,7 @@ class Router(ABC, MegatronModule):
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
+        self.is_mtp = False
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -513,6 +514,7 @@ class TopKRouter(Router):
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
+                is_mtp=self.is_mtp,
             )
 
         # Apply token dropping to probs and routing_map.
