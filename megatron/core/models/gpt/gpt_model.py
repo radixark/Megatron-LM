@@ -488,6 +488,7 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        mtp_kwargs: Optional[dict] = {},
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -560,6 +561,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            mtp_kwargs=mtp_kwargs,
         )
 
     def _postprocess(
@@ -581,6 +583,7 @@ class GPTModel(LanguageModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
+        mtp_kwargs={},
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -595,7 +598,7 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess:
+        if mtp_in_postprocess and mtp_kwargs.get('mtp_labels', None) is not None:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -615,9 +618,10 @@ class GPTModel(LanguageModule):
             return hidden_states
 
         if self.config.mtp_num_layers:
+            mtp_labels = mtp_kwargs.get('mtp_labels', None) if mtp_kwargs else None
             hidden_states = process_mtp_loss(
                 hidden_states=hidden_states,
-                labels=labels,
+                labels=mtp_labels if mtp_labels is not None else labels,
                 loss_mask=loss_mask,
                 output_layer=self.output_layer,
                 output_weight=output_weight,
@@ -627,6 +631,7 @@ class GPTModel(LanguageModule):
                 config=self.config,
                 cp_group=self.pg_collection.cp,
                 packed_seq_params=packed_seq_params,
+                detach_output_weight=mtp_labels is not None,
             )
         sequence_parallel_override = False
 

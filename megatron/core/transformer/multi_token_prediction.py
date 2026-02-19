@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 from torch import Tensor
+import warnings
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -624,6 +625,7 @@ def process_mtp_loss(
     config: TransformerConfig,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
+    detach_output_weight: bool = False,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -642,6 +644,8 @@ def process_mtp_loss(
         config (TransformerConfig): Model configuration containing mtp_num_layers etc.
         cp_group (Optional[ProcessGroup]): Context parallelism process group.
         packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
+        detach_output_weight (bool): If True, detach output_weight to prevent MTP gradient
+            flowing to the output layer (useful for RL training). Defaults to False.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -671,9 +675,13 @@ def process_mtp_loss(
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
+        mtp_output_weight = (
+            output_weight.detach() if detach_output_weight and output_weight is not None
+            else output_weight
+        )
         output_layer_kwargs = dict(
             input_=hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
+            weight=mtp_output_weight,
             runtime_gather_output=runtime_gather_output,
         )
         if fuse_linear_cross_entropy:
@@ -880,17 +888,19 @@ class MultiTokenPredictionLayer(MegatronModule):
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
         )
-        position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
+        if position_ids is not None:
+            position_ids, _ = roll_tensor(
+                position_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        decoder_input = decoder_input.detach()
 
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=False)
 
         return input_ids, position_ids, decoder_input, hidden_states
 
@@ -1001,6 +1011,51 @@ class MultiTokenPredictionLayer(MegatronModule):
         return hidden_states
 
     def _checkpointed_forward(self, forward_func, *args, **kwargs):
+        """Wrap `forward_func` with activation checkpointing while only passing tensors.
+
+        Non-tensor arguments (e.g., configuration objects, None) are captured via closure so
+        that checkpoint implementations never receive them directly, avoiding save_for_backward
+        issues with non-tensor inputs.
+        """
+
+        # TODO(jiajun): Is there any better implementation here?
+        positional_specs = []
+        kw_specs = []
+        tensor_args: List[torch.Tensor] = []
+
+        for arg in args:
+            if torch.is_tensor(arg):
+                positional_specs.append(('tensor', len(tensor_args)))
+                tensor_args.append(arg)
+            else:
+                positional_specs.append(('const', arg))
+
+        for key, value in kwargs.items():
+            if torch.is_tensor(value):
+                kw_specs.append((key, ('tensor', len(tensor_args))))
+                tensor_args.append(value)
+            else:
+                kw_specs.append((key, ('const', value)))
+
+        def run(*flat_tensor_args):
+            rebuilt_args = []
+            for spec_type, payload in positional_specs:
+                if spec_type == 'tensor':
+                    rebuilt_args.append(flat_tensor_args[payload])
+                else:
+                    rebuilt_args.append(payload)
+
+            rebuilt_kwargs = {}
+            for key, (spec_type, payload) in kw_specs:
+                if spec_type == 'tensor':
+                    rebuilt_kwargs[key] = flat_tensor_args[payload]
+                else:
+                    rebuilt_kwargs[key] = payload
+
+            return forward_func(*rebuilt_args, **rebuilt_kwargs)
+
+        tensor_args_tuple = tuple(tensor_args)
+
         def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             if self.config.fp8:
@@ -1011,12 +1066,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
-                    *args,
-                    **kwargs,
+                    *tensor_args_tuple,
                 )
             else:
                 return tensor_parallel.checkpoint(
-                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
+                    run, self.config.distribute_saved_activations, *tensor_args_tuple
                 )
 
         if self.config.recompute_method == 'uniform':
