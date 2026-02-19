@@ -128,6 +128,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
+
 class MoELayer(BaseMoELayer):
     """Mixture of Experts layer.
 
