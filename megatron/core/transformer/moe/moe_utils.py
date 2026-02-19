@@ -537,6 +537,7 @@ def topk_routing_with_score_function(
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
+    is_mtp: bool = False,
 ):
     """Compute the routing probabilities and map for top-k selection with score function.
     Args:
@@ -588,7 +589,10 @@ def topk_routing_with_score_function(
             return torch.topk(scores, k=topk, dim=1)
 
     from miles.utils.replay_base import routing_replay_manager
-    compute_topk = routing_replay_manager.get_topk_fn(compute_topk, return_probs=True)
+
+    # MTP layers cannot use rollout routing replay
+    if not is_mtp:
+        compute_topk = routing_replay_manager.get_topk_fn(compute_topk, return_probs=True)
 
     if score_function == "softmax":
         if use_pre_softmax:
