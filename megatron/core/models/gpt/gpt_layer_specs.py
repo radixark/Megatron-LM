@@ -184,6 +184,8 @@ def get_gpt_layer_with_transformer_engine_submodules(
     fallback_to_eager_attn: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -264,9 +266,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
             pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
@@ -287,9 +291,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
             pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
             sharded_state_dict_keys_map={
                 "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                 "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
