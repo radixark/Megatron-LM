@@ -599,6 +599,7 @@ class _ParamAndGradBuffer:
         param_indices: List[int],
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        grad_mem_alloc_context=None,
     ):
 
         if pg_collection is None:
@@ -754,6 +755,9 @@ class _ParamAndGradBuffer:
         self.param_data = None
 
         if self.nccl_ub:
+            assert grad_mem_alloc_context is None, (
+                "grad_mem_alloc_context is not supported with nccl_ub=True"
+            )
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
             nccl_allocator.init()
             pool = nccl_allocator.create_nccl_mem_pool(
@@ -772,8 +776,7 @@ class _ParamAndGradBuffer:
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
         else:
-            # If nccl_ub is False, mem_alloc_context is nullcontext.
-            mem_alloc_context = nullcontext
+            mem_alloc_context = grad_mem_alloc_context if grad_mem_alloc_context is not None else nullcontext
 
         with mem_alloc_context():
             # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency

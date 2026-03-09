@@ -1321,6 +1321,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
+        ddp_extra_kwargs = {}
+        if getattr(args, 'grad_mem_alloc_context', None) is not None:
+            ddp_extra_kwargs['grad_mem_alloc_context'] = args.grad_mem_alloc_context
+
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
         ddp_stream = torch.cuda.Stream()
@@ -1337,6 +1341,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     # model chunks is overlapped with compute anyway.
                     disable_bucketing=(model_chunk_idx > 0)
                     or args.overlap_param_gather_with_optimizer_step,
+                    **ddp_extra_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]

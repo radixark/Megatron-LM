@@ -45,6 +45,7 @@ class DistributedDataParallel(_BaseDataParallel):
         module: torch.nn.Module,
         disable_bucketing: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        grad_mem_alloc_context=None,
     ):
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -209,6 +210,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
                         self.ddp_config.nccl_ub,
                         pg_collection,
+                        grad_mem_alloc_context=grad_mem_alloc_context,
                     )
                 )
 
