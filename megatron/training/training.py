@@ -1324,6 +1324,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_extra_kwargs = {}
         if getattr(args, 'disable_grad_buffers_cpu_backup', False):
             ddp_extra_kwargs['disable_grad_buffers_cpu_backup'] = True
+        if getattr(args, 'disable_param_buffers_cpu_backup', False):
+            ddp_extra_kwargs['disable_param_buffers_cpu_backup'] = True
 
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.

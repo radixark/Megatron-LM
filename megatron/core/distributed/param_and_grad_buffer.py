@@ -600,6 +600,7 @@ class _ParamAndGradBuffer:
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
         disable_grad_buffers_cpu_backup: bool = False,
+        disable_param_buffers_cpu_backup: bool = False,
     ):
 
         if pg_collection is None:
@@ -755,8 +756,8 @@ class _ParamAndGradBuffer:
         self.param_data = None
 
         if self.nccl_ub:
-            assert not disable_grad_buffers_cpu_backup, (
-                "disable_grad_buffers_cpu_backup is not supported with nccl_ub=True"
+            assert not disable_grad_buffers_cpu_backup and not disable_param_buffers_cpu_backup, (
+                "disable_grad/param_buffers_cpu_backup is not supported with nccl_ub=True"
             )
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
             nccl_allocator.init()
@@ -787,16 +788,19 @@ class _ParamAndGradBuffer:
             else:
                 mem_alloc_context = nullcontext
 
-        if disable_grad_buffers_cpu_backup:
-            from torch_memory_saver import torch_memory_saver
+        def _make_no_backup_context(tag, disable):
+            if disable:
+                from torch_memory_saver import torch_memory_saver
 
-            grad_mem_alloc_context = partial(
-                torch_memory_saver.region,
-                tag="grad_buffer",
-                enable_cpu_backup=False,
-            )
-        else:
-            grad_mem_alloc_context = nullcontext
+                return partial(
+                    torch_memory_saver.region,
+                    tag=tag,
+                    enable_cpu_backup=False,
+                )
+            return nullcontext
+
+        grad_mem_alloc_context = _make_no_backup_context("grad_buffer", disable_grad_buffers_cpu_backup)
+        param_mem_alloc_context = _make_no_backup_context("param_buffer", disable_param_buffers_cpu_backup)
 
         with mem_alloc_context():
             # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
@@ -820,12 +824,13 @@ class _ParamAndGradBuffer:
             else:
                 # Only re-map param tensors if using distributed optimizer.
                 if self.ddp_config.use_distributed_optimizer:
-                    self.param_data = torch.zeros(
-                        self.numel,
-                        dtype=self.param_dtype,
-                        device=torch.cuda.current_device(),
-                        requires_grad=False,
-                    )
+                    with param_mem_alloc_context():
+                        self.param_data = torch.zeros(
+                            self.numel,
+                            dtype=self.param_dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
                 with grad_mem_alloc_context():
                     self.grad_data = torch.zeros(
                         self.numel,
