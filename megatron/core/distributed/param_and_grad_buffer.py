@@ -777,16 +777,9 @@ class _ParamAndGradBuffer:
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
         else:
-            if disable_grad_buffers_cpu_backup:
-                from torch_memory_saver import torch_memory_saver
-
-                mem_alloc_context = partial(
-                    torch_memory_saver.region,
-                    tag="grad_buffer",
-                    enable_cpu_backup=False,
-                )
-            else:
-                mem_alloc_context = nullcontext
+            # If nccl_ub is False, mem_alloc_context is nullcontext.
+            # Individual param/grad contexts below handle TMS regions separately.
+            mem_alloc_context = nullcontext
 
         def _make_no_backup_context(tag, disable):
             if disable:
