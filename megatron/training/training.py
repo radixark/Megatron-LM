@@ -1322,8 +1322,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
         ddp_extra_kwargs = {}
-        if getattr(args, 'grad_mem_alloc_context', None) is not None:
-            ddp_extra_kwargs['grad_mem_alloc_context'] = args.grad_mem_alloc_context
+        if getattr(args, 'disable_grad_buffers_cpu_backup', False):
+            ddp_extra_kwargs['disable_grad_buffers_cpu_backup'] = True
 
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
