@@ -776,16 +776,19 @@ class _ParamAndGradBuffer:
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
         else:
-            if disable_grad_buffers_cpu_backup:
-                from torch_memory_saver import torch_memory_saver
+            # If nccl_ub is False, mem_alloc_context is nullcontext.
+            mem_alloc_context = nullcontext
 
-                mem_alloc_context = partial(
-                    torch_memory_saver.region,
-                    tag="grad_buffer",
-                    enable_cpu_backup=False,
-                )
-            else:
-                mem_alloc_context = nullcontext
+        if disable_grad_buffers_cpu_backup:
+            from torch_memory_saver import torch_memory_saver
+
+            grad_mem_alloc_context = partial(
+                torch_memory_saver.region,
+                tag="grad_buffer",
+                enable_cpu_backup=False,
+            )
+        else:
+            grad_mem_alloc_context = nullcontext
 
         with mem_alloc_context():
             # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
@@ -815,12 +818,13 @@ class _ParamAndGradBuffer:
                         device=torch.cuda.current_device(),
                         requires_grad=False,
                     )
-                self.grad_data = torch.zeros(
-                    self.numel,
-                    dtype=self.grad_dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
-                )
+                with grad_mem_alloc_context():
+                    self.grad_data = torch.zeros(
+                        self.numel,
+                        dtype=self.grad_dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
 
         self.grad_data_size = 0
         self.param_data_size = 0
