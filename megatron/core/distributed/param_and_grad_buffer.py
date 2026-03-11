@@ -777,7 +777,7 @@ class _ParamAndGradBuffer:
             torch.distributed.barrier()
         else:
             if disable_grad_buffers_cpu_backup:
-                import torch_memory_saver
+                from torch_memory_saver import torch_memory_saver
 
                 mem_alloc_context = partial(
                     torch_memory_saver.region,
