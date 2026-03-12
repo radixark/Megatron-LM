@@ -2196,6 +2196,9 @@ def _add_checkpointing_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--low-memory-resume', action='store_true', default=False,
+                       help='Allocate optimizer states on CPU during distributed optimizer checkpoint loading '
+                       'to prevent GPU OOM on large peak memory.')
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')

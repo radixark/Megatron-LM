@@ -330,6 +330,9 @@ class OptimizerConfig:
     reload them before the next optimizer step.
     """
 
+    low_memory_resume: bool = False
+    """If True, allocate optimizer states on CPU during checkpoint loading to prevent GPU OOM."""
+
     ################
     # Miscellaneous
     ################

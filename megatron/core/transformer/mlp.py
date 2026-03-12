@@ -334,6 +334,9 @@ def apply_swiglu_sharded_factory(
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():
+            from megatron.training import get_args
+            if get_args().low_memory_resume:
+                return torch.cat([t.cpu() for t in sub_state_dict])
             try:
                 return torch.cat(sub_state_dict)
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:

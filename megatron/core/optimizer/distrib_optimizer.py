@@ -56,6 +56,7 @@ from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
+from .fused_adam_patch import apply_fused_adam_patch, is_patch_applied
 
 logger = getLogger(__name__)
 
@@ -810,8 +811,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                             # Allocate dummy tensors.
                             numel = len(param_range_map["gbuf_world"])
-                            init_shard = lambda dtype=torch.float32: torch.empty(
-                                (numel,), dtype=dtype, device=torch.cuda.current_device()
+                            low_mem_resume = self.config.low_memory_resume
+                            if low_mem_resume and USING_TE_OPTIMIZER and not is_patch_applied():
+                                apply_fused_adam_patch()
+                            init_device = 'cpu' if low_mem_resume else torch.cuda.current_device()
+                            init_shard = lambda dtype=torch.float32, _device=init_device: torch.empty(
+                                (numel,), dtype=dtype, device=_device
                             )
 
                             # For precision_aware_optimizer, the empty tensors should also be
@@ -902,6 +907,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.load_parameter_state_from_fs_model_space(param_state)
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
+
+            if self.config.low_memory_resume:
+                for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor) and v.device.type == 'cpu':
+                            state[k] = v.to(torch.cuda.current_device())
 
     def _get_main_param_and_optimizer_states(self, model_param):
         """Return a dict containing the main param and optimizer states corresponding to the input
