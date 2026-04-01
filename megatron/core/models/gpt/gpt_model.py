@@ -125,6 +125,7 @@ class GPTModel(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+        self._pre_decoder_hooks: list = []
 
         if hasattr(self.config, 'position_embedding_type'):
             self.position_embedding_type = self.config.position_embedding_type
@@ -473,6 +474,14 @@ class GPTModel(LanguageModule):
                     off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
 
+    def register_pre_decoder_hook(self, hook) -> None:
+        """Register a hook called between _preprocess and decoder.
+
+        The hook signature is ``hook(model, decoder_input) -> decoder_input``.
+        Multiple hooks are called in registration order.
+        """
+        self._pre_decoder_hooks.append(hook)
+
     def forward(
         self,
         input_ids: Tensor,
@@ -527,6 +536,12 @@ class GPTModel(LanguageModule):
         ) = preproc_output[:6]
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
+
+        # Pre-decoder hooks: allow external code to transform decoder_input
+        # before it enters the decoder. Hooks are registered via
+        # register_pre_decoder_hook() and called in registration order.
+        for hook in getattr(self, '_pre_decoder_hooks', []):
+            decoder_input = hook(self, decoder_input)
 
         # Run decoder.
         hidden_states = self.decoder(
