@@ -211,6 +211,10 @@ class PostProcessNode(ScheduleNode):
             The logits or loss depending on whether labels are provided.
         """
 
+        witness_ids = getattr(self.chunk_state, 'witness_ids', None)
+        if hasattr(self.gpt_model, 'tail_witness') and witness_ids is not None:
+            hidden_states = hidden_states + self.gpt_model.tail_witness(witness_ids)
+
         empty_decoder = len(self.gpt_model.decoder.layers) == 0
         layer_norm = self.gpt_model.decoder.final_layernorm
         if not self.gpt_model.config.mtp_num_layers and empty_decoder and layer_norm:

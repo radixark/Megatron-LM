@@ -551,6 +551,9 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
+        if hasattr(self, 'tail_witness') and witness_ids is not None:
+            hidden_states = hidden_states + self.tail_witness(witness_ids)
+
         return self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
