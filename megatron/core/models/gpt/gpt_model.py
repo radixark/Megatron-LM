@@ -540,7 +540,7 @@ class GPTModel(LanguageModule):
         # Pre-decoder hooks: allow external code to transform decoder_input
         # before it enters the decoder. Hooks are registered via
         # register_pre_decoder_hook() and called in registration order.
-        for hook in getattr(self, '_pre_decoder_hooks', []):
+        for hook in self._pre_decoder_hooks:
             decoder_input = hook(self, decoder_input)
 
         # Run decoder.
