@@ -537,9 +537,6 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
-        # Pre-decoder hooks: allow external code to transform decoder_input
-        # before it enters the decoder. Hooks are registered via
-        # register_pre_decoder_hook() and called in registration order.
         for hook in self._pre_decoder_hooks:
             decoder_input = hook(self, decoder_input)
 
