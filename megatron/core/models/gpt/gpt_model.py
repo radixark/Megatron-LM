@@ -808,6 +808,7 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        witness_ids: Optional[Tensor] = None,
     ):
         """Builds a computation schedule plan for the model.
 
@@ -856,6 +857,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output,
             loss_mask,
             padding_mask,
+            witness_ids=witness_ids,
         )
 
     def sharded_state_dict(
