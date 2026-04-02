@@ -158,15 +158,6 @@ class PreProcessNode(ScheduleNode):
             padding_mask=self.chunk_state.padding_mask,
         )
 
-        # Data witness: add zero-output gradient probe (same logic as GPTModel.forward)
-        witness_ids = getattr(self.chunk_state, 'witness_ids', None)
-        if hasattr(self.gpt_model, 'head_witness') and witness_ids is not None:
-            witness_out = self.gpt_model.head_witness(witness_ids)
-            if decoder_input is not None:
-                decoder_input = decoder_input + witness_out
-            else:
-                self.gpt_model.decoder.input_tensor = self.gpt_model.decoder.input_tensor + witness_out
-
         # Saved for later use
         self.chunk_state.decoder_input = decoder_input
         self.chunk_state.rotary_pos_emb = rotary_pos_emb
@@ -210,10 +201,6 @@ class PostProcessNode(ScheduleNode):
         Returns:
             The logits or loss depending on whether labels are provided.
         """
-
-        witness_ids = getattr(self.chunk_state, 'witness_ids', None)
-        if hasattr(self.gpt_model, 'tail_witness') and witness_ids is not None:
-            hidden_states = hidden_states + self.gpt_model.tail_witness(witness_ids)
 
         empty_decoder = len(self.gpt_model.decoder.layers) == 0
         layer_norm = self.gpt_model.decoder.final_layernorm
