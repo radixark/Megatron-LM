@@ -529,7 +529,7 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
-        if hasattr(self, 'head_witness') and witness_ids is not None:
+        if witness_ids is not None:
             witness_out = self.head_witness(witness_ids)
             if decoder_input is not None:
                 decoder_input = decoder_input + witness_out
@@ -551,7 +551,7 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
-        if hasattr(self, 'tail_witness') and witness_ids is not None:
+        if witness_ids is not None:
             hidden_states = hidden_states + self.tail_witness(witness_ids)
 
         return self._postprocess(
