@@ -531,6 +531,8 @@ class GPTModel(LanguageModule):
 
         if witness_ids is not None:
             witness_out = self.head_witness(input_ids=input_ids, witness_ids=witness_ids)
+            # Transpose from [b, s, 1] to [s, b, 1] to match Megatron's SBH layout
+            witness_out = witness_out.transpose(0, 1).contiguous()
             if decoder_input is not None:
                 decoder_input = decoder_input + witness_out
             else:
@@ -552,7 +554,9 @@ class GPTModel(LanguageModule):
         )
 
         if witness_ids is not None:
-            hidden_states = hidden_states + self.tail_witness(input_ids=input_ids, witness_ids=witness_ids)
+            tail_out = self.tail_witness(input_ids=input_ids, witness_ids=witness_ids)
+            tail_out = tail_out.transpose(0, 1).contiguous()
+            hidden_states = hidden_states + tail_out
 
         return self._postprocess(
             hidden_states=hidden_states,
