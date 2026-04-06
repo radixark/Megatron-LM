@@ -529,8 +529,7 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
-        if witness_ids is not None and self.pre_process:
-            assert hasattr(self, "head_witness"), "pre_process stage must have head_witness when witness_ids is provided"
+        if witness_ids is not None and hasattr(self, "head_witness"):
             witness_out = self.head_witness(input_ids=input_ids, witness_ids=witness_ids)
             # Transpose from [b, s, 1] to [s, b, 1] to match Megatron's SBH layout
             witness_out = witness_out.transpose(0, 1).contiguous()
@@ -558,8 +557,7 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
-        if witness_ids is not None and self.post_process:
-            assert hasattr(self, "tail_witness"), "post_process stage must have tail_witness when witness_ids is provided"
+        if witness_ids is not None and hasattr(self, "tail_witness"):
             tail_out = self.tail_witness(input_ids=input_ids, witness_ids=witness_ids)
             tail_out = tail_out.transpose(0, 1).contiguous()
             if self.config.sequence_parallel:
