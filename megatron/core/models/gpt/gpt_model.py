@@ -529,8 +529,8 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
-        if witness_ids is not None and hasattr(self, "head_witness"):
-            witness_out = self.head_witness(input_ids=input_ids, witness_ids=witness_ids)
+        if witness_ids is not None and hasattr(self, "local_head_witness"):
+            witness_out = self.local_head_witness(input_ids=input_ids, witness_ids=witness_ids)
             # Transpose from [b, s, 1] to [s, b, 1] to match Megatron's SBH layout
             witness_out = witness_out.transpose(0, 1).contiguous()
             # Scatter along seq dim when sequence-parallel is active, matching the
@@ -557,8 +557,8 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
-        if witness_ids is not None and hasattr(self, "tail_witness"):
-            tail_out = self.tail_witness(input_ids=input_ids, witness_ids=witness_ids)
+        if witness_ids is not None and hasattr(self, "local_tail_witness"):
+            tail_out = self.local_tail_witness(input_ids=input_ids, witness_ids=witness_ids)
             tail_out = tail_out.transpose(0, 1).contiguous()
             if self.config.sequence_parallel:
                 tail_out = tensor_parallel.scatter_to_sequence_parallel_region(tail_out)
