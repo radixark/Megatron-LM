@@ -558,11 +558,13 @@ class GPTModel(LanguageModule):
         )
 
         if witness_ids is not None and hasattr(self, "local_tail_witness"):
+            from miles.utils.witness.module import witness_broadcast_add
+
             tail_out = self.local_tail_witness(input_ids=input_ids, witness_ids=witness_ids)
             tail_out = tail_out.transpose(0, 1).contiguous()
             if self.config.sequence_parallel:
                 tail_out = tensor_parallel.scatter_to_sequence_parallel_region(tail_out)
-            hidden_states = hidden_states + tail_out
+            hidden_states = witness_broadcast_add(hidden_states, tail_out)
 
         return self._postprocess(
             hidden_states=hidden_states,
