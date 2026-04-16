@@ -1274,6 +1274,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # After TE2.x: Below function is an empty function and does nothing.
     correct_amax_history_if_needed(model)
 
+    # Miles allows selected parameters to opt out of Float16Module's global
+    # bf16/fp16 cast. Restore those dtypes immediately after model materialization.
+    from miles.backends.megatron_utils.fp32_param_utils import enforce_marked_param_dtypes
+
+    enforce_marked_param_dtypes(model)
+
     if wrap_with_ddp:
         if args.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
