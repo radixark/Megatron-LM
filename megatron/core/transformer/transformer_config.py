@@ -508,6 +508,9 @@ class TransformerConfig(ModelParallelConfig):
     use_sglang: bool = False
     """Use the correctness-first SGLang-compatible Megatron backend surface."""
 
+    true_on_policy_vocab_size: Optional[int] = None
+    """Optional non-padded vocab size for SGLang-compatible scoring logits."""
+
     use_kitchen_attention: bool = False
     """Use the kitchen extension for attention (instead of TE's attention)."""
 
@@ -2042,6 +2045,8 @@ class TransformerConfig(ModelParallelConfig):
                 f"but got {self.transformer_impl=}."
             )
             assert not self.use_kitchen, "use_sglang is not compatible with use_kitchen."
+        if self.true_on_policy_vocab_size is not None:
+            assert self.true_on_policy_vocab_size > 0, "true_on_policy_vocab_size must be > 0."
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
