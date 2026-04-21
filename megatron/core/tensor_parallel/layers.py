@@ -805,6 +805,8 @@ class ColumnParallelLinear(torch.nn.Module):
             delay and fuse reduction along with other gradients for performance optimization.
     """
 
+    backend_name = "local"
+
     def __init__(
         self,
         input_size,
@@ -1136,6 +1138,8 @@ class RowParallelLinear(torch.nn.Module):
             ModelParallelConfig object
 
     """
+
+    backend_name = "local"
 
     def __init__(
         self,
