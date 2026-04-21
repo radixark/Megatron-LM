@@ -33,6 +33,43 @@ def _reduce(input_, group):
     return input_
 
 
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _tree_reduce_sum_from_gathered(gathered):
+    """Reduce gathered TP partials with a fixed pairwise tree order."""
+    partials = list(torch.unbind(gathered, dim=0))
+
+    while len(partials) > 1:
+        next_partials = []
+        for index in range(0, len(partials), 2):
+            next_partials.append(partials[index] + partials[index + 1])
+        partials = next_partials
+
+    return partials[0]
+
+
+def _tree_all_reduce_sum(input_, group):
+    """Deterministic TP sum via all-gather plus fixed local tree reduction."""
+    assert group is not None, "group should not be None"
+
+    world_size = group.size()
+    if world_size == 1:
+        return input_
+    if not _is_power_of_two(world_size):
+        raise RuntimeError(
+            "Deterministic TP tree reduction currently requires a power-of-two "
+            f"tensor parallel size, but got {world_size}."
+        )
+
+    gathered_shape = [input_.shape[0] * world_size, *input_.shape[1:]]
+    gathered = torch.empty(gathered_shape, dtype=input_.dtype, device=input_.device)
+    dist_all_gather_func(gathered, input_.contiguous(), group=group)
+    gathered = gathered.view(world_size, *input_.shape)
+    return _tree_reduce_sum_from_gathered(gathered)
+
+
 def _split_along_last_dim(input_, group):
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
@@ -226,6 +263,25 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         return _reduce(input_, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward function."""
+        return grad_output, None
+
+
+class _DeterministicReduceFromModelParallelRegion(torch.autograd.Function):
+    """Deterministic TP reduction using a fixed tree-sum order."""
+
+    @staticmethod
+    def symbolic(graph, input_, group):
+        """Symbolic function for tracing."""
+        return _tree_all_reduce_sum(input_, group)
+
+    @staticmethod
+    def forward(ctx, input_, group):
+        """Forward function."""
+        return _tree_all_reduce_sum(input_, group)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -472,9 +528,11 @@ def copy_to_tensor_model_parallel_region(input_, group=None):
     return _CopyToModelParallelRegion.apply(input_, group)
 
 
-def reduce_from_tensor_model_parallel_region(input_, group=None):
+def reduce_from_tensor_model_parallel_region(input_, group=None, deterministic=False):
     """Wrapper for autograd function: forward: all reduce, backward copy"""
     group = get_tensor_model_parallel_group_if_none(group)
+    if deterministic:
+        return _DeterministicReduceFromModelParallelRegion.apply(input_, group)
     return _ReduceFromModelParallelRegion.apply(input_, group)
 
 

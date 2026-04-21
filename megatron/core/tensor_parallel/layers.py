@@ -805,6 +805,8 @@ class ColumnParallelLinear(torch.nn.Module):
             delay and fuse reduction along with other gradients for performance optimization.
     """
 
+    backend_name = "local"
+
     def __init__(
         self,
         input_size,
@@ -1137,6 +1139,8 @@ class RowParallelLinear(torch.nn.Module):
 
     """
 
+    backend_name = "local"
+
     def __init__(
         self,
         input_size: int,
@@ -1315,7 +1319,11 @@ class RowParallelLinear(torch.nn.Module):
                 output_parallel, group=self.tp_group
             )
         else:
-            output_ = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+            output_ = reduce_from_tensor_model_parallel_region(
+                output_parallel,
+                group=self.tp_group,
+                deterministic=self.config.use_sglang,
+            )
         if not self.skip_bias_add:
             output = (output_ + self.bias) if self.bias is not None else output_
             output_bias = None
