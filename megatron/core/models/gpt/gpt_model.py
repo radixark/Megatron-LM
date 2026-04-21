@@ -43,6 +43,22 @@ from megatron.core.utils import (
 )
 
 
+def apply_true_on_policy_logits_contract(
+    logits: Optional[Tensor], *, vocab_size: Optional[int] = None
+) -> Optional[Tensor]:
+    """Match SGLang's gathered-logits contract before log-softmax."""
+    if logits is None:
+        return None
+    if vocab_size is not None:
+        if logits.shape[-1] < vocab_size:
+            raise RuntimeError(
+                f"true_on_policy_vocab_size={vocab_size} exceeds gathered logits width "
+                f"{logits.shape[-1]}."
+            )
+        logits = logits[..., :vocab_size]
+    return logits.float()
+
+
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
 
@@ -564,6 +580,14 @@ class GPTModel(LanguageModule):
             mtp_kwargs=mtp_kwargs,
         )
 
+    def _apply_true_on_policy_logits_contract(self, logits: Optional[Tensor]) -> Optional[Tensor]:
+        if not self.config.use_sglang:
+            return logits
+        return apply_true_on_policy_logits_contract(
+            logits,
+            vocab_size=self.config.true_on_policy_vocab_size,
+        )
+
     def _postprocess(
         self,
         hidden_states,
@@ -722,6 +746,7 @@ class GPTModel(LanguageModule):
             logits, _ = self.output_layer(
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
+            logits = self._apply_true_on_policy_logits_contract(logits)
         else:
             logits = None
 
@@ -761,6 +786,7 @@ class GPTModel(LanguageModule):
             )
         else:
             logits, _ = self.output_layer(**output_layer_kwargs)
+            logits = self._apply_true_on_policy_logits_contract(logits)
             loss = self.compute_language_model_loss(labels, logits)
 
         return loss
