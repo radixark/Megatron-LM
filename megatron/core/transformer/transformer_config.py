@@ -505,6 +505,9 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
+    use_sglang: bool = False
+    """Use the correctness-first SGLang-compatible Megatron backend surface."""
+
     use_kitchen_attention: bool = False
     """Use the kitchen extension for attention (instead of TE's attention)."""
 
@@ -2031,6 +2034,14 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
+            assert not self.use_sglang
+
+        if self.use_sglang:
+            assert self.transformer_impl == "local", (
+                f"use_sglang currently requires transformer_impl='local', "
+                f"but got {self.transformer_impl=}."
+            )
+            assert not self.use_kitchen, "use_sglang is not compatible with use_kitchen."
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
