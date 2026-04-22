@@ -55,6 +55,8 @@ try:
 except ImportError:
     HAVE_KITCHEN = False
 
+from megatron.core.extensions.sglang import SGLangNorm, SGLangSpecProvider
+
 try:
     import apex  # pylint: disable=unused-import
 
@@ -320,6 +322,7 @@ def get_gpt_layer_local_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
+    use_sglang: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
 ) -> ModuleSpec:
@@ -340,7 +343,10 @@ def get_gpt_layer_local_spec(
         ModuleSpec: Module specification with Megatron-Core modules
     """
 
-    if use_kitchen:
+    if use_sglang:
+        assert not use_kitchen, "use_sglang is not compatible with use_kitchen."
+        backend = SGLangSpecProvider()
+    elif use_kitchen:
         assert HAVE_KITCHEN
         backend = KitchenSpecProvider(
             fallback=LocalSpecProvider(),
@@ -564,6 +570,7 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_sglang=config.use_sglang,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -574,6 +581,7 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_sglang=config.use_sglang,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -644,6 +652,8 @@ def get_gpt_decoder_block_spec(
     # Block spec.
     if use_transformer_engine:
         layer_norm_impl = TENorm
+    elif config.use_sglang:
+        layer_norm_impl = SGLangNorm
     else:
         layer_norm_impl = LNImpl
     block_spec = TransformerBlockSubmodules(
@@ -671,11 +681,14 @@ def get_gpt_mtp_block_spec(
         else:
             backend = TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn)
     else:
-        backend = (
-            KitchenSpecProvider(fallback=LocalSpecProvider())
-            if config.use_kitchen
-            else LocalSpecProvider()
-        )
+        if config.use_sglang:
+            backend = SGLangSpecProvider()
+        else:
+            backend = (
+                KitchenSpecProvider(fallback=LocalSpecProvider())
+                if config.use_kitchen
+                else LocalSpecProvider()
+            )
     return get_gpt_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
     )

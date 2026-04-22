@@ -235,6 +235,13 @@ class CrossAttentionSubmodules:
     linear_proj: Union[ModuleSpec, type] = None
 
 
+def _is_ulysses_cp(config: TransformerConfig) -> bool:
+    cp_comm_type = getattr(config, "cp_comm_type", None)
+    if isinstance(cp_comm_type, list):
+        cp_comm_type = cp_comm_type[0] if cp_comm_type else None
+    return config.context_parallel_size > 1 and cp_comm_type == "a2a"
+
+
 class Attention(MegatronModule, ABC):
     """Attention layer abstract class.
 
@@ -1095,6 +1102,7 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if split_qkv:
+                ulysses_cp = _is_ulysses_cp(self.config)
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
                     if inference_context is None or inference_context.is_static_batching():
@@ -1105,6 +1113,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=self.pg_collection.cp,
+                            ulysses_cp=ulysses_cp,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1118,6 +1127,7 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=_yarn_get_concentration_factor_from_config(self.config),
                         cp_group=self.pg_collection.cp,
+                        ulysses_cp=ulysses_cp,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
