@@ -167,7 +167,7 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = submodules.router(config=self.config, pg_collection=pg_collection)
+        self.router = submodules.router(config=self.config, pg_collection=pg_collection, layer_number=layer_number)
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
@@ -247,13 +247,16 @@ class MoELayer(BaseMoELayer):
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, input_ids: Optional[torch.Tensor] = None):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        if input_ids is not None and self.config.sequence_parallel:
+            from megatron.core.tensor_parallel.mappings import split_along_nth_dim
+            input_ids = split_along_nth_dim(input_ids, dim=1, group=parallel_state.get_tensor_model_parallel_group())
+        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, input_ids=input_ids)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -363,6 +366,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ):
         """Forward pass for the MoE layer.
 
@@ -377,6 +381,7 @@ class MoELayer(BaseMoELayer):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            input_ids (torch.Tensor, optional): Input token IDs for hash routing.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -390,11 +395,11 @@ class MoELayer(BaseMoELayer):
             padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, intermediate_tensors, padding_mask=None):
+        def custom_forward(hidden_states, intermediate_tensors, padding_mask=None, input_ids=None):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    probs, routing_map = self.route(hidden_states, padding_mask, input_ids=input_ids)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
@@ -448,7 +453,7 @@ class MoELayer(BaseMoELayer):
                     custom_forward, False, hidden_states, padding_mask
                 )
         else:
-            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask, input_ids=input_ids)
 
         return outputs
 

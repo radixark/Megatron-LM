@@ -620,6 +620,8 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     is_mtp: bool = False,
+    tid2eid: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -700,7 +702,8 @@ def topk_routing_with_score_function(
     from miles.utils.replay_base import routing_replay_manager
 
     # MTP layers cannot use rollout routing replay
-    if not is_mtp:
+    # Hash-routed layers (tid2eid is not None) also bypass replay since routing is deterministic
+    if not is_mtp and tid2eid is None:
         compute_topk = routing_replay_manager.get_topk_fn(_compute_topk, return_probs=True)
     else:
         compute_topk = _compute_topk
@@ -721,6 +724,22 @@ def topk_routing_with_score_function(
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+    elif score_function == "sqrtsoftplus":
+        assert num_groups is None
+        assert group_topk is None
+        scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+        if tid2eid is not None:
+            assert not tid2eid.requires_grad
+            assert input_ids is not None and not input_ids.requires_grad
+            top_indices = tid2eid[input_ids]
+            assert torch.all(top_indices >= 0)
+        else:
+            assert expert_bias is not None
+            scores_for_routing = scores + expert_bias
+            assert len(scores_for_routing.shape) == 2
+            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+        scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 

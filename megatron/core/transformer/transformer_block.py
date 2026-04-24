@@ -384,6 +384,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
+        # DeepSeek V4 Hyper-Connection
+        if self.config.dsv4_mode:
+            from miles_plugins.models.deepseek_v4.ops.hyper_connection import (
+                DeepSeekV4HyperConnectionUtil,
+                HCHeadParams,
+            )
+            self.hc_util = DeepSeekV4HyperConnectionUtil(self.config)
+            if self.has_final_layernorm_in_this_stage():
+                self.hc_head_params = HCHeadParams(self.config)
+
         if self.config.inference_fuse_tp_communication:
             self._setup_fused_tp_communication()
 
@@ -453,6 +463,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
         padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
     ):
         """Forward method with activation checkpointing."""
 
@@ -464,6 +475,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 context_mask,
                 rotary_pos_emb,
                 padding_mask=None,
+                input_ids=None,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -495,6 +507,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
+                            input_ids=input_ids,
                         )
                 return hidden_states, context
 
@@ -515,6 +528,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    input_ids,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -526,6 +540,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    input_ids,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -632,6 +647,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
@@ -702,6 +718,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        # HC expand: [s, b, d] -> [s, b, hc, d]
+        if self.config.dsv4_mode and self.pre_process:
+            hidden_states = self.hc_util.block_expand(hidden_states)
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -742,6 +762,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                     padding_mask=padding_mask,
+                    input_ids=input_ids,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
@@ -775,6 +796,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            input_ids=input_ids,
                         )
 
                     if (
@@ -783,6 +805,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         and self.group_prefetch_offload_commit_async is not None
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+        # HC head: [s, b, hc, d] -> [s, b, d]
+        if self.config.dsv4_mode and self.post_process and hasattr(self, 'hc_head_params'):
+            hidden_states = self.hc_util.block_head(
+                hidden_states,
+                self.hc_head_params.hc_head_fn,
+                self.hc_head_params.hc_head_scale,
+                self.hc_head_params.hc_head_base,
+            )
 
         # Final layer norm.
         if self.final_layernorm is not None:

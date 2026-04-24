@@ -316,7 +316,7 @@ def fused_qk_topk_naive(
     # =========================================
     # Select top-k indices
     # =========================================
-    topk_k = min(index_topk, seqlen)
+    topk_k = min(index_topk, index_scores.size(-1))
     # [batch, seqlen, index_topk]
     topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 
@@ -687,6 +687,7 @@ class DSAIndexer(MegatronModule):
             pg_collection (ProcessGroupCollection, optional): Process groups for the indexer.
         """
         super().__init__(config=config)
+        self.dsv4_mode = config.dsv4_mode
         self.hidden_size = self.config.hidden_size
         self.qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
         self.q_lora_rank = (
@@ -743,26 +744,27 @@ class DSAIndexer(MegatronModule):
             parallel_mode="duplicated",
         )
 
-        self.linear_wk = build_module(
-            submodules.linear_wk,
-            self.hidden_size,
-            self.index_head_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+        if not self.dsv4_mode:
+            self.linear_wk = build_module(
+                submodules.linear_wk,
+                self.hidden_size,
+                self.index_head_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
 
-        k_norm_config = copy.copy(self.config)
-        k_norm_config.normalization = "LayerNorm"
-        self.k_norm = build_module(
-            submodules.k_norm,
-            config=k_norm_config,
-            hidden_size=self.index_head_dim,
-            eps=self.config.layernorm_epsilon,
-        )
+            k_norm_config = copy.copy(self.config)
+            k_norm_config.normalization = "LayerNorm"
+            self.k_norm = build_module(
+                submodules.k_norm,
+                config=k_norm_config,
+                hidden_size=self.index_head_dim,
+                eps=self.config.layernorm_epsilon,
+            )
 
         self.linear_weights_proj = build_module(
             submodules.linear_weights_proj,
@@ -775,6 +777,30 @@ class DSAIndexer(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
+
+        # V4-specific: compressor for key computation and custom RoPE
+        if self.dsv4_mode:
+            from miles_plugins.models.deepseek_v4.ops.compressor import DeepSeekV4Compressor
+            from miles_plugins.models.deepseek_v4.ops.utils import wrapped_precompute_freqs_cis
+            from miles_plugins.models.deepseek_v4.ops.qat import fp8_simulate_qat
+            self._fp8_simulate_qat = fp8_simulate_qat
+
+            self.compress_ratio = 4
+            self.compressor = DeepSeekV4Compressor(
+                config=self.config,
+                head_dim=self.index_head_dim,
+                compress_ratio=self.compress_ratio,
+                rotate=True,
+                cp_group=pg_collection.cp,
+            )
+
+            self.rope_head_dim = config.qk_pos_emb_head_dim
+            rope_base = config.dsv4_compress_rope_theta if self.compress_ratio else config.rotary_base
+            freqs_cis = wrapped_precompute_freqs_cis(config, rope_head_dim=self.rope_head_dim, base=rope_base)
+            self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
+            from miles.utils.replay_base import indexer_replay_manager
+            indexer_replay_manager.register_to_module(self, "indexer_replay")
 
     def _apply_rope(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor, mscale: float):
         """Apply RoPE to the input tensor."""
@@ -802,14 +828,15 @@ class DSAIndexer(MegatronModule):
         # =========================================
         # Prepare RoPE params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            None, None, x, self.config, packed_seq_params
-        )
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
-            mscale = 1.0
-        else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+        if not self.dsv4_mode:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                None, None, x, self.config, packed_seq_params
+            )
+            if self.config.rope_type == "rope":
+                rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+                mscale = 1.0
+            else:
+                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
 
         # =========================================
         # Gather inputs if sp is enabled
@@ -831,25 +858,48 @@ class DSAIndexer(MegatronModule):
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
-        q = self._apply_rope(q, rotary_pos_emb, mscale)
+        if self.dsv4_mode:
+            import einops
+            from miles_plugins.models.deepseek_v4.ops.cp_utils import get_freqs_cis_for_cp
+            from miles_plugins.models.deepseek_v4.ops.ref_model import apply_rotary_emb
+
+            rd = self.rope_head_dim
+            cp_size = parallel_state.get_context_parallel_world_size()
+            freqs_cis = get_freqs_cis_for_cp(
+                self.freqs_cis, seqlen, cp_size, self.pg_collection.cp, stride=1
+            )
+            q = q.clone()
+            q = einops.rearrange(q, 's b ... -> b s ...')
+            apply_rotary_emb(q[..., -rd:], freqs_cis)
+            q = einops.rearrange(q, 'b s ... -> s b ...')
+        else:
+            q = self._apply_rope(q, rotary_pos_emb, mscale)
 
         # =========================================
         # k linear and apply rope to k
         # =========================================
-        # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
-        k, _ = self.linear_wk(x)
-        k = self.k_norm(k)
-        # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
-        k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
-        k = self._apply_rope(k, rotary_pos_emb, mscale)
-        # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
-        k = k.reshape(seqlen, bsz, self.index_head_dim)
+        if self.dsv4_mode:
+            k = self.compressor(x)
+        else:
+            # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
+            k, _ = self.linear_wk(x)
+            k = self.k_norm(k)
+            # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
+            k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
+            k = self._apply_rope(k, rotary_pos_emb, mscale)
+            # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
+            k = k.reshape(seqlen, bsz, self.index_head_dim)
 
         # =========================================
         # Rotate activation
         # =========================================
         q = rotate_activation(q)
-        k = rotate_activation(k)
+        if hasattr(self, '_fp8_simulate_qat'):
+            import os
+            if os.environ.get("MEGATRON_USE_KV_QAT", "0") == "1":
+                q = self._fp8_simulate_qat(q, block_size=128)
+        if not self.dsv4_mode:
+            k = rotate_activation(k)
 
         # =========================================
         # Prepare weights for index scores
@@ -891,6 +941,17 @@ class DSAIndexer(MegatronModule):
 
         # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
         index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, self.index_topk, mask)
+
+        # V4 mode: apply indexer replay if registered
+        if self.dsv4_mode:
+            from miles.utils.replay_base import indexer_replay_manager
+
+            def _original_topk(scores, k, **kwargs):
+                k = min(k, scores.size(-1))
+                return scores.topk(k, dim=-1)[1]
+
+            topk_fn = indexer_replay_manager.get_topk_fn(_original_topk, return_probs=False)
+            topk_indices = topk_fn(index_scores, self.index_topk)
 
         return index_scores, topk_indices
 
