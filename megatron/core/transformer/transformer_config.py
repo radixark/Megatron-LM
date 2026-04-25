@@ -311,6 +311,14 @@ class TransformerConfig(ModelParallelConfig):
     dsv4_window_size: int = 4096
     """Window size for local window attention in sparse attention."""
 
+    dsv4_moe_router_use_tile_kernels_topk: bool = False
+    """Use deepseek-ai/TileKernels ``topk_gate`` for the MoE router top-k selection
+    instead of ``torch.topk``. When enabled, the topk selection runs on a fused
+    TileLang kernel that breaks ties by smallest expert index.
+
+    Only effective on the non-grouped path (``moe_router_group_topk`` unset) and
+    when the existing TE-fused path is disabled (``moe_router_fusion=False``)."""
+
     vocab_size: Optional[int] = None
     """Vocabulary size, passed through for hash routing tid2eid initialization."""
 

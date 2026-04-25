@@ -622,6 +622,7 @@ def topk_routing_with_score_function(
     is_mtp: bool = False,
     tid2eid: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
+    use_tile_kernels_topk: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -697,6 +698,14 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
+            if use_tile_kernels_topk:
+                from tile_kernels.moe import topk_gate
+                # TileKernels topk_gate returns int64 indices only; gather scores back
+                # to match the (values, indices) contract used by the surrounding code.
+                scores_fp32 = scores.float().contiguous()
+                top_indices = topk_gate(scores_fp32, topk)
+                top_values = torch.gather(scores, dim=1, index=top_indices)
+                return top_values, top_indices
             return torch.topk(scores, k=topk, dim=1)
 
     from miles.utils.replay_base import routing_replay_manager

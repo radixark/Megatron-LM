@@ -638,6 +638,7 @@ class TopKRouter(Router):
                 is_mtp=self.is_mtp,
                 tid2eid=self.tid2eid,
                 input_ids=input_ids.view(-1) if self.tid2eid is not None and input_ids is not None else None,
+                use_tile_kernels_topk=getattr(self.config, "dsv4_moe_router_use_tile_kernels_topk", False),
             )
 
         # Apply token dropping to probs and routing_map.
