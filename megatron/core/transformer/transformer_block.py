@@ -75,7 +75,7 @@ else:
 logger = logging.getLogger(__name__)
 
 _FINAL_LAYERNORM_BWD_DUMP_COUNTER = 0
-_WARNED_SGLANG_CP_TORCH_CHECKPOINT = False
+_WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = False
 
 
 def _maybe_dump_final_layernorm_backward(name: str, tensor: Optional[Tensor]) -> None:
@@ -127,6 +127,11 @@ def _cp_comm_type_uses_a2a(cp_comm_type: Optional[Union[str, List[str]]]) -> boo
     if isinstance(cp_comm_type, list):
         return any(item == "a2a" for item in cp_comm_type)
     return False
+
+
+def _get_sglang_cp_recompute_mode() -> str:
+    mode = os.environ.get("MEGATRON_TRUE_ON_POLICY_SGLANG_CP_RECOMPUTE", "disabled")
+    return mode.lower().replace("-", "_")
 
 
 def get_num_layers_to_build(
@@ -568,31 +573,53 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         def checkpoint_handler(forward_func):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            use_torch_checkpoint_for_sglang_cp = (
+            use_sglang_cp_recompute_fallback = (
                 self.config.use_sglang
                 and self.config.context_parallel_size > 1
                 and _cp_comm_type_uses_a2a(self.config.cp_comm_type)
-                and os.environ.get("MEGATRON_TRUE_ON_POLICY_REENTRANT_CHECKPOINT", "0") != "1"
             )
-            if use_torch_checkpoint_for_sglang_cp:
-                global _WARNED_SGLANG_CP_TORCH_CHECKPOINT
-                if not _WARNED_SGLANG_CP_TORCH_CHECKPOINT:
-                    logger.info(
-                        "Using non-reentrant torch checkpoint for SGLang Ulysses CP "
-                        "full recompute."
+            if use_sglang_cp_recompute_fallback:
+                mode = _get_sglang_cp_recompute_mode()
+                global _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK
+                if mode in ("disabled", "disable", "off", "none", "false", "0"):
+                    if not _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK:
+                        logger.info(
+                            "Bypassing full activation recompute for SGLang Ulysses CP. "
+                            "Set MEGATRON_TRUE_ON_POLICY_SGLANG_CP_RECOMPUTE to "
+                            "'non_reentrant' or 'reentrant' to override."
+                        )
+                        _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = True
+                    return forward_func(
+                        hidden_states,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        rotary_pos_emb,
+                        padding_mask,
                     )
-                    _WARNED_SGLANG_CP_TORCH_CHECKPOINT = True
-                return torch_checkpoint(
-                    forward_func,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    padding_mask,
-                    use_reentrant=False,
-                    preserve_rng_state=True,
-                )
+                if mode == "non_reentrant":
+                    if not _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK:
+                        logger.info(
+                            "Using non-reentrant torch checkpoint for SGLang Ulysses CP "
+                            "full recompute."
+                        )
+                        _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = True
+                    return torch_checkpoint(
+                        forward_func,
+                        hidden_states,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        rotary_pos_emb,
+                        padding_mask,
+                        use_reentrant=False,
+                        preserve_rng_state=True,
+                    )
+                if mode != "reentrant":
+                    raise ValueError(
+                        "Invalid MEGATRON_TRUE_ON_POLICY_SGLANG_CP_RECOMPUTE value "
+                        f"{mode!r}; expected disabled, non_reentrant, or reentrant."
+                    )
 
             # TODO: check if fp4 is supported in this case
             if self.config.fp8 or self.config.fp4:
