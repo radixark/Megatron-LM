@@ -325,7 +325,9 @@ def validate_args(args, defaults={}):
         assert args.transformer_impl == 'local', (
             '--use-sglang currently requires --transformer-impl local'
         )
-        assert not args.use_kitchen, '--use-sglang is not compatible with --use-kitchen'
+        assert not getattr(args, 'use_kitchen', False), (
+            '--use-sglang is not compatible with --use-kitchen'
+        )
 
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size

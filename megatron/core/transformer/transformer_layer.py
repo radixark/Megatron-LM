@@ -2,6 +2,7 @@
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -34,6 +35,75 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_NORM_GRAD_DEBUG_COUNTER = 0
+
+
+def _register_norm_grad_debug(tensor: Tensor, *, layer_number: int, name: str) -> None:
+    debug_dir = os.environ.get("MILES_NORM_BACKWARD_DEBUG_DIR")
+    if not debug_dir or not torch.is_tensor(tensor) or not tensor.requires_grad:
+        return
+
+    debug_all = os.environ.get("MILES_NORM_BACKWARD_DEBUG_ALL") == "1"
+    threshold = float(os.environ.get("MILES_NORM_BACKWARD_DEBUG_THRESHOLD", "1e20"))
+    debug_key = f"{layer_number}:{name}"
+
+    def _hook(grad: Tensor) -> Tensor:
+        flat = grad.detach().view(-1)
+        finite = torch.isfinite(flat)
+        has_nan = int(torch.isnan(flat).sum().item())
+        has_inf = int(torch.isinf(flat).sum().item())
+        max_abs_finite = None
+        min_finite = None
+        max_finite = None
+        if finite.any().item():
+            finite_values = flat[finite].float()
+            max_abs_finite = float(finite_values.abs().max().item())
+            min_finite = float(finite_values.min().item())
+            max_finite = float(finite_values.max().item())
+
+        should_dump = debug_all or has_nan or has_inf
+        if max_abs_finite is not None and max_abs_finite >= threshold:
+            should_dump = True
+        if not should_dump:
+            return grad
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        if not debug_all:
+            seen = getattr(_register_norm_grad_debug, "_seen", set())
+            seen_key = (rank, debug_key)
+            if seen_key in seen:
+                return grad
+            seen.add(seen_key)
+            _register_norm_grad_debug._seen = seen
+
+        global _NORM_GRAD_DEBUG_COUNTER
+        counter = _NORM_GRAD_DEBUG_COUNTER
+        _NORM_GRAD_DEBUG_COUNTER += 1
+        stats = {
+            "rank": rank,
+            "layer_number": layer_number,
+            "name": name,
+            "shape": tuple(grad.shape),
+            "dtype": str(grad.dtype),
+            "numel": flat.numel(),
+            "finite": int(finite.sum().item()),
+            "nan": has_nan,
+            "inf": has_inf,
+            "max_abs_finite": max_abs_finite,
+            "min_finite": min_finite,
+            "max_finite": max_finite,
+        }
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(
+            debug_dir,
+            f"rank_{rank}_layer_{layer_number}_{counter:05d}_{name}_pid_{os.getpid()}.pt",
+        )
+        torch.save(stats, path)
+        print(f"[MILES_NORM_BACKWARD_DEBUG] {stats} wrote {path}", flush=True)
+        return grad
+
+    tensor.register_hook(_hook)
 
 
 def get_transformer_layer_offset(
@@ -377,6 +447,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     f"Unknown MLP type: {type(submodules.mlp)}. Using default kwargs.",
                 )
         self.mlp = build_module(submodules.mlp, config=self.config, **additional_mlp_kwargs)
+        self.mlp.layer_number = self.layer_number
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 
@@ -527,12 +598,75 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
+        self._register_activation_grad_debug(hidden_states, "after_attention")
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
         )
+        self._register_activation_grad_debug(output, "layer_output")
         return output, context
+
+    def _register_activation_grad_debug(self, tensor: Tensor, name: str) -> None:
+        """Print/dump first nonfinite activation gradient for this layer when env-gated."""
+        debug_dir = os.environ.get("MILES_ACTIVATION_GRAD_DEBUG_DIR")
+        if not debug_dir or not torch.is_tensor(tensor) or not tensor.requires_grad:
+            return
+
+        layer_number = self.layer_number
+        debug_key = f"{layer_number}:{name}"
+
+        def _hook(grad: Tensor) -> Tensor:
+            if torch.isfinite(grad).all().item():
+                return grad
+
+            seen = getattr(self, "_activation_grad_debug_seen", set())
+            if debug_key in seen:
+                return grad
+            seen.add(debug_key)
+            self._activation_grad_debug_seen = seen
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            else:
+                rank = -1
+
+            flat = grad.detach().view(-1)
+            finite = torch.isfinite(flat)
+            stats = {
+                "rank": rank,
+                "layer_number": layer_number,
+                "name": name,
+                "shape": tuple(grad.shape),
+                "dtype": str(grad.dtype),
+                "numel": flat.numel(),
+                "finite": int(finite.sum().item()),
+                "nan": int(torch.isnan(flat).sum().item()),
+                "inf": int(torch.isinf(flat).sum().item()),
+            }
+            if stats["finite"] > 0:
+                finite_values = flat[finite].float()
+                stats.update(
+                    {
+                        "max_abs_finite": float(finite_values.abs().max().item()),
+                        "min_finite": float(finite_values.min().item()),
+                        "max_finite": float(finite_values.max().item()),
+                    }
+                )
+
+            os.makedirs(debug_dir, exist_ok=True)
+            path = os.path.join(
+                debug_dir,
+                f"rank_{rank}_layer_{layer_number}_{name}_pid_{os.getpid()}.pt",
+            )
+            torch.save(stats, path)
+            print(
+                f"[MILES_ACTIVATION_GRAD_DEBUG] {stats} wrote {path}",
+                flush=True,
+            )
+            return grad
+
+        tensor.register_hook(_hook)
 
     def _forward_attention(
         self,
@@ -585,19 +719,45 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # Residual connection.
-        residual = hidden_states
+        # Residual connection.  The SGLang path carries MLP output and residual as a
+        # pair across layer boundaries to match SGLang's LayerCommunicator flow.
+        sglang_carried_residual = (
+            getattr(hidden_states, "_sglang_residual", None) if self.config.use_sglang else None
+        )
+        residual = sglang_carried_residual if sglang_carried_residual is not None else hidden_states
 
         # Optional Input Layer norm
-        if self.recompute_input_layernorm:
+        if sglang_carried_residual is not None:
+            input_layernorm_output, residual = self.input_layernorm(hidden_states, residual)
+            _register_norm_grad_debug(
+                input_layernorm_output,
+                layer_number=self.layer_number,
+                name="input_layernorm_output",
+            )
+            _register_norm_grad_debug(
+                residual,
+                layer_number=self.layer_number,
+                name="input_layernorm_residual_output",
+            )
+        elif self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     self.input_layernorm, hidden_states
                 )
+            _register_norm_grad_debug(
+                input_layernorm_output,
+                layer_number=self.layer_number,
+                name="input_layernorm_output",
+            )
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
+            _register_norm_grad_debug(
+                input_layernorm_output,
+                layer_number=self.layer_number,
+                name="input_layernorm_output",
+            )
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -643,6 +803,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
+        elif self.config.use_sglang:
+            attention_output, attention_output_bias = attention_output_with_bias
+            if attention_output_bias is not None:
+                attention_output = attention_output + attention_output_bias
+            hidden_states = torch.nn.functional.dropout(
+                attention_output, p=self.hidden_dropout, training=self.training
+            )
+            self._sglang_pre_mlp_residual = residual
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -683,12 +851,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _forward_pre_mlp_layernorm(self, hidden_states):
+    def _forward_pre_mlp_layernorm(self, hidden_states, residual=None):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 
         if self.recompute_pre_mlp_layernorm:
+            if residual is not None:
+                raise AssertionError(
+                    "SGLang residual-pair pre-MLP layernorm is not compatible with "
+                    "selective pre_mlp_layernorm recompute."
+                )
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
@@ -696,7 +869,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         else:
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+                if residual is None:
+                    pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+                    _register_norm_grad_debug(
+                        pre_mlp_layernorm_output,
+                        layer_number=self.layer_number,
+                        name="pre_mlp_layernorm_output",
+                    )
+                else:
+                    pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states, residual)
+                    norm_output, norm_residual = pre_mlp_layernorm_output
+                    _register_norm_grad_debug(
+                        norm_output,
+                        layer_number=self.layer_number,
+                        name="pre_mlp_layernorm_output",
+                    )
+                    _register_norm_grad_debug(
+                        norm_residual,
+                        layer_number=self.layer_number,
+                        name="pre_mlp_layernorm_residual_output",
+                    )
 
         return pre_mlp_layernorm_output
 
@@ -717,10 +909,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         # Residual connection.
-        residual = hidden_states
+        residual = getattr(self, "_sglang_pre_mlp_residual", hidden_states)
+        if hasattr(self, "_sglang_pre_mlp_residual"):
+            del self._sglang_pre_mlp_residual
 
         # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        if self.config.use_sglang and residual is not hidden_states:
+            pre_mlp_layernorm_output, residual = self._forward_pre_mlp_layernorm(
+                hidden_states, residual
+            )
+        else:
+            pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -833,6 +1032,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
+        elif self.config.use_sglang:
+            mlp_output, mlp_output_bias = mlp_output_with_bias
+            if mlp_output_bias is not None:
+                mlp_output = mlp_output + mlp_output_bias
+            hidden_states = torch.nn.functional.dropout(
+                mlp_output, p=self.hidden_dropout, training=self.training
+            )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
@@ -855,6 +1061,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+        if self.config.use_sglang:
+            output._sglang_residual = residual
 
         return output
 

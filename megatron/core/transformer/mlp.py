@@ -2,6 +2,7 @@
 
 import gc
 import logging
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -152,12 +153,74 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
+    def _register_activation_grad_debug(self, tensor: torch.Tensor, name: str) -> None:
+        debug_dir = os.environ.get("MILES_ACTIVATION_GRAD_DEBUG_DIR")
+        if not debug_dir or not torch.is_tensor(tensor) or not tensor.requires_grad:
+            return
+
+        layer_number = getattr(self, "layer_number", -1)
+        debug_key = f"mlp:{layer_number}:{name}"
+
+        def _hook(grad: torch.Tensor) -> torch.Tensor:
+            if torch.isfinite(grad).all().item():
+                return grad
+
+            seen = getattr(self, "_activation_grad_debug_seen", set())
+            if debug_key in seen:
+                return grad
+            seen.add(debug_key)
+            self._activation_grad_debug_seen = seen
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            else:
+                rank = -1
+
+            flat = grad.detach().view(-1)
+            finite = torch.isfinite(flat)
+            stats = {
+                "rank": rank,
+                "layer_number": layer_number,
+                "module": "mlp",
+                "name": name,
+                "shape": tuple(grad.shape),
+                "dtype": str(grad.dtype),
+                "numel": flat.numel(),
+                "finite": int(finite.sum().item()),
+                "nan": int(torch.isnan(flat).sum().item()),
+                "inf": int(torch.isinf(flat).sum().item()),
+            }
+            if stats["finite"] > 0:
+                finite_values = flat[finite].float()
+                stats.update(
+                    {
+                        "max_abs_finite": float(finite_values.abs().max().item()),
+                        "min_finite": float(finite_values.min().item()),
+                        "max_finite": float(finite_values.max().item()),
+                    }
+                )
+
+            os.makedirs(debug_dir, exist_ok=True)
+            path = os.path.join(
+                debug_dir,
+                f"rank_{rank}_layer_{layer_number}_mlp_{name}_pid_{os.getpid()}.pt",
+            )
+            torch.save(stats, path)
+            print(
+                f"[MILES_ACTIVATION_GRAD_DEBUG] {stats} wrote {path}",
+                flush=True,
+            )
+            return grad
+
+        tensor.register_hook(_hook)
+
     def forward(self, hidden_states, per_token_scale=None, **kwargs):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
+        self._register_activation_grad_debug(intermediate_parallel, "fc1_output")
 
         nvtx_range_push(suffix="activation")
         if self.config.use_te_activation_func:
@@ -234,12 +297,14 @@ class MLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
         nvtx_range_pop(suffix="activation")
+        self._register_activation_grad_debug(intermediate_parallel, "activation_output")
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
 
         output, output_bias = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
+        self._register_activation_grad_debug(output, "fc2_output")
 
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly

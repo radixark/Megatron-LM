@@ -55,7 +55,12 @@ try:
 except ImportError:
     HAVE_KITCHEN = False
 
-from megatron.core.extensions.sglang import SGLangNorm, SGLangSpecProvider
+from megatron.core.extensions.sglang import (
+    SGLangFinalRMSNorm,
+    SGLangNorm,
+    SGLangSpecProvider,
+    get_sglang_bias_dropout_add,
+)
 
 try:
     import apex  # pylint: disable=unused-import
@@ -345,6 +350,13 @@ def get_gpt_layer_local_spec(
 
     if use_sglang:
         assert not use_kitchen, "use_sglang is not compatible with use_kitchen."
+        from megatron.core.extensions.sglang import (
+            enable_sglang_batch_invariant_mode,
+            enable_sglang_rope,
+        )
+
+        enable_sglang_batch_invariant_mode()
+        enable_sglang_rope()
         backend = SGLangSpecProvider()
     elif use_kitchen:
         assert HAVE_KITCHEN
@@ -375,6 +387,7 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
+    bias_dropout_add = get_sglang_bias_dropout_add if use_sglang else get_bias_dropout_add
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -397,10 +410,10 @@ def get_gpt_layer_local_spec(
                         kv_layernorm=qk_norm if qk_layernorm else IdentityOp,
                     ),
                 ),
-                self_attn_bda=get_bias_dropout_add,
+                self_attn_bda=bias_dropout_add,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
-                mlp_bda=get_bias_dropout_add,
+                mlp_bda=bias_dropout_add,
             ),
         )
     else:
@@ -423,10 +436,10 @@ def get_gpt_layer_local_spec(
                         ),
                     ),
                 ),
-                self_attn_bda=get_bias_dropout_add,
+                self_attn_bda=bias_dropout_add,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
-                mlp_bda=get_bias_dropout_add,
+                mlp_bda=bias_dropout_add,
                 sharded_state_dict_keys_map={
                     "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
                     "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
@@ -650,7 +663,11 @@ def get_gpt_decoder_block_spec(
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
-    if use_transformer_engine:
+    norm_type = normalization if normalization is not None else getattr(config, "normalization", "LayerNorm")
+
+    if config.use_sglang and norm_type == "RMSNorm":
+        layer_norm_impl = SGLangFinalRMSNorm
+    elif use_transformer_engine:
         layer_norm_impl = TENorm
     elif config.use_sglang:
         layer_norm_impl = SGLangNorm

@@ -2018,7 +2018,8 @@ class TransformerConfig(ModelParallelConfig):
                 f" but got {self.transformer_impl=}."
             )
 
-        if self.fallback_to_eager_attn or self.transformer_impl == "local":
+        local_attention_requires_all_gather_cp = self.transformer_impl == "local" and not self.use_sglang
+        if self.fallback_to_eager_attn or local_attention_requires_all_gather_cp:
             if self.context_parallel_size > 1 and self.cp_comm_type is not None:
                 all_cp_comm_types_are_all_gather = (
                     all(item == "all_gather" for item in self.cp_comm_type)

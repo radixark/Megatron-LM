@@ -3,6 +3,7 @@
 import functools
 import logging
 import math
+import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -93,6 +94,7 @@ class _ParamAndGradBucket:
         gradient_scaling_factor: float,
         bucket_id: int,
         param_index_map: Dict[torch.nn.Parameter, tuple],
+        param_to_name: Dict[torch.nn.Parameter, str],
     ):
         self.params_list = params
         self.params = set(params)
@@ -106,6 +108,7 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
+        self.param_to_name = param_to_name
         # Derive bucket-local param offsets from the global param_index_map.
         self.param_to_index = {}
         for param in params:
@@ -199,6 +202,7 @@ class _ParamAndGradBucketGroup:
         # or bucket.grad_data.
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
+        self._grad_debug_dumped_buckets = set()
 
     def reset(self):
         """
@@ -218,8 +222,15 @@ class _ParamAndGradBucketGroup:
         all-reduce / reduce-scatter.
         """
         rerun_state_machine = get_rerun_state_machine()
+        grad_debug_dir = os.environ.get("MILES_GRAD_DEBUG_DIR")
         for i in range(len(self.buckets)):
             grad_norm = self.buckets[i].grad_data.norm(p=2)
+            if grad_debug_dir and not torch.isfinite(grad_norm).item():
+                self._dump_grad_debug(
+                    bucket_index=i,
+                    grad_norm=grad_norm,
+                    grad_debug_dir=grad_debug_dir,
+                )
             # check for NaN, Inf and unexpectedly large grads
             if check_for_nan_or_inf:
                 rerun_state_machine.validate_result(
@@ -249,6 +260,83 @@ class _ParamAndGradBucketGroup:
                     tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
                     fatal=False,
                 )
+
+    def _dump_grad_debug(self, bucket_index: int, grad_norm: torch.Tensor, grad_debug_dir: str):
+        """
+        Dump bucket and per-parameter gradient stats before the normal rerun-state
+        validation raises. This is env-gated because it synchronizes tensors to CPU.
+        """
+        bucket = self.buckets[bucket_index]
+        dump_key = (bucket.bucket_id, bucket_index)
+        if dump_key in self._grad_debug_dumped_buckets:
+            return
+        self._grad_debug_dumped_buckets.add(dump_key)
+
+        def _tensor_stats(tensor: torch.Tensor):
+            flat = tensor.detach().view(-1)
+            finite = torch.isfinite(flat)
+            nan = torch.isnan(flat)
+            inf = torch.isinf(flat)
+            stats = {
+                "shape": tuple(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "numel": flat.numel(),
+                "finite": int(finite.sum().item()),
+                "nan": int(nan.sum().item()),
+                "inf": int(inf.sum().item()),
+            }
+            if stats["finite"] > 0:
+                finite_values = flat[finite].float()
+                stats.update(
+                    {
+                        "max_abs_finite": float(finite_values.abs().max().item()),
+                        "min_finite": float(finite_values.min().item()),
+                        "max_finite": float(finite_values.max().item()),
+                    }
+                )
+            return stats
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = -1
+
+        params = []
+        for param in bucket.params_list:
+            start, end = bucket.param_to_index[param]
+            grad_slice = bucket.grad_data.view(-1)[start:end].view(param.shape)
+            params.append(
+                {
+                    "name": bucket.param_to_name.get(param, "<unknown>"),
+                    "shape": tuple(param.shape),
+                    "requires_grad": bool(param.requires_grad),
+                    "grad_slice": _tensor_stats(grad_slice),
+                    "main_grad": _tensor_stats(param.main_grad)
+                    if hasattr(param, "main_grad") and param.main_grad is not None
+                    else None,
+                }
+            )
+
+        os.makedirs(grad_debug_dir, exist_ok=True)
+        path = os.path.join(
+            grad_debug_dir,
+            f"rank_{rank}_bucket_{bucket.bucket_id}_idx_{bucket_index}_pid_{os.getpid()}.pt",
+        )
+        torch.save(
+            {
+                "rank": rank,
+                "bucket_id": bucket.bucket_id,
+                "bucket_index": bucket_index,
+                "grad_norm": float(grad_norm.detach().float().cpu().item()),
+                "bucket_grad": _tensor_stats(bucket.grad_data),
+                "params": params,
+            },
+            path,
+        )
+        print(
+            f"[MILES_GRAD_DEBUG] wrote nonfinite grad dump to {path}",
+            flush=True,
+        )
 
     def start_param_sync(self, force_sync: bool = False):
         """
@@ -616,6 +704,7 @@ class _ParamAndGradBuffer:
         self.ddp_config = ddp_config
         self.params = params
         self.param_indices = param_indices
+        self.param_to_name = param_to_name
 
         # Check that params are unique.
         unique_params = set()
@@ -974,6 +1063,7 @@ class _ParamAndGradBuffer:
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
             param_index_map=self.param_index_map,
+            param_to_name=self.param_to_name,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket

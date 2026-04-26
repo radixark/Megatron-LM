@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
+import os
+from pathlib import Path
 from typing import Dict, Literal, Optional
 
 import torch
@@ -56,7 +58,52 @@ def apply_true_on_policy_logits_contract(
                 f"{logits.shape[-1]}."
             )
         logits = logits[..., :vocab_size]
-    return logits.float()
+    return logits
+
+
+_TOP_LM_HEAD_BWD_DUMP_COUNTER = 0
+
+
+def _maybe_dump_lm_head_backward(name: str, tensor: Optional[Tensor]) -> None:
+    dump_dir = os.environ.get("MILES_LM_HEAD_BACKWARD_DEBUG_DIR")
+    if not dump_dir or tensor is None or not tensor.requires_grad:
+        return
+
+    def hook(grad: Tensor) -> Tensor:
+        global _TOP_LM_HEAD_BWD_DUMP_COUNTER
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        finite_mask = torch.isfinite(grad)
+        finite = grad[finite_mask]
+        stats = {
+            "rank": rank,
+            "name": name,
+            "shape": tuple(grad.shape),
+            "dtype": str(grad.dtype),
+            "numel": grad.numel(),
+            "finite": finite_mask.sum().item(),
+            "nan": torch.isnan(grad).sum().item(),
+            "inf": torch.isinf(grad).sum().item(),
+        }
+        if finite.numel() > 0:
+            finite_f = finite.float()
+            stats.update(
+                {
+                    "max_abs_finite": finite_f.abs().max().item(),
+                    "min_finite": finite_f.min().item(),
+                    "max_finite": finite_f.max().item(),
+                }
+            )
+        else:
+            stats.update({"max_abs_finite": None, "min_finite": None, "max_finite": None})
+        counter = _TOP_LM_HEAD_BWD_DUMP_COUNTER
+        _TOP_LM_HEAD_BWD_DUMP_COUNTER += 1
+        path = Path(dump_dir) / f"rank_{rank}_{counter:05d}_{name}.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"stats": stats}, path)
+        print(f"[MILES_LM_HEAD_BACKWARD_DEBUG] {stats} wrote {path}", flush=True)
+        return grad
+
+    tensor.register_hook(hook)
 
 
 class GPTModel(LanguageModule):
@@ -743,10 +790,12 @@ class GPTModel(LanguageModule):
                 ).unsqueeze(1)
 
         if has_config_logger_enabled(self.config) or labels is None:
+            _maybe_dump_lm_head_backward("lm_head_input_hidden_states", hidden_states)
             logits, _ = self.output_layer(
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
             logits = self._apply_true_on_policy_logits_contract(logits)
+            _maybe_dump_lm_head_backward("lm_head_output_logits", logits)
         else:
             logits = None
 
@@ -785,8 +834,10 @@ class GPTModel(LanguageModule):
                 **output_layer_kwargs,
             )
         else:
+            _maybe_dump_lm_head_backward("lm_head_input_hidden_states", hidden_states)
             logits, _ = self.output_layer(**output_layer_kwargs)
             logits = self._apply_true_on_policy_logits_contract(logits)
+            _maybe_dump_lm_head_backward("lm_head_output_logits", logits)
             loss = self.compute_language_model_loss(labels, logits)
 
         return loss
