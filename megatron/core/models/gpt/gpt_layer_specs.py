@@ -61,6 +61,9 @@ from megatron.core.true_on_policy.sglang_backend import (
     SGLangSpecProvider,
     get_sglang_bias_dropout_add,
 )
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from megatron.core.true_on_policy.rope import enable_sglang_rope
+from megatron.core.true_on_policy.runtime import enable_sglang_batch_invariant_mode
 
 try:
     import apex  # pylint: disable=unused-import
@@ -317,6 +320,31 @@ def get_gpt_layer_with_transformer_engine_spec(
         )
 
 
+def _select_local_backend(
+    *,
+    use_sglang: bool,
+    use_kitchen: bool,
+    use_kitchen_attention: bool,
+    kitchen_attention_backend: str,
+) -> tuple[BackendSpecProvider, bool]:
+    if use_sglang:
+        assert not use_kitchen, "use_sglang is not compatible with use_kitchen."
+        enable_sglang_batch_invariant_mode()
+        enable_sglang_rope()
+        return SGLangSpecProvider(), True
+    if use_kitchen:
+        assert HAVE_KITCHEN
+        return (
+            KitchenSpecProvider(
+                fallback=LocalSpecProvider(),
+                use_kitchen_attention=use_kitchen_attention,
+                kitchen_attention_backend=kitchen_attention_backend,
+            ),
+            False,
+        )
+    return LocalSpecProvider(), False
+
+
 def get_gpt_layer_local_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
@@ -348,25 +376,12 @@ def get_gpt_layer_local_spec(
         ModuleSpec: Module specification with Megatron-Core modules
     """
 
-    if use_sglang:
-        assert not use_kitchen, "use_sglang is not compatible with use_kitchen."
-        from megatron.core.true_on_policy.sglang_backend import (
-            enable_sglang_batch_invariant_mode,
-            enable_sglang_rope,
-        )
-
-        enable_sglang_batch_invariant_mode()
-        enable_sglang_rope()
-        backend = SGLangSpecProvider()
-    elif use_kitchen:
-        assert HAVE_KITCHEN
-        backend = KitchenSpecProvider(
-            fallback=LocalSpecProvider(),
-            use_kitchen_attention=use_kitchen_attention,
-            kitchen_attention_backend=kitchen_attention_backend,
-        )
-    else:
-        backend = LocalSpecProvider()
+    backend, uses_sglang_backend = _select_local_backend(
+        use_sglang=use_sglang,
+        use_kitchen=use_kitchen,
+        use_kitchen_attention=use_kitchen_attention,
+        kitchen_attention_backend=kitchen_attention_backend,
+    )
     # Adjust for RMS norm.
     if normalization == "RMSNorm":
         layer_norm = backend.layer_norm(rms_norm=True, for_qk=False)
@@ -387,7 +402,9 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
-    bias_dropout_add = get_sglang_bias_dropout_add if use_sglang else get_bias_dropout_add
+    bias_dropout_add = (
+        get_sglang_bias_dropout_add if uses_sglang_backend else get_bias_dropout_add
+    )
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -551,6 +568,7 @@ def get_gpt_decoder_layer_specs(
         "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
         f"but got {config.experimental_attention_variant=}."
     )
+    uses_sglang_backend = resolve_true_on_policy_runtime_policy(config).use_sglang_backend
 
     if use_transformer_engine:
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -583,7 +601,7 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
-            use_sglang=config.use_sglang,
+            use_sglang=uses_sglang_backend,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -594,7 +612,7 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
-            use_sglang=config.use_sglang,
+            use_sglang=uses_sglang_backend,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -665,11 +683,12 @@ def get_gpt_decoder_block_spec(
     # Block spec.
     norm_type = normalization if normalization is not None else getattr(config, "normalization", "LayerNorm")
 
-    if config.use_sglang and norm_type == "RMSNorm":
+    uses_sglang_backend = resolve_true_on_policy_runtime_policy(config).use_sglang_backend
+    if uses_sglang_backend and norm_type == "RMSNorm":
         layer_norm_impl = SGLangFinalRMSNorm
     elif use_transformer_engine:
         layer_norm_impl = TENorm
-    elif config.use_sglang:
+    elif uses_sglang_backend:
         layer_norm_impl = SGLangNorm
     else:
         layer_norm_impl = LNImpl
@@ -698,7 +717,7 @@ def get_gpt_mtp_block_spec(
         else:
             backend = TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn)
     else:
-        if config.use_sglang:
+        if resolve_true_on_policy_runtime_policy(config).use_sglang_backend:
             backend = SGLangSpecProvider()
         else:
             backend = (

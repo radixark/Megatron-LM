@@ -38,6 +38,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
@@ -628,7 +629,7 @@ class GPTModel(LanguageModule):
         )
 
     def _apply_true_on_policy_logits_contract(self, logits: Optional[Tensor]) -> Optional[Tensor]:
-        if not self.config.use_sglang:
+        if not resolve_true_on_policy_runtime_policy(self.config).apply_logits_contract:
             return logits
         return apply_true_on_policy_logits_contract(
             logits,

@@ -183,6 +183,7 @@ def test_contract_object_owns_megatron_runtime_policy_values():
     assert policy.cast_lm_head_input_to_weight_dtype
     assert policy.deterministic_row_parallel_reduce
     assert policy.defer_ulysses_cp_loss_scaling_to_grad_sum
+    assert policy.apply_logits_contract
 
 
 def test_use_sglang_without_contract_defaults_to_qwen3_dense_policy():
