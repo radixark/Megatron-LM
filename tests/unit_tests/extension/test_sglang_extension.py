@@ -104,10 +104,19 @@ def test_sglang_extension_imports():
 def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
     from megatron.core.extensions import sglang as legacy_backend
     from megatron.core.tensor_parallel import matmul_tp_inv as legacy_matmul
+    from megatron.core.true_on_policy import attention_fa3, bias_dropout, cp_layout, linear, norm, provider, rope, runtime
     from megatron.core.true_on_policy import matmul, sglang_backend
 
     assert legacy_backend.SGLangNorm is sglang_backend.SGLangNorm
     assert legacy_backend.SGLangRowParallelLinear is sglang_backend.SGLangRowParallelLinear
+    assert sglang_backend.SGLangColumnParallelLinear is linear.SGLangColumnParallelLinear
+    assert sglang_backend.SGLangCoreAttention is attention_fa3.SGLangCoreAttention
+    assert sglang_backend.SGLangUlyssesCPLayout is cp_layout.SGLangUlyssesCPLayout
+    assert sglang_backend.SGLangNorm is norm.SGLangNorm
+    assert sglang_backend.SGLangSpecProvider is provider.SGLangSpecProvider
+    assert sglang_backend.get_sglang_bias_dropout_add is bias_dropout.get_sglang_bias_dropout_add
+    assert sglang_backend.enable_sglang_batch_invariant_mode is runtime.enable_sglang_batch_invariant_mode
+    assert sglang_backend.sglang_apply_rotary_pos_emb is rope.sglang_apply_rotary_pos_emb
     assert legacy_matmul.sglang_reference_matmul is matmul.sglang_reference_matmul
 
 
