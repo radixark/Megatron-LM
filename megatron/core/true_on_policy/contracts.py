@@ -36,7 +36,9 @@ class MegatronTrueOnPolicyRuntimePolicy:
     disable_bias_swiglu_fusion: bool
     attention_backend: str
     cp_layout: Optional[str]
+    cast_attention_input_to_dense_math_dtype: bool
     cast_qk_norm_input_before_weight_mul: bool
+    cast_qk_after_rope_to_dense_math_dtype: bool
     cast_lm_head_input_to_weight_dtype: bool
     deterministic_row_parallel_reduce: bool
     defer_ulysses_cp_loss_scaling_to_grad_sum: bool
@@ -55,7 +57,9 @@ DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
     disable_bias_swiglu_fusion=False,
     attention_backend="default",
     cp_layout=None,
+    cast_attention_input_to_dense_math_dtype=False,
     cast_qk_norm_input_before_weight_mul=True,
+    cast_qk_after_rope_to_dense_math_dtype=False,
     cast_lm_head_input_to_weight_dtype=False,
     deterministic_row_parallel_reduce=False,
     defer_ulysses_cp_loss_scaling_to_grad_sum=False,
@@ -90,7 +94,9 @@ class MegatronTrueOnPolicyContract:
             disable_bias_swiglu_fusion=True,
             attention_backend="fa3_varlen",
             cp_layout="ulysses_a2a" if uses_ulysses_cp else None,
+            cast_attention_input_to_dense_math_dtype=True,
             cast_qk_norm_input_before_weight_mul=True,
+            cast_qk_after_rope_to_dense_math_dtype=True,
             cast_lm_head_input_to_weight_dtype=True,
             deterministic_row_parallel_reduce=True,
             defer_ulysses_cp_loss_scaling_to_grad_sum=True,

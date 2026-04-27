@@ -46,6 +46,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -1243,7 +1244,8 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
-        if self.config.use_sglang:
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+        if true_on_policy_policy.cast_qk_after_rope_to_dense_math_dtype:
             # SGLang Qwen3 casts Q/K after QK RMSNorm and RoPE, before attention.
             query = _sglang_cast_dense_tensor_math_input(query)
             key = _sglang_cast_dense_tensor_math_input(key)
@@ -1517,7 +1519,8 @@ class SelfAttention(Attention):
         If `output_gate` is True, then also derives `gate` tensor.
         If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
         """
-        if self.config.use_sglang:
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+        if true_on_policy_policy.cast_attention_input_to_dense_math_dtype:
             hidden_states = _sglang_cast_dense_tensor_math_input(hidden_states)
 
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
