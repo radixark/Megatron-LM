@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
-from megatron.core.extensions.sglang import (
+from megatron.core.true_on_policy.sglang_backend import (
     SGLangColumnParallelLinear,
     SGLangCoreAttention,
     SGLangFinalRMSNorm,
@@ -26,7 +26,7 @@ from megatron.core.extensions.sglang import (
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.layers import linear_with_grad_accumulation_and_async_allreduce
-from megatron.core.tensor_parallel.matmul_tp_inv import (
+from megatron.core.true_on_policy.matmul import (
     _sglang_row_parallel_matmul,
     sglang_reference_matmul,
 )
@@ -99,6 +99,16 @@ def test_sglang_extension_imports():
     assert SGLangRowParallelLinear.backend_name == "sglang"
     assert SGLangNorm.backend_name == "sglang"
     assert callable(sglang_reference_matmul)
+
+
+def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
+    from megatron.core.extensions import sglang as legacy_backend
+    from megatron.core.tensor_parallel import matmul_tp_inv as legacy_matmul
+    from megatron.core.true_on_policy import matmul, sglang_backend
+
+    assert legacy_backend.SGLangNorm is sglang_backend.SGLangNorm
+    assert legacy_backend.SGLangRowParallelLinear is sglang_backend.SGLangRowParallelLinear
+    assert legacy_matmul.sglang_reference_matmul is matmul.sglang_reference_matmul
 
 
 def test_use_sglang_arg_parsing(monkeypatch):

@@ -318,7 +318,7 @@ def _get_block_submodules(
             num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
             layer_norm = LayerNormImpl
             if config.use_sglang:
-                from megatron.core.extensions.sglang import SGLangFinalRMSNorm, SGLangNorm
+                from megatron.core.true_on_policy.sglang_backend import SGLangFinalRMSNorm, SGLangNorm
 
                 layer_norm = (
                     SGLangFinalRMSNorm

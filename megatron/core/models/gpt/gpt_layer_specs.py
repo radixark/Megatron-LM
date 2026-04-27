@@ -55,7 +55,7 @@ try:
 except ImportError:
     HAVE_KITCHEN = False
 
-from megatron.core.extensions.sglang import (
+from megatron.core.true_on_policy.sglang_backend import (
     SGLangFinalRMSNorm,
     SGLangNorm,
     SGLangSpecProvider,
@@ -350,7 +350,7 @@ def get_gpt_layer_local_spec(
 
     if use_sglang:
         assert not use_kitchen, "use_sglang is not compatible with use_kitchen."
-        from megatron.core.extensions.sglang import (
+        from megatron.core.true_on_policy.sglang_backend import (
             enable_sglang_batch_invariant_mode,
             enable_sglang_rope,
         )

@@ -19,7 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb_with_cos_sin,
 )
 try:
-    from megatron.core.extensions.sglang import (
+    from megatron.core.true_on_policy.sglang_backend import (
         is_sglang_rope_enabled,
         sglang_apply_rotary_pos_emb_with_freqs,
     )
