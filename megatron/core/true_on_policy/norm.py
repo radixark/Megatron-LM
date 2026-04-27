@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -121,20 +122,14 @@ class SGLangQKRMSNorm(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        del config
         del persist_layer_norm
         del zero_centered_gamma
         del normalization
 
         self.hidden_size = (hidden_size,)
         self.eps = eps
-        try:
-            from sglang.srt.server_args import get_global_server_args
-
-            target = getattr(get_global_server_args(), "rl_on_policy_target", None)
-        except Exception:
-            target = None
-        self.cast_x_before_out_mul = target in ("fsdp", "fsdp_tp", None)
+        policy = resolve_true_on_policy_runtime_policy(config)
+        self.cast_x_before_out_mul = policy.cast_qk_norm_input_before_weight_mul
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -13,6 +13,11 @@ from megatron.core.true_on_policy.bias_dropout import (
     get_sglang_bias_dropout_add,
 )
 from megatron.core.true_on_policy.cp_layout import SGLangUlyssesCPLayout
+from megatron.core.true_on_policy.contracts import (
+    QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    MegatronTrueOnPolicyRuntimePolicy,
+    resolve_true_on_policy_runtime_policy,
+)
 from megatron.core.true_on_policy.linear import (
     SGLangColumnParallelLinear,
     SGLangRowParallelLinear,
@@ -39,6 +44,8 @@ _ensure_batch_invariant_mode_from_config = ensure_batch_invariant_mode_from_conf
 
 __all__ = [
     "HAVE_FA3_VARLEN",
+    "QWEN3_DENSE_TRUE_ON_POLICY_V1",
+    "MegatronTrueOnPolicyRuntimePolicy",
     "SGLangColumnParallelLinear",
     "SGLangCoreAttention",
     "SGLangFinalRMSNorm",
@@ -55,6 +62,7 @@ __all__ = [
     "fa3_varlen_func",
     "get_sglang_bias_dropout_add",
     "is_sglang_rope_enabled",
+    "resolve_true_on_policy_runtime_policy",
     "sglang_apply_rotary_pos_emb",
     "sglang_apply_rotary_pos_emb_with_freqs",
 ]

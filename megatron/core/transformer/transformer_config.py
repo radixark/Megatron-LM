@@ -508,6 +508,9 @@ class TransformerConfig(ModelParallelConfig):
     use_sglang: bool = False
     """Use the correctness-first SGLang-compatible Megatron backend surface."""
 
+    true_on_policy_contract: Optional[str] = None
+    """Internal true-on-policy parity contract selected by the launcher."""
+
     true_on_policy_vocab_size: Optional[int] = None
     """Optional non-padded vocab size for SGLang-compatible scoring logits."""
 
@@ -936,6 +939,10 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.true_on_policy_contract is not None:
+            from megatron.core.true_on_policy.contracts import validate_true_on_policy_contract
+
+            validate_true_on_policy_contract(self.true_on_policy_contract)
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."

@@ -11,6 +11,8 @@ import torch
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.true_on_policy.sglang_backend import (
+    QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    MegatronTrueOnPolicyRuntimePolicy,
     SGLangColumnParallelLinear,
     SGLangCoreAttention,
     SGLangFinalRMSNorm,
@@ -22,6 +24,7 @@ from megatron.core.true_on_policy.sglang_backend import (
     disable_sglang_rope,
     get_sglang_bias_dropout_add,
     is_sglang_rope_enabled,
+    resolve_true_on_policy_runtime_policy,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -99,6 +102,7 @@ def test_sglang_extension_imports():
     assert SGLangRowParallelLinear.backend_name == "sglang"
     assert SGLangNorm.backend_name == "sglang"
     assert callable(sglang_reference_matmul)
+    assert MegatronTrueOnPolicyRuntimePolicy.__name__ == "MegatronTrueOnPolicyRuntimePolicy"
 
 
 def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
@@ -117,16 +121,57 @@ def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
     assert sglang_backend.get_sglang_bias_dropout_add is bias_dropout.get_sglang_bias_dropout_add
     assert sglang_backend.enable_sglang_batch_invariant_mode is runtime.enable_sglang_batch_invariant_mode
     assert sglang_backend.sglang_apply_rotary_pos_emb is rope.sglang_apply_rotary_pos_emb
+    assert sglang_backend.resolve_true_on_policy_runtime_policy is resolve_true_on_policy_runtime_policy
     assert legacy_matmul.sglang_reference_matmul is matmul.sglang_reference_matmul
 
 
 def test_use_sglang_arg_parsing(monkeypatch):
     field_names = {field.name for field in dataclasses.fields(TransformerConfig)}
     assert "use_sglang" in field_names
+    assert "true_on_policy_contract" in field_names
 
-    args = _parse_training_args(monkeypatch, "--use-sglang")
+    args = _parse_training_args(
+        monkeypatch,
+        "--use-sglang",
+        "--true-on-policy-contract",
+        QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    )
 
     assert args.use_sglang is True
+    assert args.true_on_policy_contract == QWEN3_DENSE_TRUE_ON_POLICY_V1
+
+
+def test_true_on_policy_contract_resolves_megatron_runtime_policy():
+    config = _make_config(
+        use_sglang=True,
+        batch_invariant_mode=True,
+        context_parallel_size=4,
+        attention_backend=AttnBackend.flash,
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    )
+
+    policy = resolve_true_on_policy_runtime_policy(config)
+
+    assert policy.contract_name == QWEN3_DENSE_TRUE_ON_POLICY_V1
+    assert policy.use_sglang_backend
+    assert policy.batch_invariant_mode
+    assert policy.attention_backend == "fa3_varlen"
+    assert policy.cp_layout == "ulysses_a2a"
+
+
+def test_use_sglang_without_contract_defaults_to_qwen3_dense_policy():
+    config = _make_config(use_sglang=True)
+
+    with pytest.warns(UserWarning, match="defaults to 'qwen3_dense_true_on_policy_v1'"):
+        policy = resolve_true_on_policy_runtime_policy(config)
+
+    assert policy.contract_name == QWEN3_DENSE_TRUE_ON_POLICY_V1
+    assert policy.enabled
+
+
+def test_invalid_true_on_policy_contract_is_rejected_by_config():
+    with pytest.raises(ValueError, match="Unsupported Megatron true-on-policy contract"):
+        _make_config(true_on_policy_contract="unknown_contract")
 
 
 def test_validate_args_rejects_incompatible_sglang_backend(monkeypatch):
