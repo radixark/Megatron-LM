@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional
-import warnings
 
 
 QWEN3_DENSE_TRUE_ON_POLICY_V1 = "qwen3_dense_true_on_policy_v1"
+_WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT = False
 
 
 @dataclass(frozen=True)
@@ -46,15 +47,19 @@ def validate_true_on_policy_contract(contract_name: Optional[str]) -> None:
 
 
 def resolve_true_on_policy_runtime_policy(config) -> MegatronTrueOnPolicyRuntimePolicy:
+    global _WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT
+
     contract_name = getattr(config, "true_on_policy_contract", None)
     if contract_name is None and getattr(config, "use_sglang", False):
         contract_name = QWEN3_DENSE_TRUE_ON_POLICY_V1
-        warnings.warn(
-            "--use-sglang without --true-on-policy-contract defaults to "
-            f"{QWEN3_DENSE_TRUE_ON_POLICY_V1!r} for backward compatibility. "
-            "Pass the contract explicitly for new true-on-policy runs.",
-            stacklevel=2,
-        )
+        if not _WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT:
+            warnings.warn(
+                "--use-sglang without --true-on-policy-contract defaults to "
+                f"{QWEN3_DENSE_TRUE_ON_POLICY_V1!r} for backward compatibility. "
+                "Pass the contract explicitly for new true-on-policy runs.",
+                stacklevel=2,
+            )
+            _WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT = True
     if contract_name is None:
         return DEFAULT_RUNTIME_POLICY
 
