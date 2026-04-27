@@ -180,6 +180,9 @@ def test_contract_object_owns_megatron_runtime_policy_values():
     assert policy.disable_rope_fusion
     assert policy.disable_bias_swiglu_fusion
     assert policy.attention_backend == "fa3_varlen"
+    assert policy.cast_lm_head_input_to_weight_dtype
+    assert policy.deterministic_row_parallel_reduce
+    assert policy.defer_ulysses_cp_loss_scaling_to_grad_sum
 
 
 def test_use_sglang_without_contract_defaults_to_qwen3_dense_policy():

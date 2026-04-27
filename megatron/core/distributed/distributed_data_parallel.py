@@ -11,6 +11,7 @@ from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
+from ..true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
@@ -25,11 +26,13 @@ def _first_cp_comm_type(cp_comm_type):
     return cp_comm_type
 
 
-def _use_sglang_ulysses_cp_gradient_scaling(config: TransformerConfig) -> bool:
+def _use_true_on_policy_ulysses_cp_gradient_scaling(config: TransformerConfig) -> bool:
     """Return true when CP loss scaling is deferred to the CP gradient sum."""
 
     return (
-        getattr(config, "use_sglang", False)
+        resolve_true_on_policy_runtime_policy(
+            config
+        ).defer_ulysses_cp_loss_scaling_to_grad_sum
         and getattr(config, "context_parallel_size", 1) > 1
         and _first_cp_comm_type(getattr(config, "cp_comm_type", None)) == "a2a"
         and not getattr(config, "calculate_per_token_loss", False)
@@ -37,7 +40,7 @@ def _use_sglang_ulysses_cp_gradient_scaling(config: TransformerConfig) -> bool:
 
 
 def _dense_gradient_scaling_factor(config: TransformerConfig, dp_cp_world_size: int) -> float:
-    if _use_sglang_ulysses_cp_gradient_scaling(config):
+    if _use_true_on_policy_ulysses_cp_gradient_scaling(config):
         return float(getattr(config, "context_parallel_size", 1)) / float(dp_cp_world_size)
     return 1.0 / float(dp_cp_world_size)
 

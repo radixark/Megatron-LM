@@ -29,6 +29,7 @@ from megatron.core.utils import (
 )
 
 from ..dist_checkpointing.mapping import ShardedStateDict
+from ..true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from .mappings import (
     copy_to_tensor_model_parallel_region,
@@ -1452,7 +1453,9 @@ class RowParallelLinear(torch.nn.Module):
             output_ = reduce_from_tensor_model_parallel_region(
                 output_parallel,
                 group=self.tp_group,
-                deterministic=self.config.use_sglang,
+                deterministic=resolve_true_on_policy_runtime_policy(
+                    self.config
+                ).deterministic_row_parallel_reduce,
             )
         if not self.skip_bias_add:
             output = (output_ + self.bias) if self.bias is not None else output_

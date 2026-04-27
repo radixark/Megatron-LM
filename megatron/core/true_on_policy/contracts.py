@@ -29,6 +29,9 @@ class MegatronTrueOnPolicyRuntimePolicy:
     attention_backend: str
     cp_layout: Optional[str]
     cast_qk_norm_input_before_weight_mul: bool
+    cast_lm_head_input_to_weight_dtype: bool
+    deterministic_row_parallel_reduce: bool
+    defer_ulysses_cp_loss_scaling_to_grad_sum: bool
 
 
 DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
@@ -41,6 +44,9 @@ DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
     attention_backend="default",
     cp_layout=None,
     cast_qk_norm_input_before_weight_mul=True,
+    cast_lm_head_input_to_weight_dtype=False,
+    deterministic_row_parallel_reduce=False,
+    defer_ulysses_cp_loss_scaling_to_grad_sum=False,
 )
 
 
@@ -67,6 +73,9 @@ class MegatronTrueOnPolicyContract:
             if getattr(config, "context_parallel_size", 1) > 1
             else None,
             cast_qk_norm_input_before_weight_mul=True,
+            cast_lm_head_input_to_weight_dtype=True,
+            deterministic_row_parallel_reduce=True,
+            defer_ulysses_cp_loss_scaling_to_grad_sum=True,
         )
 
 
