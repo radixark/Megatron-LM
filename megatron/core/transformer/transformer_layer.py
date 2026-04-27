@@ -24,6 +24,7 @@ from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
@@ -721,8 +722,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.  The SGLang path carries MLP output and residual as a
         # pair across layer boundaries to match SGLang's LayerCommunicator flow.
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
         sglang_carried_residual = (
-            getattr(hidden_states, "_sglang_residual", None) if self.config.use_sglang else None
+            getattr(hidden_states, "_sglang_residual", None)
+            if true_on_policy_policy.use_sglang_residual_pair
+            else None
         )
         residual = sglang_carried_residual if sglang_carried_residual is not None else hidden_states
 
@@ -803,7 +807,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
-        elif self.config.use_sglang:
+        elif true_on_policy_policy.use_sglang_residual_pair:
             attention_output, attention_output_bias = attention_output_with_bias
             if attention_output_bias is not None:
                 attention_output = attention_output + attention_output_bias
@@ -914,7 +918,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             del self._sglang_pre_mlp_residual
 
         # Optional Layer norm post the cross-attention.
-        if self.config.use_sglang and residual is not hidden_states:
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+        if true_on_policy_policy.use_sglang_residual_pair and residual is not hidden_states:
             pre_mlp_layernorm_output, residual = self._forward_pre_mlp_layernorm(
                 hidden_states, residual
             )
@@ -1027,12 +1032,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
         if using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
-        elif self.config.use_sglang:
+        elif true_on_policy_policy.use_sglang_residual_pair:
             mlp_output, mlp_output_bias = mlp_output_with_bias
             if mlp_output_bias is not None:
                 mlp_output = mlp_output + mlp_output_bias
@@ -1061,7 +1067,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
-        if self.config.use_sglang:
+        if true_on_policy_policy.use_sglang_residual_pair:
             output._sglang_residual = residual
 
         return output
