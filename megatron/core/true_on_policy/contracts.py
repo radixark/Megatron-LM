@@ -6,8 +6,13 @@ import warnings
 from dataclasses import dataclass
 from typing import Optional
 
+from megatron.core.true_on_policy.schema import (
+    QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
+    TrueOnPolicyContractName,
+    TrueOnPolicyContractSchema,
+)
 
-QWEN3_DENSE_TRUE_ON_POLICY_V1 = "qwen3_dense_true_on_policy_v1"
+QWEN3_DENSE_TRUE_ON_POLICY_V1 = QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA.name
 _WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT = False
 
 
@@ -39,11 +44,57 @@ DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
 )
 
 
+@dataclass(frozen=True)
+class MegatronTrueOnPolicyContract:
+    """Megatron-local adapter from a shared contract schema to runtime policy."""
+
+    schema: TrueOnPolicyContractSchema
+
+    @property
+    def name(self) -> TrueOnPolicyContractName:
+        return self.schema.name
+
+    def policy_for(self, config) -> MegatronTrueOnPolicyRuntimePolicy:
+        return MegatronTrueOnPolicyRuntimePolicy(
+            contract_name=self.name,
+            enabled=True,
+            use_sglang_backend=getattr(config, "use_sglang", False),
+            batch_invariant_mode=getattr(config, "batch_invariant_mode", False),
+            disable_rope_fusion=True,
+            disable_bias_swiglu_fusion=True,
+            attention_backend="fa3_varlen",
+            cp_layout="ulysses_a2a"
+            if getattr(config, "context_parallel_size", 1) > 1
+            else None,
+            cast_qk_norm_input_before_weight_mul=True,
+        )
+
+
+QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT = MegatronTrueOnPolicyContract(
+    schema=QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
+)
+
+
+_CONTRACT_BY_NAME = {
+    QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT,
+}
+
+
+def get_true_on_policy_contract(contract_name: str) -> MegatronTrueOnPolicyContract:
+    try:
+        return _CONTRACT_BY_NAME[contract_name]
+    except KeyError as exc:
+        supported = ", ".join(sorted(_CONTRACT_BY_NAME))
+        raise ValueError(
+            f"Unsupported Megatron true-on-policy contract {contract_name!r}. "
+            f"Supported contracts: {supported}"
+        ) from exc
+
+
 def validate_true_on_policy_contract(contract_name: Optional[str]) -> None:
     if contract_name is None:
         return
-    if contract_name != QWEN3_DENSE_TRUE_ON_POLICY_V1:
-        raise ValueError(f"Unsupported Megatron true-on-policy contract: {contract_name!r}")
+    get_true_on_policy_contract(contract_name)
 
 
 def resolve_true_on_policy_runtime_policy(config) -> MegatronTrueOnPolicyRuntimePolicy:
@@ -64,16 +115,4 @@ def resolve_true_on_policy_runtime_policy(config) -> MegatronTrueOnPolicyRuntime
         return DEFAULT_RUNTIME_POLICY
 
     validate_true_on_policy_contract(contract_name)
-    return MegatronTrueOnPolicyRuntimePolicy(
-        contract_name=contract_name,
-        enabled=True,
-        use_sglang_backend=getattr(config, "use_sglang", False),
-        batch_invariant_mode=getattr(config, "batch_invariant_mode", False),
-        disable_rope_fusion=True,
-        disable_bias_swiglu_fusion=True,
-        attention_backend="fa3_varlen",
-        cp_layout="ulysses_a2a"
-        if getattr(config, "context_parallel_size", 1) > 1
-        else None,
-        cast_qk_norm_input_before_weight_mul=True,
-    )
+    return get_true_on_policy_contract(contract_name).policy_for(config)

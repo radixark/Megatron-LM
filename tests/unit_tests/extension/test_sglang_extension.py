@@ -26,6 +26,7 @@ from megatron.core.true_on_policy.sglang_backend import (
     is_sglang_rope_enabled,
     resolve_true_on_policy_runtime_policy,
 )
+from megatron.core.true_on_policy.contracts import get_true_on_policy_contract
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.layers import linear_with_grad_accumulation_and_async_allreduce
@@ -157,6 +158,28 @@ def test_true_on_policy_contract_resolves_megatron_runtime_policy():
     assert policy.batch_invariant_mode
     assert policy.attention_backend == "fa3_varlen"
     assert policy.cp_layout == "ulysses_a2a"
+
+
+def test_contract_object_owns_megatron_runtime_policy_values():
+    contract = get_true_on_policy_contract(QWEN3_DENSE_TRUE_ON_POLICY_V1)
+    config = _make_config(
+        use_sglang=True,
+        batch_invariant_mode=True,
+        attention_backend=AttnBackend.flash,
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    )
+
+    policy = contract.policy_for(config)
+
+    assert contract.schema.name == QWEN3_DENSE_TRUE_ON_POLICY_V1
+    assert contract.schema.model_family == "qwen3_dense"
+    assert policy.contract_name == QWEN3_DENSE_TRUE_ON_POLICY_V1
+    assert policy.enabled
+    assert policy.use_sglang_backend
+    assert policy.batch_invariant_mode
+    assert policy.disable_rope_fusion
+    assert policy.disable_bias_swiglu_fusion
+    assert policy.attention_backend == "fa3_varlen"
 
 
 def test_use_sglang_without_contract_defaults_to_qwen3_dense_policy():
