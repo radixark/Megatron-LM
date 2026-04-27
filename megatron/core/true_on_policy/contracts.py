@@ -16,6 +16,14 @@ QWEN3_DENSE_TRUE_ON_POLICY_V1 = QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA.name
 _WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT = False
 
 
+def _cp_comm_type_uses_a2a(cp_comm_type) -> bool:
+    if isinstance(cp_comm_type, str):
+        return cp_comm_type == "a2a"
+    if isinstance(cp_comm_type, list):
+        return any(item == "a2a" for item in cp_comm_type)
+    return False
+
+
 @dataclass(frozen=True)
 class MegatronTrueOnPolicyRuntimePolicy:
     """Megatron-local behavior implied by a true-on-policy parity contract."""
@@ -33,6 +41,9 @@ class MegatronTrueOnPolicyRuntimePolicy:
     deterministic_row_parallel_reduce: bool
     defer_ulysses_cp_loss_scaling_to_grad_sum: bool
     apply_logits_contract: bool
+    use_sglang_final_norm: bool
+    use_sglang_residual_pair: bool
+    use_ulysses_cp_recompute_fallback: bool
 
 
 DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
@@ -49,6 +60,9 @@ DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
     deterministic_row_parallel_reduce=False,
     defer_ulysses_cp_loss_scaling_to_grad_sum=False,
     apply_logits_contract=False,
+    use_sglang_final_norm=False,
+    use_sglang_residual_pair=False,
+    use_ulysses_cp_recompute_fallback=False,
 )
 
 
@@ -63,6 +77,10 @@ class MegatronTrueOnPolicyContract:
         return self.schema.name
 
     def policy_for(self, config) -> MegatronTrueOnPolicyRuntimePolicy:
+        uses_ulysses_cp = (
+            getattr(config, "context_parallel_size", 1) > 1
+            and _cp_comm_type_uses_a2a(getattr(config, "cp_comm_type", None))
+        )
         return MegatronTrueOnPolicyRuntimePolicy(
             contract_name=self.name,
             enabled=True,
@@ -71,14 +89,15 @@ class MegatronTrueOnPolicyContract:
             disable_rope_fusion=True,
             disable_bias_swiglu_fusion=True,
             attention_backend="fa3_varlen",
-            cp_layout="ulysses_a2a"
-            if getattr(config, "context_parallel_size", 1) > 1
-            else None,
+            cp_layout="ulysses_a2a" if uses_ulysses_cp else None,
             cast_qk_norm_input_before_weight_mul=True,
             cast_lm_head_input_to_weight_dtype=True,
             deterministic_row_parallel_reduce=True,
             defer_ulysses_cp_loss_scaling_to_grad_sum=True,
             apply_logits_contract=True,
+            use_sglang_final_norm=True,
+            use_sglang_residual_pair=True,
+            use_ulysses_cp_recompute_fallback=uses_ulysses_cp,
         )
 
 

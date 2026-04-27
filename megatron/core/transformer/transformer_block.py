@@ -29,6 +29,8 @@ from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from megatron.core.true_on_policy.sglang_backend import SGLangFinalRMSNorm, SGLangNorm
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import (
     WrappedTensor,
@@ -119,14 +121,6 @@ def _maybe_dump_final_layernorm_backward(name: str, tensor: Optional[Tensor]) ->
         return grad
 
     tensor.register_hook(hook)
-
-
-def _cp_comm_type_uses_a2a(cp_comm_type: Optional[Union[str, List[str]]]) -> bool:
-    if isinstance(cp_comm_type, str):
-        return cp_comm_type == "a2a"
-    if isinstance(cp_comm_type, list):
-        return any(item == "a2a" for item in cp_comm_type)
-    return False
 
 
 def _get_sglang_cp_recompute_mode() -> str:
@@ -317,9 +311,7 @@ def _get_block_submodules(
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
             layer_norm = LayerNormImpl
-            if config.use_sglang:
-                from megatron.core.true_on_policy.sglang_backend import SGLangFinalRMSNorm, SGLangNorm
-
+            if resolve_true_on_policy_runtime_policy(config).use_sglang_final_norm:
                 layer_norm = (
                     SGLangFinalRMSNorm
                     if getattr(config, "normalization", None) == "RMSNorm"
@@ -573,12 +565,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         def checkpoint_handler(forward_func):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            use_sglang_cp_recompute_fallback = (
-                self.config.use_sglang
-                and self.config.context_parallel_size > 1
-                and _cp_comm_type_uses_a2a(self.config.cp_comm_type)
-            )
-            if use_sglang_cp_recompute_fallback:
+            true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+            if true_on_policy_policy.use_ulysses_cp_recompute_fallback:
                 mode = _get_sglang_cp_recompute_mode()
                 global _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK
                 if mode in ("disabled", "disable", "off", "none", "false", "0"):
@@ -905,9 +893,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Final layer norm.
         if self.final_layernorm is not None:
+            true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
             sglang_residual = (
                 getattr(hidden_states, "_sglang_residual", None)
-                if self.config.use_sglang
+                if true_on_policy_policy.use_sglang_residual_pair
                 else None
             )
             _maybe_dump_final_layernorm_backward(

@@ -147,6 +147,7 @@ def test_true_on_policy_contract_resolves_megatron_runtime_policy():
         use_sglang=True,
         batch_invariant_mode=True,
         context_parallel_size=4,
+        cp_comm_type="a2a",
         attention_backend=AttnBackend.flash,
         true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
     )
@@ -158,6 +159,7 @@ def test_true_on_policy_contract_resolves_megatron_runtime_policy():
     assert policy.batch_invariant_mode
     assert policy.attention_backend == "fa3_varlen"
     assert policy.cp_layout == "ulysses_a2a"
+    assert policy.use_ulysses_cp_recompute_fallback
 
 
 def test_contract_object_owns_megatron_runtime_policy_values():
@@ -184,6 +186,25 @@ def test_contract_object_owns_megatron_runtime_policy_values():
     assert policy.deterministic_row_parallel_reduce
     assert policy.defer_ulysses_cp_loss_scaling_to_grad_sum
     assert policy.apply_logits_contract
+    assert policy.use_sglang_final_norm
+    assert policy.use_sglang_residual_pair
+    assert not policy.use_ulysses_cp_recompute_fallback
+
+
+def test_qwen3_dense_contract_only_marks_ulysses_a2a_as_cp_layout():
+    contract = get_true_on_policy_contract(QWEN3_DENSE_TRUE_ON_POLICY_V1)
+
+    policy = contract.policy_for(
+        _make_config(
+            use_sglang=True,
+            context_parallel_size=4,
+            cp_comm_type="all_gather",
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+        )
+    )
+
+    assert policy.cp_layout is None
+    assert not policy.use_ulysses_cp_recompute_fallback
 
 
 def test_use_sglang_without_contract_defaults_to_qwen3_dense_policy():
