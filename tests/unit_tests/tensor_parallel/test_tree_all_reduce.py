@@ -66,7 +66,6 @@ def test_row_parallel_default_path_keeps_standard_reduce(monkeypatch):
             perform_initialization=False,
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
-            use_sglang=False,
         )
         layer = RowParallelLinear(
             input_size=8,
@@ -107,8 +106,8 @@ def test_row_parallel_sglang_path_uses_deterministic_reduce(monkeypatch):
             perform_initialization=False,
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
-            use_sglang=True,
             transformer_impl="local",
+            true_on_policy_contract="qwen3_dense_true_on_policy_v1",
         )
         layer = RowParallelLinear(
             input_size=8,

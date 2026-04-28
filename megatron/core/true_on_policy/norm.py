@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
@@ -139,9 +138,6 @@ class SGLangQKRMSNorm(torch.nn.Module):
         orig_dtype = x.dtype
         x_float = x.to(torch.float32)
         x_float = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-
-        if os.environ.get("MEGATRON_ROPE_BF16", "0") == "1":
-            return (x_float.to(orig_dtype) * self.weight.to(orig_dtype)).to(orig_dtype)
 
         if self.cast_x_before_out_mul:
             return self.weight.float() * x_float.to(orig_dtype)

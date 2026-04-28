@@ -1,8 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
-
-import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,7 +11,6 @@ from megatron.core.true_on_policy.schema import (
 )
 
 QWEN3_DENSE_TRUE_ON_POLICY_V1 = QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA.name
-_WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT = False
 
 
 def _cp_comm_type_uses_a2a(cp_comm_type) -> bool:
@@ -88,7 +85,7 @@ class MegatronTrueOnPolicyContract:
         return MegatronTrueOnPolicyRuntimePolicy(
             contract_name=self.name,
             enabled=True,
-            use_sglang_backend=getattr(config, "use_sglang", False),
+            use_sglang_backend=True,
             batch_invariant_mode=getattr(config, "batch_invariant_mode", False),
             disable_rope_fusion=True,
             disable_bias_swiglu_fusion=True,
@@ -135,19 +132,7 @@ def validate_true_on_policy_contract(contract_name: Optional[str]) -> None:
 
 
 def resolve_true_on_policy_runtime_policy(config) -> MegatronTrueOnPolicyRuntimePolicy:
-    global _WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT
-
     contract_name = getattr(config, "true_on_policy_contract", None)
-    if contract_name is None and getattr(config, "use_sglang", False):
-        contract_name = QWEN3_DENSE_TRUE_ON_POLICY_V1
-        if not _WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT:
-            warnings.warn(
-                "--use-sglang without --true-on-policy-contract defaults to "
-                f"{QWEN3_DENSE_TRUE_ON_POLICY_V1!r} for backward compatibility. "
-                "Pass the contract explicitly for new true-on-policy runs.",
-                stacklevel=2,
-            )
-            _WARNED_IMPLICIT_QWEN3_DENSE_CONTRACT = True
     if contract_name is None:
         return DEFAULT_RUNTIME_POLICY
 

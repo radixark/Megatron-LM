@@ -126,25 +126,22 @@ def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
     assert legacy_matmul.sglang_reference_matmul is matmul.sglang_reference_matmul
 
 
-def test_use_sglang_arg_parsing(monkeypatch):
+def test_true_on_policy_contract_arg_parsing(monkeypatch):
     field_names = {field.name for field in dataclasses.fields(TransformerConfig)}
-    assert "use_sglang" in field_names
+    assert "use_sglang" not in field_names
     assert "true_on_policy_contract" in field_names
 
     args = _parse_training_args(
         monkeypatch,
-        "--use-sglang",
         "--true-on-policy-contract",
         QWEN3_DENSE_TRUE_ON_POLICY_V1,
     )
 
-    assert args.use_sglang is True
     assert args.true_on_policy_contract == QWEN3_DENSE_TRUE_ON_POLICY_V1
 
 
 def test_true_on_policy_contract_resolves_megatron_runtime_policy():
     config = _make_config(
-        use_sglang=True,
         batch_invariant_mode=True,
         context_parallel_size=4,
         cp_comm_type="a2a",
@@ -165,7 +162,6 @@ def test_true_on_policy_contract_resolves_megatron_runtime_policy():
 def test_contract_object_owns_megatron_runtime_policy_values():
     contract = get_true_on_policy_contract(QWEN3_DENSE_TRUE_ON_POLICY_V1)
     config = _make_config(
-        use_sglang=True,
         batch_invariant_mode=True,
         attention_backend=AttnBackend.flash,
         true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
@@ -198,7 +194,6 @@ def test_qwen3_dense_contract_only_marks_ulysses_a2a_as_cp_layout():
 
     policy = contract.policy_for(
         _make_config(
-            use_sglang=True,
             context_parallel_size=4,
             cp_comm_type="all_gather",
             true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
@@ -209,14 +204,13 @@ def test_qwen3_dense_contract_only_marks_ulysses_a2a_as_cp_layout():
     assert not policy.use_ulysses_cp_recompute_fallback
 
 
-def test_use_sglang_without_contract_defaults_to_qwen3_dense_policy():
-    config = _make_config(use_sglang=True)
+def test_missing_true_on_policy_contract_uses_default_policy():
+    config = _make_config()
 
-    with pytest.warns(UserWarning, match="defaults to 'qwen3_dense_true_on_policy_v1'"):
-        policy = resolve_true_on_policy_runtime_policy(config)
+    policy = resolve_true_on_policy_runtime_policy(config)
 
-    assert policy.contract_name == QWEN3_DENSE_TRUE_ON_POLICY_V1
-    assert policy.enabled
+    assert policy.contract_name is None
+    assert not policy.enabled
 
 
 def test_invalid_true_on_policy_contract_is_rejected_by_config():
@@ -224,21 +218,9 @@ def test_invalid_true_on_policy_contract_is_rejected_by_config():
         _make_config(true_on_policy_contract="unknown_contract")
 
 
-def test_validate_args_rejects_incompatible_sglang_backend(monkeypatch):
-    from megatron.training.arguments import validate_args
-
-    args = _parse_training_args(monkeypatch)
-    args.use_sglang = True
-    args.transformer_impl = "transformer_engine"
-
-    with pytest.raises(
-        AssertionError, match="--use-sglang currently requires --transformer-impl local"
-    ):
-        validate_args(args)
-
 
 def test_default_backend_selection_is_unchanged():
-    config = _make_config(use_sglang=False)
+    config = _make_config()
 
     layer_spec = get_gpt_decoder_layer_specs(
         config,
@@ -251,9 +233,12 @@ def test_default_backend_selection_is_unchanged():
     assert layer_spec.submodules.self_attention.submodules.linear_proj is RowParallelLinear
 
 
-def test_use_sglang_selects_sglang_backend():
+def test_true_on_policy_contract_selects_sglang_backend():
     disable_sglang_rope()
-    config = _make_config(use_sglang=True, qk_layernorm=True)
+    config = _make_config(
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+        qk_layernorm=True,
+    )
 
     layer_spec = get_gpt_decoder_layer_specs(
         config,
@@ -273,8 +258,8 @@ def test_use_sglang_selects_sglang_backend():
     assert layer_spec.submodules.mlp_bda is get_sglang_bias_dropout_add
 
 
-def test_use_sglang_layer_spec_selects_sglang_final_norm():
-    config = _make_config(use_sglang=True)
+def test_true_on_policy_contract_layer_spec_selects_sglang_final_norm():
+    config = _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1)
     layer_spec = get_gpt_decoder_layer_specs(
         config,
         use_transformer_engine=False,
@@ -286,19 +271,31 @@ def test_use_sglang_layer_spec_selects_sglang_final_norm():
     assert block_submodules.layer_norm is SGLangFinalRMSNorm
 
 
-def test_transformer_config_rejects_incompatible_sglang_backend():
-    with pytest.raises(AssertionError, match="use_sglang currently requires transformer_impl='local'"):
-        _make_config(use_sglang=True, transformer_impl="transformer_engine")
+def test_transformer_config_rejects_incompatible_true_on_policy_backend():
+    with pytest.raises(
+        AssertionError,
+        match="true_on_policy_contract currently requires transformer_impl='local'",
+    ):
+        _make_config(
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            transformer_impl="transformer_engine",
+        )
 
 
-def test_transformer_config_rejects_sglang_with_kitchen():
-    with pytest.raises(AssertionError, match="use_sglang is not compatible with use_kitchen"):
-        _make_config(use_sglang=True, use_kitchen=True)
+def test_transformer_config_rejects_true_on_policy_with_kitchen():
+    with pytest.raises(
+        AssertionError,
+        match="true_on_policy_contract is not compatible with use_kitchen",
+    ):
+        _make_config(
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            use_kitchen=True,
+        )
 
 
 def test_sglang_config_allows_ulysses_context_parallel():
     config = _make_config(
-        use_sglang=True,
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
         batch_invariant_mode=True,
         attention_backend=AttnBackend.flash,
         tensor_model_parallel_size=1,
@@ -311,7 +308,7 @@ def test_sglang_config_allows_ulysses_context_parallel():
 
 def test_ulysses_rope_uses_cp_positions_for_local_sequence_shards():
     config = _make_config(
-        use_sglang=True,
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
         context_parallel_size=2,
         cp_comm_type="a2a",
     )
@@ -342,7 +339,7 @@ def test_ulysses_rope_uses_cp_positions_for_local_sequence_shards():
 
 def test_ulysses_rope_keeps_unsplit_positions_for_full_sequence_layout():
     config = _make_config(
-        use_sglang=True,
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
         context_parallel_size=2,
         cp_comm_type="a2a",
     )
@@ -370,10 +367,9 @@ def test_ulysses_rope_keeps_unsplit_positions_for_full_sequence_layout():
     torch.testing.assert_close(actual, expected)
 
 
-def test_local_attention_still_rejects_ulysses_context_parallel_without_sglang():
+def test_local_attention_still_rejects_ulysses_context_parallel_without_true_on_policy():
     with pytest.raises(ValueError, match="only supports all_gather"):
         _make_config(
-            use_sglang=False,
             tensor_model_parallel_size=1,
             context_parallel_size=2,
             cp_comm_type="a2a",
@@ -460,7 +456,7 @@ def test_sglang_backend_enables_batch_invariant_mode_from_config(monkeypatch):
 
     calls = []
     config = _make_config(
-        use_sglang=True,
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
         batch_invariant_mode=True,
         attention_backend=AttnBackend.flash,
     )
@@ -479,7 +475,10 @@ def test_sglang_backend_leaves_batch_invariant_mode_disabled(monkeypatch):
     from megatron.core.transformer.custom_layers import batch_invariant_kernels
 
     calls = []
-    config = _make_config(use_sglang=True, batch_invariant_mode=False)
+    config = _make_config(
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+        batch_invariant_mode=False,
+    )
 
     monkeypatch.setattr(batch_invariant_kernels, "is_batch_invariant_mode_enabled", lambda: False)
     monkeypatch.setattr(
@@ -535,7 +534,10 @@ def test_batch_invariant_linear_flattens_sequence_batch_for_gemm():
 
 def test_sglang_output_layer_casts_input_to_weight_dtype():
     with _fake_tp_init():
-        config = _make_config(use_sglang=True, use_cpu_initialization=True)
+        config = _make_config(
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            use_cpu_initialization=True,
+        )
         layer = LinearCrossEntropyModule(
             input_size=4,
             output_size=5,
@@ -706,7 +708,10 @@ def test_sglang_spec_provider_grouped_mlp_fallback():
 
 
 def test_sglang_mtp_spec_uses_sglang_backend():
-    config = _make_config(use_sglang=True, mtp_num_layers=1)
+    config = _make_config(
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+        mtp_num_layers=1,
+    )
     transformer_layer_spec = get_gpt_decoder_layer_specs(
         config,
         use_transformer_engine=False,
@@ -725,7 +730,7 @@ def test_sglang_mtp_spec_uses_sglang_backend():
 
 def test_sglang_column_parallel_linear_wrapper_forward_matches_reference():
     with _fake_tp_init():
-        config = _make_config(use_cpu_initialization=True)
+        config = _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1, use_cpu_initialization=True)
         layer = SGLangColumnParallelLinear(
             input_size=4,
             output_size=5,

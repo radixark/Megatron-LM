@@ -322,13 +322,13 @@ def get_gpt_layer_with_transformer_engine_spec(
 
 def _select_local_backend(
     *,
-    use_sglang: bool,
+    use_true_on_policy_backend: bool,
     use_kitchen: bool,
     use_kitchen_attention: bool,
     kitchen_attention_backend: str,
 ) -> tuple[BackendSpecProvider, bool]:
-    if use_sglang:
-        assert not use_kitchen, "use_sglang is not compatible with use_kitchen."
+    if use_true_on_policy_backend:
+        assert not use_kitchen, "true_on_policy_contract is not compatible with use_kitchen."
         enable_sglang_batch_invariant_mode()
         enable_sglang_rope()
         return SGLangSpecProvider(), True
@@ -355,7 +355,7 @@ def get_gpt_layer_local_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
-    use_sglang: bool = False,
+    use_true_on_policy_backend: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
 ) -> ModuleSpec:
@@ -377,7 +377,7 @@ def get_gpt_layer_local_spec(
     """
 
     backend, uses_sglang_backend = _select_local_backend(
-        use_sglang=use_sglang,
+        use_true_on_policy_backend=use_true_on_policy_backend,
         use_kitchen=use_kitchen,
         use_kitchen_attention=use_kitchen_attention,
         kitchen_attention_backend=kitchen_attention_backend,
@@ -601,7 +601,7 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
-            use_sglang=uses_sglang_backend,
+            use_true_on_policy_backend=uses_sglang_backend,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -612,7 +612,7 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
-            use_sglang=uses_sglang_backend,
+            use_true_on_policy_backend=uses_sglang_backend,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

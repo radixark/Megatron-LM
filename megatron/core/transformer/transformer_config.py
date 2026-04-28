@@ -505,9 +505,6 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
-    use_sglang: bool = False
-    """Use the correctness-first SGLang-compatible Megatron backend surface."""
-
     true_on_policy_contract: Optional[str] = None
     """Internal true-on-policy parity contract selected by the launcher."""
 
@@ -2025,7 +2022,10 @@ class TransformerConfig(ModelParallelConfig):
                 f" but got {self.transformer_impl=}."
             )
 
-        local_attention_requires_all_gather_cp = self.transformer_impl == "local" and not self.use_sglang
+        uses_true_on_policy_backend = self.true_on_policy_contract is not None
+        local_attention_requires_all_gather_cp = (
+            self.transformer_impl == "local" and not uses_true_on_policy_backend
+        )
         if self.fallback_to_eager_attn or local_attention_requires_all_gather_cp:
             if self.context_parallel_size > 1 and self.cp_comm_type is not None:
                 all_cp_comm_types_are_all_gather = (
@@ -2045,14 +2045,14 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
-            assert not self.use_sglang
+            assert self.true_on_policy_contract is None
 
-        if self.use_sglang:
+        if uses_true_on_policy_backend:
             assert self.transformer_impl == "local", (
-                f"use_sglang currently requires transformer_impl='local', "
+                f"true_on_policy_contract currently requires transformer_impl='local', "
                 f"but got {self.transformer_impl=}."
             )
-            assert not self.use_kitchen, "use_sglang is not compatible with use_kitchen."
+            assert not self.use_kitchen, "true_on_policy_contract is not compatible with use_kitchen."
         if self.true_on_policy_vocab_size is not None:
             assert self.true_on_policy_vocab_size > 0, "true_on_policy_vocab_size must be > 0."
 

@@ -9,8 +9,6 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 import logging
-import os
-
 import torch
 from torch import Tensor
 
@@ -121,16 +119,9 @@ def _apply_rotary_pos_emb_bshd(
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
     orig_dtype = t.dtype
-    rope_bf16 = os.environ.get("MEGATRON_ROPE_BF16", "0") == "1"
-
-    if rope_bf16:
-        cos_ = (torch.cos(freqs) * mscale).to(orig_dtype)
-        sin_ = (torch.sin(freqs) * mscale).to(orig_dtype)
-        t = (t.to(orig_dtype) * cos_) + (_rotate_half(t, rotary_interleaved).to(orig_dtype) * sin_)
-    else:
-        cos_ = (torch.cos(freqs) * mscale).float()
-        sin_ = (torch.sin(freqs) * mscale).float()
-        t = (t.float() * cos_) + (_rotate_half(t, rotary_interleaved).float() * sin_)
+    cos_ = (torch.cos(freqs) * mscale).float()
+    sin_ = (torch.sin(freqs) * mscale).float()
+    t = (t.float() * cos_) + (_rotate_half(t, rotary_interleaved).float() * sin_)
 
     return torch.cat((t.to(orig_dtype), t_pass), dim=-1)
 

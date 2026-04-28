@@ -321,14 +321,6 @@ def validate_args(args, defaults={}):
     if args.attention_backend == AttnBackend.local:
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
 
-    if args.use_sglang:
-        assert args.transformer_impl == 'local', (
-            '--use-sglang currently requires --transformer-impl local'
-        )
-        assert not getattr(args, 'use_kitchen', False), (
-            '--use-sglang is not compatible with --use-kitchen'
-        )
-
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
