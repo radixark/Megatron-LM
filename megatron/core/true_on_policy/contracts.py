@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -78,10 +79,9 @@ class MegatronTrueOnPolicyContract:
         return self.schema.name
 
     def policy_for(self, config) -> MegatronTrueOnPolicyRuntimePolicy:
-        uses_ulysses_cp = (
-            getattr(config, "context_parallel_size", 1) > 1
-            and _cp_comm_type_uses_a2a(getattr(config, "cp_comm_type", None))
-        )
+        uses_ulysses_cp = getattr(
+            config, "context_parallel_size", 1
+        ) > 1 and _cp_comm_type_uses_a2a(getattr(config, "cp_comm_type", None))
         return MegatronTrueOnPolicyRuntimePolicy(
             contract_name=self.name,
             enabled=True,
@@ -105,13 +105,11 @@ class MegatronTrueOnPolicyContract:
 
 
 QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT = MegatronTrueOnPolicyContract(
-    schema=QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
+    schema=QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA
 )
 
 
-_CONTRACT_BY_NAME = {
-    QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT,
-}
+_CONTRACT_BY_NAME = {QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT}
 
 
 def get_true_on_policy_contract(contract_name: str) -> MegatronTrueOnPolicyContract:

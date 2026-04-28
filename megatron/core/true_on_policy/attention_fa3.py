@@ -204,7 +204,9 @@ class SGLangFlashAttention(MegatronModule):
 
         if self.cp_size > 1:
             assert self.cp_layout is not None
-            output = self.cp_layout.head_to_sequence_parallel(output, cu_seqlens_q, local_tokens, local_heads)
+            output = self.cp_layout.head_to_sequence_parallel(
+                output, cu_seqlens_q, local_tokens, local_heads
+            )
 
         if is_packed:
             if input_ndim == 3:

@@ -9,7 +9,6 @@ from torch import Tensor
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-
 _USE_SGLANG_ROPE = False
 
 
@@ -30,10 +29,7 @@ def is_sglang_rope_enabled() -> bool:
 
 
 def sglang_apply_rotary_pos_emb(
-    x: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    is_neox_style: bool = True,
+    x: Tensor, cos: Tensor, sin: Tensor, is_neox_style: bool = True
 ) -> Tensor:
     if cos.dim() == 2:
         cos = cos.unsqueeze(-2)
@@ -67,10 +63,7 @@ def sglang_apply_rotary_pos_emb(
 
 
 def sglang_apply_rotary_pos_emb_with_freqs(
-    x: Tensor,
-    freqs: Tensor,
-    config: TransformerConfig,
-    layer_number: Optional[int] = None,
+    x: Tensor, freqs: Tensor, config: TransformerConfig, layer_number: Optional[int] = None
 ) -> Tensor:
     del layer_number
 

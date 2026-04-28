@@ -30,9 +30,7 @@ def _use_true_on_policy_ulysses_cp_gradient_scaling(config: TransformerConfig) -
     """Return true when CP loss scaling is deferred to the CP gradient sum."""
 
     return (
-        resolve_true_on_policy_runtime_policy(
-            config
-        ).defer_ulysses_cp_loss_scaling_to_grad_sum
+        resolve_true_on_policy_runtime_policy(config).defer_ulysses_cp_loss_scaling_to_grad_sum
         and getattr(config, "context_parallel_size", 1) > 1
         and _first_cp_comm_type(getattr(config, "cp_comm_type", None)) == "a2a"
         and not getattr(config, "calculate_per_token_loss", False)
@@ -153,7 +151,10 @@ class DistributedDataParallel(_BaseDataParallel):
                 expert_parallel_params.append(param)
 
         def _allocate_buffers_for_parameters(
-            input_params, data_parallel_group, gradient_scaling_factor, target_gradient_scaling_factor
+            input_params,
+            data_parallel_group,
+            gradient_scaling_factor,
+            target_gradient_scaling_factor,
         ):
             param_and_grad_dtype_to_params = {}
             param_and_grad_dtype_to_offsets = {}

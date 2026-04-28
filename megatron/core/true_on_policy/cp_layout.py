@@ -35,14 +35,16 @@ class SGLangUlyssesCPLayout:
     def sequence_to_head_parallel(self, x: Tensor, cu_seqlens: Tensor) -> Tensor:
         """Ulysses CP all-to-all: local zigzag sequence shard -> full sequence, head shard."""
         local_tokens, num_heads, head_dim = x.shape
-        assert num_heads % self.cp_size == 0, (
-            f"num_heads={num_heads} must be divisible by cp_size={self.cp_size}"
-        )
+        assert (
+            num_heads % self.cp_size == 0
+        ), f"num_heads={num_heads} must be divisible by cp_size={self.cp_size}"
         local_lengths = self.local_packed_lengths(cu_seqlens, local_tokens)
 
         x = x.reshape(local_tokens, 1, num_heads * head_dim)
         hidden_per_rank = x.shape[-1] // self.cp_size
-        rank_ordered = torch.cat(torch.split(x.reshape(local_tokens, -1), hidden_per_rank, dim=1), dim=0)
+        rank_ordered = torch.cat(
+            torch.split(x.reshape(local_tokens, -1), hidden_per_rank, dim=1), dim=0
+        )
         rank_ordered = all_to_all(self.cp_group, rank_ordered)
         rank_ordered = rank_ordered.reshape(local_tokens * self.cp_size, 1, hidden_per_rank)
 
@@ -54,9 +56,9 @@ class SGLangUlyssesCPLayout:
 
         sequential = []
         for seq_index, local_length in enumerate(local_lengths):
-            assert local_length % 2 == 0, (
-                f"Ulysses CP expects two equal zigzag chunks per rank; got local_length={local_length}"
-            )
+            assert (
+                local_length % 2 == 0
+            ), f"Ulysses CP expects two equal zigzag chunks per rank; got local_length={local_length}"
             chunk = local_length // 2
             seq_offset = sum(local_lengths[:seq_index])
 
@@ -70,15 +72,17 @@ class SGLangUlyssesCPLayout:
         x = torch.cat(sequential, dim=0)
         return x.view(local_tokens * self.cp_size, num_heads // self.cp_size, head_dim)
 
-    def head_to_sequence_parallel(self, x: Tensor, cu_seqlens: Tensor, local_tokens: int, num_heads: int) -> Tensor:
+    def head_to_sequence_parallel(
+        self, x: Tensor, cu_seqlens: Tensor, local_tokens: int, num_heads: int
+    ) -> Tensor:
         """Ulysses CP inverse all-to-all: full sequence, head shard -> local zigzag sequence shard."""
         global_tokens, heads_per_cp_rank, head_dim = x.shape
-        assert global_tokens == local_tokens * self.cp_size, (
-            f"Unexpected Ulysses global token count: {global_tokens} vs {local_tokens * self.cp_size}"
-        )
-        assert heads_per_cp_rank * self.cp_size == num_heads, (
-            f"Unexpected Ulysses head shard: {heads_per_cp_rank} * {self.cp_size} != {num_heads}"
-        )
+        assert (
+            global_tokens == local_tokens * self.cp_size
+        ), f"Unexpected Ulysses global token count: {global_tokens} vs {local_tokens * self.cp_size}"
+        assert (
+            heads_per_cp_rank * self.cp_size == num_heads
+        ), f"Unexpected Ulysses head shard: {heads_per_cp_rank} * {self.cp_size} != {num_heads}"
         local_lengths = self.local_packed_lengths(cu_seqlens, local_tokens)
 
         x = x.reshape(global_tokens, 1, heads_per_cp_rank * head_dim)
@@ -86,7 +90,9 @@ class SGLangUlyssesCPLayout:
         seq_start = 0
         for local_length in local_lengths:
             chunk = local_length // 2
-            chunks = torch.split(x[seq_start : seq_start + local_length * self.cp_size], chunk, dim=0)
+            chunks = torch.split(
+                x[seq_start : seq_start + local_length * self.cp_size], chunk, dim=0
+            )
             assert len(chunks) == 2 * self.cp_size
             for rank in range(self.cp_size):
                 rank_ordered[rank].append(chunks[rank])

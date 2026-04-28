@@ -29,8 +29,8 @@ from megatron.core.utils import (
 )
 
 from ..dist_checkpointing.mapping import ShardedStateDict
-from ..true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
+from ..true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -460,9 +460,7 @@ def linear_with_frozen_weight(
 
 
 def _linear_forward_with_optional_batch_invariant_matmul(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     if input.is_cuda:
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -531,8 +529,7 @@ def _maybe_dump_linear_backward_debug(
     os.makedirs(debug_dir, exist_ok=True)
     shape_tag = "x".join(str(dim) for dim in weight.shape)
     path = os.path.join(
-        debug_dir,
-        f"rank_{rank}_call_{counter:05d}_{tag}_weight_{shape_tag}_pid_{os.getpid()}.pt",
+        debug_dir, f"rank_{rank}_call_{counter:05d}_{tag}_weight_{shape_tag}_pid_{os.getpid()}.pt"
     )
     torch.save(
         {
@@ -550,10 +547,9 @@ def _maybe_dump_linear_backward_debug(
 
 
 def _should_allreduce_dgrad_in_fp32(grad_input: torch.Tensor) -> bool:
-    return (
-        os.environ.get("MEGATRON_TRUE_ON_POLICY_DGRAD_ALLREDUCE_FP32") == "1"
-        and grad_input.dtype in (torch.float16, torch.bfloat16)
-    )
+    return os.environ.get(
+        "MEGATRON_TRUE_ON_POLICY_DGRAD_ALLREDUCE_FP32"
+    ) == "1" and grad_input.dtype in (torch.float16, torch.bfloat16)
 
 
 def _should_compute_dgrad_in_fp32(grad_output: torch.Tensor, weight: torch.Tensor) -> bool:

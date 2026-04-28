@@ -53,8 +53,7 @@ def _safe_tensor_context_parallel_size() -> int:
 
 
 def _rollout_row_parallel_partition_k(
-    input_: torch.Tensor,
-    tp_group: Optional[torch.distributed.ProcessGroup],
+    input_: torch.Tensor, tp_group: Optional[torch.distributed.ProcessGroup]
 ) -> int:
     train_tp_size = _safe_group_size(tp_group)
     rollout_tp_size = _safe_tensor_context_parallel_size()
@@ -65,9 +64,7 @@ def _rollout_row_parallel_partition_k(
 
 
 def _should_use_sglang_tp_invariant_row_linear(
-    input_: torch.Tensor,
-    row_parallel: bool,
-    tp_group: Optional[torch.distributed.ProcessGroup],
+    input_: torch.Tensor, row_parallel: bool, tp_group: Optional[torch.distributed.ProcessGroup]
 ) -> bool:
     rollout_partition_k = _rollout_row_parallel_partition_k(input_, tp_group)
     return (
@@ -78,9 +75,7 @@ def _should_use_sglang_tp_invariant_row_linear(
 
 
 def _sglang_row_parallel_matmul(
-    input_: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    input_: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     """SGLang's row-linear TP-invariant matmul contract.
 
@@ -96,9 +91,7 @@ def _sglang_row_parallel_matmul(
 
     for start in range(0, input_2d.shape[1], _ROW_LINEAR_INV_BLOCK_K):
         end = min(start + _ROW_LINEAR_INV_BLOCK_K, input_2d.shape[1])
-        partials.append(
-            input_2d[:, start:end] @ weight_t[start:end, :]
-        )
+        partials.append(input_2d[:, start:end] @ weight_t[start:end, :])
 
     output = _fixed_tree_sum_tensors(partials).to(input_.dtype)
     if bias is not None:
@@ -138,9 +131,7 @@ def _sglang_rollout_partition_row_parallel_matmul(
 
 
 def _linear_reference_matmul(
-    input_: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    input_: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     output = input_.reshape(-1, input_.shape[-1]) @ weight.t()
     output = output.reshape(*input_.shape[:-1], weight.shape[0])

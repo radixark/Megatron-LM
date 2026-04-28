@@ -7,8 +7,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
 
 class SGLangNorm(torch.nn.Module):

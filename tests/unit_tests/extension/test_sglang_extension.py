@@ -30,10 +30,7 @@ from megatron.core.true_on_policy.contracts import get_true_on_policy_contract
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.layers import linear_with_grad_accumulation_and_async_allreduce
-from megatron.core.true_on_policy.matmul import (
-    _sglang_row_parallel_matmul,
-    sglang_reference_matmul,
-)
+from megatron.core.true_on_policy.matmul import _sglang_row_parallel_matmul, sglang_reference_matmul
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     matmul_persistent,
@@ -109,7 +106,16 @@ def test_sglang_extension_imports():
 def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
     from megatron.core.extensions import sglang as legacy_backend
     from megatron.core.tensor_parallel import matmul_tp_inv as legacy_matmul
-    from megatron.core.true_on_policy import attention_fa3, bias_dropout, cp_layout, linear, norm, provider, rope, runtime
+    from megatron.core.true_on_policy import (
+        attention_fa3,
+        bias_dropout,
+        cp_layout,
+        linear,
+        norm,
+        provider,
+        rope,
+        runtime,
+    )
     from megatron.core.true_on_policy import matmul, sglang_backend
 
     assert legacy_backend.SGLangNorm is sglang_backend.SGLangNorm
@@ -120,9 +126,15 @@ def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
     assert sglang_backend.SGLangNorm is norm.SGLangNorm
     assert sglang_backend.SGLangSpecProvider is provider.SGLangSpecProvider
     assert sglang_backend.get_sglang_bias_dropout_add is bias_dropout.get_sglang_bias_dropout_add
-    assert sglang_backend.enable_sglang_batch_invariant_mode is runtime.enable_sglang_batch_invariant_mode
+    assert (
+        sglang_backend.enable_sglang_batch_invariant_mode
+        is runtime.enable_sglang_batch_invariant_mode
+    )
     assert sglang_backend.sglang_apply_rotary_pos_emb is rope.sglang_apply_rotary_pos_emb
-    assert sglang_backend.resolve_true_on_policy_runtime_policy is resolve_true_on_policy_runtime_policy
+    assert (
+        sglang_backend.resolve_true_on_policy_runtime_policy
+        is resolve_true_on_policy_runtime_policy
+    )
     assert legacy_matmul.sglang_reference_matmul is matmul.sglang_reference_matmul
 
 
@@ -132,9 +144,7 @@ def test_true_on_policy_contract_arg_parsing(monkeypatch):
     assert "true_on_policy_contract" in field_names
 
     args = _parse_training_args(
-        monkeypatch,
-        "--true-on-policy-contract",
-        QWEN3_DENSE_TRUE_ON_POLICY_V1,
+        monkeypatch, "--true-on-policy-contract", QWEN3_DENSE_TRUE_ON_POLICY_V1
     )
 
     assert args.true_on_policy_contract == QWEN3_DENSE_TRUE_ON_POLICY_V1
@@ -218,14 +228,11 @@ def test_invalid_true_on_policy_contract_is_rejected_by_config():
         _make_config(true_on_policy_contract="unknown_contract")
 
 
-
 def test_default_backend_selection_is_unchanged():
     config = _make_config()
 
     layer_spec = get_gpt_decoder_layer_specs(
-        config,
-        use_transformer_engine=False,
-        normalization=config.normalization,
+        config, use_transformer_engine=False, normalization=config.normalization
     )[0]
 
     assert layer_spec.submodules.input_layernorm is WrappedTorchNorm
@@ -235,15 +242,10 @@ def test_default_backend_selection_is_unchanged():
 
 def test_true_on_policy_contract_selects_sglang_backend():
     disable_sglang_rope()
-    config = _make_config(
-        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-        qk_layernorm=True,
-    )
+    config = _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1, qk_layernorm=True)
 
     layer_spec = get_gpt_decoder_layer_specs(
-        config,
-        use_transformer_engine=False,
-        normalization=config.normalization,
+        config, use_transformer_engine=False, normalization=config.normalization
     )[0]
 
     assert is_sglang_rope_enabled()
@@ -261,9 +263,7 @@ def test_true_on_policy_contract_selects_sglang_backend():
 def test_true_on_policy_contract_layer_spec_selects_sglang_final_norm():
     config = _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1)
     layer_spec = get_gpt_decoder_layer_specs(
-        config,
-        use_transformer_engine=False,
-        normalization=config.normalization,
+        config, use_transformer_engine=False, normalization=config.normalization
     )[0]
 
     block_submodules = _get_block_submodules(config, layer_spec, pp_rank=0)
@@ -273,8 +273,7 @@ def test_true_on_policy_contract_layer_spec_selects_sglang_final_norm():
 
 def test_transformer_config_rejects_incompatible_true_on_policy_backend():
     with pytest.raises(
-        AssertionError,
-        match="true_on_policy_contract currently requires transformer_impl='local'",
+        AssertionError, match="true_on_policy_contract currently requires transformer_impl='local'"
     ):
         _make_config(
             true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
@@ -284,13 +283,9 @@ def test_transformer_config_rejects_incompatible_true_on_policy_backend():
 
 def test_transformer_config_rejects_true_on_policy_with_kitchen():
     with pytest.raises(
-        AssertionError,
-        match="true_on_policy_contract is not compatible with use_kitchen",
+        AssertionError, match="true_on_policy_contract is not compatible with use_kitchen"
     ):
-        _make_config(
-            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-            use_kitchen=True,
-        )
+        _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1, use_kitchen=True)
 
 
 def test_sglang_config_allows_ulysses_context_parallel():
@@ -318,20 +313,10 @@ def test_ulysses_rope_uses_cp_positions_for_local_sequence_shards():
     cp_group = _FakeCPGroup(size=2, rank=1)
 
     actual = apply_rotary_pos_emb(
-        local_t,
-        freqs,
-        config=config,
-        cu_seqlens=cu_seqlens,
-        cp_group=cp_group,
-        ulysses_cp=True,
+        local_t, freqs, config=config, cu_seqlens=cu_seqlens, cp_group=cp_group, ulysses_cp=True
     )
     expected = apply_rotary_pos_emb(
-        local_t,
-        freqs,
-        config=config,
-        cu_seqlens=cu_seqlens,
-        cp_group=cp_group,
-        ulysses_cp=False,
+        local_t, freqs, config=config, cu_seqlens=cu_seqlens, cp_group=cp_group, ulysses_cp=False
     )
 
     torch.testing.assert_close(actual, expected)
@@ -369,11 +354,7 @@ def test_ulysses_rope_keeps_unsplit_positions_for_full_sequence_layout():
 
 def test_local_attention_still_rejects_ulysses_context_parallel_without_true_on_policy():
     with pytest.raises(ValueError, match="only supports all_gather"):
-        _make_config(
-            tensor_model_parallel_size=1,
-            context_parallel_size=2,
-            cp_comm_type="a2a",
-        )
+        _make_config(tensor_model_parallel_size=1, context_parallel_size=2, cp_comm_type="a2a")
 
 
 def test_sglang_reference_matmul_matches_torch_linear():
@@ -476,8 +457,7 @@ def test_sglang_backend_leaves_batch_invariant_mode_disabled(monkeypatch):
 
     calls = []
     config = _make_config(
-        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-        batch_invariant_mode=False,
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1, batch_invariant_mode=False
     )
 
     monkeypatch.setattr(batch_invariant_kernels, "is_batch_invariant_mode_enabled", lambda: False)
@@ -535,8 +515,7 @@ def test_batch_invariant_linear_flattens_sequence_batch_for_gemm():
 def test_sglang_output_layer_casts_input_to_weight_dtype():
     with _fake_tp_init():
         config = _make_config(
-            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-            use_cpu_initialization=True,
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1, use_cpu_initialization=True
         )
         layer = LinearCrossEntropyModule(
             input_size=4,
@@ -575,9 +554,9 @@ def test_sglang_norm_rmsnorm_matches_reference():
 
     actual = norm(x)
     x_float = x.float()
-    expected = (
-        x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + norm.eps)
-    ).type_as(x) * norm.weight
+    expected = (x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + norm.eps)).type_as(
+        x
+    ) * norm.weight
 
     torch.testing.assert_close(actual, expected)
 
@@ -589,9 +568,9 @@ def test_sglang_norm_rmsnorm_keeps_affine_in_float():
 
     actual = norm(x)
     x_float = x.float()
-    expected = (
-        x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + norm.eps)
-    ).type_as(x) * norm.weight.float()
+    expected = (x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + norm.eps)).type_as(
+        x
+    ) * norm.weight.float()
 
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected)
@@ -599,12 +578,9 @@ def test_sglang_norm_rmsnorm_keeps_affine_in_float():
 
 def test_sglang_norm_rmsnorm_can_override_original_dtype():
     config = _make_config(normalization="RMSNorm")
-    norm = SGLangNorm(
-        config=config,
-        hidden_size=4,
-        eps=1e-5,
-        override_orig_dtype=torch.float32,
-    ).to(dtype=torch.bfloat16)
+    norm = SGLangNorm(config=config, hidden_size=4, eps=1e-5, override_orig_dtype=torch.float32).to(
+        dtype=torch.bfloat16
+    )
     x = torch.randn(2, 3, 4, dtype=torch.bfloat16)
 
     actual = norm(x)
@@ -619,12 +595,9 @@ def test_sglang_norm_rmsnorm_can_override_original_dtype():
 
 def test_sglang_norm_rmsnorm_accepts_residual_pair():
     config = _make_config(normalization="RMSNorm")
-    norm = SGLangNorm(
-        config=config,
-        hidden_size=4,
-        eps=1e-5,
-        override_orig_dtype=torch.float32,
-    ).to(dtype=torch.bfloat16)
+    norm = SGLangNorm(config=config, hidden_size=4, eps=1e-5, override_orig_dtype=torch.float32).to(
+        dtype=torch.bfloat16
+    )
     x = torch.randn(2, 3, 4, dtype=torch.bfloat16)
     residual = torch.randn(2, 3, 4, dtype=torch.bfloat16)
 
@@ -708,18 +681,12 @@ def test_sglang_spec_provider_grouped_mlp_fallback():
 
 
 def test_sglang_mtp_spec_uses_sglang_backend():
-    config = _make_config(
-        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-        mtp_num_layers=1,
-    )
+    config = _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1, mtp_num_layers=1)
     transformer_layer_spec = get_gpt_decoder_layer_specs(
-        config,
-        use_transformer_engine=False,
-        normalization=config.normalization,
+        config, use_transformer_engine=False, normalization=config.normalization
     )[0]
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
-        transformer_layer_spec=transformer_layer_spec,
-        backend=SGLangSpecProvider(),
+        transformer_layer_spec=transformer_layer_spec, backend=SGLangSpecProvider()
     )
 
     assert mtp_layer_spec.submodules.enorm.module is SGLangNorm
@@ -730,7 +697,9 @@ def test_sglang_mtp_spec_uses_sglang_backend():
 
 def test_sglang_column_parallel_linear_wrapper_forward_matches_reference():
     with _fake_tp_init():
-        config = _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1, use_cpu_initialization=True)
+        config = _make_config(
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1, use_cpu_initialization=True
+        )
         layer = SGLangColumnParallelLinear(
             input_size=4,
             output_size=5,

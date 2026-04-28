@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from collections import OrderedDict
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Literal, Optional
 
@@ -632,8 +632,7 @@ class GPTModel(LanguageModule):
         if not resolve_true_on_policy_runtime_policy(self.config).apply_logits_contract:
             return logits
         return apply_true_on_policy_logits_contract(
-            logits,
-            vocab_size=self.config.true_on_policy_vocab_size,
+            logits, vocab_size=self.config.true_on_policy_vocab_size
         )
 
     def _postprocess(
@@ -692,7 +691,13 @@ class GPTModel(LanguageModule):
         # Skip when mtp_num_layers is None or 0
         if self.config.mtp_num_layers and mtp_kwargs.get('mtp_labels', None) is not None:
             mtp_labels = mtp_kwargs['mtp_labels'].clone()
-            mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params)
+            mtp_labels, _ = roll_tensor(
+                mtp_labels,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
 
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
             hidden_states = hidden_states_list[0]
@@ -701,7 +706,13 @@ class GPTModel(LanguageModule):
                 loss_mask = torch.ones_like(mtp_labels)
             else:
                 # Otherwise, roll the loss_mask to keep up with the mtp_labels
-                loss_mask, _ = roll_tensor(loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params)
+                loss_mask, _ = roll_tensor(
+                    loss_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
                 mtp_labels, _ = roll_tensor(

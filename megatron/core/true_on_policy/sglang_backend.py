@@ -12,21 +12,14 @@ from megatron.core.true_on_policy.bias_dropout import (
     _sglang_bias_dropout_add,
     get_sglang_bias_dropout_add,
 )
-from megatron.core.true_on_policy.cp_layout import SGLangUlyssesCPLayout
 from megatron.core.true_on_policy.contracts import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
     MegatronTrueOnPolicyRuntimePolicy,
     resolve_true_on_policy_runtime_policy,
 )
-from megatron.core.true_on_policy.linear import (
-    SGLangColumnParallelLinear,
-    SGLangRowParallelLinear,
-)
-from megatron.core.true_on_policy.norm import (
-    SGLangFinalRMSNorm,
-    SGLangNorm,
-    SGLangQKRMSNorm,
-)
+from megatron.core.true_on_policy.cp_layout import SGLangUlyssesCPLayout
+from megatron.core.true_on_policy.linear import SGLangColumnParallelLinear, SGLangRowParallelLinear
+from megatron.core.true_on_policy.norm import SGLangFinalRMSNorm, SGLangNorm, SGLangQKRMSNorm
 from megatron.core.true_on_policy.provider import SGLangSpecProvider
 from megatron.core.true_on_policy.rope import (
     disable_sglang_rope,

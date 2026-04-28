@@ -97,8 +97,7 @@ def _register_norm_grad_debug(tensor: Tensor, *, layer_number: int, name: str) -
         }
         os.makedirs(debug_dir, exist_ok=True)
         path = os.path.join(
-            debug_dir,
-            f"rank_{rank}_layer_{layer_number}_{counter:05d}_{name}_pid_{os.getpid()}.pt",
+            debug_dir, f"rank_{rank}_layer_{layer_number}_{counter:05d}_{name}_pid_{os.getpid()}.pt"
         )
         torch.save(stats, path)
         print(f"[MILES_NORM_BACKWARD_DEBUG] {stats} wrote {path}", flush=True)
@@ -461,7 +460,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             submodules.post_mlp_layernorm,
             config=self.config,
             hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon
+            eps=self.config.layernorm_epsilon,
         )
 
         self.recompute_input_layernorm = False
@@ -657,14 +656,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
             os.makedirs(debug_dir, exist_ok=True)
             path = os.path.join(
-                debug_dir,
-                f"rank_{rank}_layer_{layer_number}_{name}_pid_{os.getpid()}.pt",
+                debug_dir, f"rank_{rank}_layer_{layer_number}_{name}_pid_{os.getpid()}.pt"
             )
             torch.save(stats, path)
-            print(
-                f"[MILES_ACTIVATION_GRAD_DEBUG] {stats} wrote {path}",
-                flush=True,
-            )
+            print(f"[MILES_ACTIVATION_GRAD_DEBUG] {stats} wrote {path}", flush=True)
             return grad
 
         tensor.register_hook(_hook)
@@ -739,9 +734,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 name="input_layernorm_output",
             )
             _register_norm_grad_debug(
-                residual,
-                layer_number=self.layer_number,
-                name="input_layernorm_residual_output",
+                residual, layer_number=self.layer_number, name="input_layernorm_residual_output"
             )
         elif self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -884,9 +877,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states, residual)
                     norm_output, norm_residual = pre_mlp_layernorm_output
                     _register_norm_grad_debug(
-                        norm_output,
-                        layer_number=self.layer_number,
-                        name="pre_mlp_layernorm_output",
+                        norm_output, layer_number=self.layer_number, name="pre_mlp_layernorm_output"
                     )
                     _register_norm_grad_debug(
                         norm_residual,

@@ -2052,7 +2052,9 @@ class TransformerConfig(ModelParallelConfig):
                 f"true_on_policy_contract currently requires transformer_impl='local', "
                 f"but got {self.transformer_impl=}."
             )
-            assert not self.use_kitchen, "true_on_policy_contract is not compatible with use_kitchen."
+            assert (
+                not self.use_kitchen
+            ), "true_on_policy_contract is not compatible with use_kitchen."
         if self.true_on_policy_vocab_size is not None:
             assert self.true_on_policy_vocab_size > 0, "true_on_policy_vocab_size must be > 0."
 

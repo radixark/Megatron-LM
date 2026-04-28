@@ -12,10 +12,7 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.true_on_policy.attention_fa3 import SGLangCoreAttention
-from megatron.core.true_on_policy.linear import (
-    SGLangColumnParallelLinear,
-    SGLangRowParallelLinear,
-)
+from megatron.core.true_on_policy.linear import SGLangColumnParallelLinear, SGLangRowParallelLinear
 from megatron.core.true_on_policy.norm import SGLangNorm, SGLangQKRMSNorm
 
 
@@ -62,8 +59,7 @@ class SGLangSpecProvider(BackendSpecProvider):
             return GroupedMLP, None
 
         return SequentialMLP, MLPSubmodules(
-            linear_fc1=SGLangColumnParallelLinear,
-            linear_fc2=SGLangRowParallelLinear,
+            linear_fc1=SGLangColumnParallelLinear, linear_fc2=SGLangRowParallelLinear
         )
 
     def activation_func(self) -> type:

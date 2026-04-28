@@ -29,9 +29,9 @@ from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
+from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.true_on_policy.sglang_backend import SGLangFinalRMSNorm, SGLangNorm
-from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,

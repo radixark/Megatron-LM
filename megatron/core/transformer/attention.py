@@ -18,6 +18,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+
 try:
     from megatron.core.true_on_policy.sglang_backend import (
         is_sglang_rope_enabled,
@@ -175,8 +176,7 @@ def _register_attention_grad_debug(tensor: Tensor, *, layer_number: int, name: s
 
         os.makedirs(debug_dir, exist_ok=True)
         path = os.path.join(
-            debug_dir,
-            f"rank_{rank}_layer_{layer_number}_attention_{name}_pid_{os.getpid()}.pt",
+            debug_dir, f"rank_{rank}_layer_{layer_number}_attention_{name}_pid_{os.getpid()}.pt"
         )
         torch.save(stats, path)
         print(f"[MILES_ACTIVATION_GRAD_DEBUG] {stats} wrote {path}", flush=True)
@@ -1180,9 +1180,7 @@ class Attention(MegatronModule, ABC):
                 ulysses_cp = _is_ulysses_cp(self.config)
                 if q_pos_emb is not None:
                     use_sglang_rope = (
-                        HAVE_SGLANG_ROPE
-                        and is_sglang_rope_enabled()
-                        and packed_seq_params is None
+                        HAVE_SGLANG_ROPE and is_sglang_rope_enabled() and packed_seq_params is None
                     )
                     sglang_rope_applied = False
                     if use_sglang_rope and sglang_apply_rotary_pos_emb_with_freqs is not None:
@@ -1210,9 +1208,7 @@ class Attention(MegatronModule, ABC):
                             )
                 if k_pos_emb is not None:
                     use_sglang_rope = (
-                        HAVE_SGLANG_ROPE
-                        and is_sglang_rope_enabled()
-                        and packed_seq_params is None
+                        HAVE_SGLANG_ROPE and is_sglang_rope_enabled() and packed_seq_params is None
                     )
                     sglang_rope_applied = False
                     if use_sglang_rope and sglang_apply_rotary_pos_emb_with_freqs is not None:

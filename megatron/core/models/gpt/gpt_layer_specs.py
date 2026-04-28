@@ -55,15 +55,15 @@ try:
 except ImportError:
     HAVE_KITCHEN = False
 
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from megatron.core.true_on_policy.rope import enable_sglang_rope
+from megatron.core.true_on_policy.runtime import enable_sglang_batch_invariant_mode
 from megatron.core.true_on_policy.sglang_backend import (
     SGLangFinalRMSNorm,
     SGLangNorm,
     SGLangSpecProvider,
     get_sglang_bias_dropout_add,
 )
-from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
-from megatron.core.true_on_policy.rope import enable_sglang_rope
-from megatron.core.true_on_policy.runtime import enable_sglang_batch_invariant_mode
 
 try:
     import apex  # pylint: disable=unused-import
@@ -402,9 +402,7 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
-    bias_dropout_add = (
-        get_sglang_bias_dropout_add if uses_sglang_backend else get_bias_dropout_add
-    )
+    bias_dropout_add = get_sglang_bias_dropout_add if uses_sglang_backend else get_bias_dropout_add
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -681,7 +679,11 @@ def get_gpt_decoder_block_spec(
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
-    norm_type = normalization if normalization is not None else getattr(config, "normalization", "LayerNorm")
+    norm_type = (
+        normalization
+        if normalization is not None
+        else getattr(config, "normalization", "LayerNorm")
+    )
 
     uses_sglang_backend = resolve_true_on_policy_runtime_policy(config).use_sglang_backend
     if uses_sglang_backend and norm_type == "RMSNorm":

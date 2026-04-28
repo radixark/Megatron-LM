@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 import logging
+
 import torch
 from torch import Tensor
 
@@ -311,7 +312,9 @@ def apply_rotary_pos_emb(
             else:
                 cp_size = cp_group.size()
                 cp_rank = cp_group.rank()
-            return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, cp_size=cp_size, cp_rank=cp_rank)
+            return fused_apply_rotary_pos_emb_thd(
+                t, cu_seqlens, freqs, cp_size=cp_size, cp_rank=cp_rank
+            )
     # use unfused implementation
     if cu_seqlens is None:
         return _apply_rotary_pos_emb_bshd(

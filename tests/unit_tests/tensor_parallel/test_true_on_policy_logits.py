@@ -6,8 +6,7 @@ from megatron.core.models.gpt.gpt_model import apply_true_on_policy_logits_contr
 
 def test_true_on_policy_logits_contract_truncates_and_preserves_dtype():
     full_vocab_logits = torch.tensor(
-        [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 100.0, 100.0]],
-        dtype=torch.bfloat16,
+        [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 100.0, 100.0]], dtype=torch.bfloat16
     )
 
     actual = apply_true_on_policy_logits_contract(full_vocab_logits, vocab_size=6)
@@ -25,7 +24,9 @@ def test_true_on_policy_logprob_uses_real_vocab_after_full_gather():
     contracted_logits = apply_true_on_policy_logits_contract(gathered_logits, vocab_size=6)
     contracted_logprob = torch.nn.functional.log_softmax(contracted_logits, dim=-1)[0, 5]
 
-    wrong_full_vocab_logprob = torch.nn.functional.log_softmax(gathered_logits.float(), dim=-1)[0, 5]
+    wrong_full_vocab_logprob = torch.nn.functional.log_softmax(gathered_logits.float(), dim=-1)[
+        0, 5
+    ]
     expected_logprob = torch.nn.functional.log_softmax(gathered_logits[:, :6], dim=-1)[0, 5]
 
     torch.testing.assert_close(contracted_logprob, expected_logprob)

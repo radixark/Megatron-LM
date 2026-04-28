@@ -36,8 +36,7 @@ def _manual_tree_sum(partials):
 @pytest.mark.parametrize("world_size", [2, 8])
 def test_tree_all_reduce_sum_matches_fixed_pairwise_order(monkeypatch, world_size):
     partials = [
-        torch.full((2, 3), float(index + 1), dtype=torch.float32)
-        for index in range(world_size)
+        torch.full((2, 3), float(index + 1), dtype=torch.float32) for index in range(world_size)
     ]
     _make_tree_gather(monkeypatch, partials)
 
