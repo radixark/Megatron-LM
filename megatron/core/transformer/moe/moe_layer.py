@@ -526,7 +526,7 @@ class MoELayer(BaseMoELayer):
     ) -> bool:
         if torch.is_grad_enabled():
             return False
-        if padding_mask is not None or shared_expert_output is not None:
+        if self._has_true_on_policy_padding(padding_mask) or shared_expert_output is not None:
             return False
         if self.use_shared_expert or self.config.moe_latent_size:
             return False
@@ -556,7 +556,7 @@ class MoELayer(BaseMoELayer):
     ) -> bool:
         if not torch.is_grad_enabled() or intermediate_tensors is not None:
             return False
-        if padding_mask is not None or shared_expert_output is not None:
+        if self._has_true_on_policy_padding(padding_mask) or shared_expert_output is not None:
             return False
         if self.use_shared_expert or self.config.moe_latent_size:
             return False
@@ -577,6 +577,10 @@ class MoELayer(BaseMoELayer):
 
         policy = resolve_true_on_policy_runtime_policy(self.config)
         return policy.ep_invariant_moe and policy.deterministic_moe_dispatch
+
+    @staticmethod
+    def _has_true_on_policy_padding(padding_mask: Optional[torch.Tensor]) -> bool:
+        return padding_mask is not None and bool(padding_mask.any().item())
 
     def _forward_sglang_local_masked_ep(
         self,

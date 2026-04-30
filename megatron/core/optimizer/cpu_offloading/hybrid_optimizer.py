@@ -375,10 +375,21 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
     def update_fp32_param_by_new_param(self):
         """
-        Update the fp32 parameters by the new parameters.
+        Update optimizer-owned parameter copies from the live model parameters.
+
+        ``DistributedOptimizer.reload_model_params`` calls this after checkpoint
+        loading. For offloaded fp32 model parameters there is no separate
+        ``param_to_fp32_param`` entry: the CPU copy tracked by
+        ``gpu_params_map_cpu_copy`` is the optimizer-owned parameter. Refresh it
+        as well, otherwise the first optimizer step can copy constructor-time
+        values back over checkpoint-loaded weights.
         """
         for param, fp32_param in self.param_to_fp32_param.items():
             fp32_param.data.copy_(param)
+        for param, cpu_copy in self.gpu_params_map_cpu_copy.items():
+            if param in self.param_to_fp32_param:
+                continue
+            cpu_copy.data.copy_(param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
