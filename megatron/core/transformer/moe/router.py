@@ -23,6 +23,7 @@ from megatron.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
 
 class Router(ABC, MegatronModule):
@@ -92,12 +93,19 @@ class Router(ABC, MegatronModule):
         if self.bias is not None and self.bias.device.type == 'cpu':
             self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
 
-        # Convert to specified datatype for routing computation if enabled
-        router_dtype = input.dtype
-        if self.config.moe_router_dtype == 'fp32':
-            router_dtype = torch.float32
-        elif self.config.moe_router_dtype == 'fp64':
-            router_dtype = torch.float64
+        # Convert to specified datatype for routing computation if enabled.
+        # The true-on-policy MoE contract follows SGLang's routed expert path:
+        # cast the post-norm activation back to parameter dtype for the router
+        # projection, then compute softmax/top-k from the resulting logits.
+        true_on_policy = resolve_true_on_policy_runtime_policy(self.config)
+        if true_on_policy.deterministic_moe_routing:
+            router_dtype = self.config.params_dtype
+        else:
+            router_dtype = input.dtype
+            if self.config.moe_router_dtype == 'fp32':
+                router_dtype = torch.float32
+            elif self.config.moe_router_dtype == 'fp64':
+                router_dtype = torch.float64
         logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
 
@@ -567,6 +575,8 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
+        true_on_policy = resolve_true_on_policy_runtime_policy(self.config)
+
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
@@ -582,6 +592,11 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 is_mtp=self.is_mtp,
+                topk_tiebreak=(
+                    true_on_policy.moe_topk_tiebreak
+                    if true_on_policy.deterministic_moe_routing
+                    else None
+                ),
             )
 
         # Apply token dropping to probs and routing_map.
@@ -604,6 +619,11 @@ class TopKRouter(Router):
                 self.score_function,
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
+                topk_tiebreak=(
+                    true_on_policy.moe_topk_tiebreak
+                    if true_on_policy.deterministic_moe_routing
+                    else None
+                ),
             )
             probs = self._apply_aux_loss(
                 probs,

@@ -620,6 +620,7 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     is_mtp: bool = False,
+    topk_tiebreak: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -666,6 +667,16 @@ def topk_routing_with_score_function(
             expert_bias=expert_bias,
         )
 
+    def _stable_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        expert_ids = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.float32)
+        scores_fp32 = scores.float()
+        tie_step = torch.finfo(torch.float32).eps * scores_fp32.abs().clamp_min(
+            1.0 / scores.shape[-1]
+        )
+        scores_for_topk = scores_fp32 - expert_ids.view(1, -1) * tie_step
+        _, selected_indices = torch.topk(scores_for_topk, k, dim=-1)
+        return torch.gather(scores, dim=-1, index=selected_indices), selected_indices
+
     def _compute_topk(
         scores: torch.Tensor,
         topk: int,
@@ -694,6 +705,8 @@ def topk_routing_with_score_function(
                 num_groups=num_groups,
                 group_topk=group_topk,
             )
+        if topk_tiebreak == "stable_sort":
+            return _stable_topk(scores, topk)
         else:
             return torch.topk(scores, k=topk, dim=1)
 
@@ -706,7 +719,13 @@ def topk_routing_with_score_function(
         compute_topk = _compute_topk
 
     if score_function == "softmax":
-        if use_pre_softmax:
+        if topk_tiebreak == "stable_sort" and not use_pre_softmax and group_topk is None:
+            # SGLang's deterministic MoE route selects experts from fp32 softmax scores
+            # and only casts the selected probabilities back to the activation dtype.
+            all_scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            probs, top_indices = compute_topk(all_scores, topk, num_groups, group_topk)
+            probs = (probs / probs.sum(dim=-1, keepdim=True)).type_as(logits)
+        elif use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
             probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
@@ -752,6 +771,7 @@ def compute_routing_scores_for_aux_loss(
     score_function: str,
     fused: bool = False,
     padding_mask: Optional[torch.Tensor] = None,
+    topk_tiebreak: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute routing scores based on the score function.
 
@@ -784,7 +804,11 @@ def compute_routing_scores_for_aux_loss(
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
 
-        _, top_indices = torch.topk(scores, k=topk, dim=1)
+        if topk_tiebreak == "stable_sort":
+            _, top_indices = torch.sort(scores, dim=-1, descending=True, stable=True)
+            top_indices = top_indices[:, :topk]
+        else:
+            _, top_indices = torch.topk(scores, k=topk, dim=1)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     # Apply padding mask to scores if provided

@@ -158,13 +158,13 @@ class SGLangFinalRMSNorm(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        del config
         del persist_layer_norm
         del zero_centered_gamma
         del normalization
 
         self.hidden_size = (hidden_size,)
         self.eps = eps
+        self.source_truth_orig_dtype = getattr(config, "params_dtype", None)
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
 
     def forward(
@@ -176,7 +176,7 @@ class SGLangFinalRMSNorm(torch.nn.Module):
         if not x.is_contiguous():
             x = x.contiguous()
 
-        orig_dtype = x.dtype
+        orig_dtype = self.source_truth_orig_dtype or x.dtype
         if residual is not None:
             x = x + residual
             if post_residual_addition is not None:
@@ -185,7 +185,7 @@ class SGLangFinalRMSNorm(torch.nn.Module):
 
         x_float = x.to(torch.float32)
         x_float = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        output = self.weight * x_float.to(orig_dtype)
+        output = self.weight.to(orig_dtype) * x_float.to(orig_dtype)
 
         if residual is not None:
             return output, residual

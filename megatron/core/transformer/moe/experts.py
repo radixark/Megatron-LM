@@ -34,6 +34,7 @@ from megatron.core.tensor_parallel.layers import (
     set_tensor_model_parallel_attributes,
 )
 from megatron.core.tensor_parallel.utils import divide
+from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
@@ -88,6 +89,8 @@ class GroupedMLP(MegatronModule):
         ), "MoE latent projection not supported in GroupedMLP yet."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
+        true_on_policy = resolve_true_on_policy_runtime_policy(config)
+        self.cast_grouped_gemm_input_to_weight_dtype = true_on_policy.use_sglang_backend
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
                 raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
@@ -254,6 +257,12 @@ class GroupedMLP(MegatronModule):
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
+
+        if (
+            self.cast_grouped_gemm_input_to_weight_dtype
+            and permuted_local_hidden_states.dtype != self.weight1.dtype
+        ):
+            permuted_local_hidden_states = permuted_local_hidden_states.to(self.weight1.dtype)
 
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.

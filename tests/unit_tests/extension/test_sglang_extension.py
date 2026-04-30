@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+import types
 from contextlib import contextmanager
 
 import pytest
@@ -12,10 +13,12 @@ import torch
 import megatron.core.parallel_state as parallel_state
 from miles_megatron_plugins.true_on_policy.sglang_backend import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    QWEN3_MOE_TRUE_ON_POLICY_V1,
     MegatronTrueOnPolicyRuntimePolicy,
     SGLangColumnParallelLinear,
     SGLangCoreAttention,
     SGLangFinalRMSNorm,
+    SGLangGroupedMLP,
     SGLangNorm,
     SGLangQKRMSNorm,
     SGLangRowParallelLinear,
@@ -27,7 +30,10 @@ from miles_megatron_plugins.true_on_policy.sglang_backend import (
     resolve_true_on_policy_runtime_policy,
 )
 from miles_megatron_plugins.true_on_policy.contracts import get_true_on_policy_contract
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_local_spec,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.layers import linear_with_grad_accumulation_and_async_allreduce
 from miles_megatron_plugins.true_on_policy.matmul import _sglang_row_parallel_matmul, sglang_reference_matmul
@@ -39,6 +45,11 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.attention import _sglang_cast_dense_tensor_math_input
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
+from megatron.core.transformer.moe.token_dispatcher import (
+    _sglang_ordered_moe_assignment_rows,
+    _sglang_ordered_moe_unpermute,
+)
+from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
 from megatron.core.transformer.multi_token_prediction import get_mtp_layer_spec_for_backend
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer import TransformerConfig
@@ -197,6 +208,104 @@ def test_contract_object_owns_megatron_runtime_policy_values():
     assert policy.use_sglang_final_norm
     assert policy.use_sglang_residual_pair
     assert not policy.use_ulysses_cp_recompute_fallback
+
+
+def test_qwen3_moe_contract_splits_tp_cp_and_ep_policy_values():
+    contract = get_true_on_policy_contract(QWEN3_MOE_TRUE_ON_POLICY_V1)
+    config = _make_config(
+        batch_invariant_mode=True,
+        attention_backend=AttnBackend.flash,
+        context_parallel_size=2,
+        cp_comm_type="a2a",
+        expert_model_parallel_size=4,
+        num_moe_experts=128,
+        true_on_policy_contract=QWEN3_MOE_TRUE_ON_POLICY_V1,
+    )
+
+    policy = contract.policy_for(config)
+
+    assert contract.schema.model_family == "qwen3_moe"
+    assert policy.contract_name == QWEN3_MOE_TRUE_ON_POLICY_V1
+    assert policy.use_sglang_backend
+    assert policy.cp_layout == "ulysses_a2a"
+    assert policy.deterministic_moe_routing
+    assert policy.moe_topk_tiebreak == "stable_sort"
+    assert policy.ep_invariant_moe
+    assert policy.deterministic_moe_dispatch
+    assert policy.deterministic_moe_combine
+
+
+def test_true_on_policy_moe_local_spec_keeps_pre_mlp_layernorm_checkpoint_key():
+    dense_spec = get_gpt_layer_local_spec(
+        normalization="RMSNorm",
+        use_true_on_policy_backend=True,
+    )
+    moe_spec = get_gpt_layer_local_spec(
+        num_experts=128,
+        moe_grouped_gemm=True,
+        normalization="RMSNorm",
+        use_true_on_policy_backend=True,
+    )
+
+    dense_key_map = dense_spec.submodules.sharded_state_dict_keys_map
+    moe_key_map = moe_spec.submodules.sharded_state_dict_keys_map
+
+    assert dense_key_map["pre_mlp_layernorm."] == "mlp.linear_fc1.layer_norm_"
+    assert "pre_mlp_layernorm." not in moe_key_map
+    assert "mlp.linear_fc1.layer_norm_" not in moe_key_map.values()
+
+
+def test_sglang_moe_ep_tree_all_reduce_uses_sglang_fixed_tree(monkeypatch):
+    from megatron.core.true_on_policy.moe import sglang_moe_ep_tree_all_reduce
+
+    calls = []
+    tp_invariant_ops = types.ModuleType("sglang.srt.tp_invariant_ops")
+
+    def fake_tree_all_reduce_sum(input_, device_group=None):
+        calls.append((input_, device_group))
+        return input_ + 1
+
+    tp_invariant_ops.tree_all_reduce_sum = fake_tree_all_reduce_sum
+    monkeypatch.setitem(sys.modules, "sglang", types.ModuleType("sglang"))
+    monkeypatch.setitem(sys.modules, "sglang.srt", types.ModuleType("sglang.srt"))
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.tp_invariant_ops", tp_invariant_ops
+    )
+
+    ep_group = object()
+    input_ = torch.zeros(2, 3)
+    output = sglang_moe_ep_tree_all_reduce(input_, ep_group)
+
+    torch.testing.assert_close(output, torch.ones_like(input_))
+    assert calls == [(input_, ep_group)]
+
+
+def test_true_on_policy_stable_moe_topk_selects_from_fp32_softmax_scores():
+    logits = torch.tensor([[0.0, 0.001, 0.002, 0.003]], dtype=torch.bfloat16)
+
+    _, routing_map = topk_routing_with_score_function(
+        logits,
+        topk=2,
+        use_pre_softmax=False,
+        score_function="softmax",
+        topk_tiebreak="stable_sort",
+    )
+
+    assert routing_map.squeeze(0).nonzero().flatten().tolist() == [2, 3]
+
+
+def test_true_on_policy_stable_moe_topk_breaks_ties_by_expert_id():
+    logits = torch.zeros((1, 4), dtype=torch.bfloat16)
+
+    _, routing_map = topk_routing_with_score_function(
+        logits,
+        topk=2,
+        use_pre_softmax=False,
+        score_function="softmax",
+        topk_tiebreak="stable_sort",
+    )
+
+    assert routing_map.squeeze(0).nonzero().flatten().tolist() == [0, 1]
 
 
 def test_qwen3_dense_contract_only_marks_ulysses_a2a_as_cp_layout():
@@ -628,19 +737,19 @@ def test_sglang_qk_rmsnorm_matches_source_truth_dtype_boundary():
 
 
 def test_sglang_final_rmsnorm_matches_source_truth_dtype_boundary():
-    config = _make_config(normalization="RMSNorm")
+    config = _make_config(normalization="RMSNorm", params_dtype=torch.bfloat16)
     norm = SGLangFinalRMSNorm(config=config, hidden_size=4, eps=1e-6)
-    x = torch.randn(2, 3, 4, dtype=torch.bfloat16)
-    residual = torch.randn(2, 3, 4, dtype=torch.bfloat16)
+    x = torch.randn(2, 3, 4, dtype=torch.bfloat16).float()
+    residual = torch.randn(2, 3, 4, dtype=torch.float32)
 
     actual, actual_residual = norm(x, residual)
     x_with_residual = x + residual
     x_float = x_with_residual.float()
     expected = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + norm.eps)
-    expected = norm.weight.float() * expected.to(torch.bfloat16)
+    expected = norm.weight.to(torch.bfloat16) * expected.to(torch.bfloat16)
 
     assert norm.weight.dtype == torch.float32
-    assert actual.dtype == torch.float32
+    assert actual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(actual_residual, x_with_residual)
 
@@ -663,7 +772,7 @@ def test_sglang_rmsnorm_rejects_zero_centered_gamma():
         SGLangNorm(config=config, hidden_size=4, zero_centered_gamma=True)
 
 
-def test_sglang_spec_provider_grouped_mlp_fallback():
+def test_sglang_spec_provider_grouped_mlp_uses_sglang_no_grad_surface():
     provider = SGLangSpecProvider()
 
     module, submodules = provider.grouped_mlp_modules(
@@ -676,8 +785,122 @@ def test_sglang_spec_provider_grouped_mlp_fallback():
     grouped_module, grouped_submodules = provider.grouped_mlp_modules(
         moe_use_grouped_gemm=True, moe_use_legacy_grouped_gemm=False
     )
-    assert grouped_module.__name__ == "GroupedMLP"
+    assert grouped_module is SGLangGroupedMLP
     assert grouped_submodules is None
+
+
+def test_sglang_grouped_mlp_weight_views_match_megatron_grouped_layout():
+    config = _make_config(hidden_size=2, moe_ffn_hidden_size=3, num_moe_experts=2)
+    layer = object.__new__(SGLangGroupedMLP)
+    layer.config = config
+    layer.num_local_experts = 2
+    layer.weight1 = torch.arange(2 * 2 * 2 * 3, dtype=torch.bfloat16).reshape(2, 12)
+    layer.weight2 = torch.arange(2 * 3 * 2, dtype=torch.bfloat16).reshape(6, 2)
+
+    expected_w13 = layer.weight1.view(2, 2, 6).permute(0, 2, 1).contiguous()
+    expected_w2 = layer.weight2.view(2, 3, 2).permute(0, 2, 1).contiguous()
+
+    torch.testing.assert_close(layer._sglang_w13_weight(), expected_w13)
+    torch.testing.assert_close(layer._sglang_w2_weight(), expected_w2)
+
+
+def test_sglang_grouped_mlp_builds_sglang_ordered_topk_ids_from_routing_probs():
+    routing_probs = torch.tensor(
+        [
+            [0.0, 0.25, 0.0, 0.75],
+            [0.5, 0.0, 0.5, 0.0],
+        ],
+        dtype=torch.bfloat16,
+    )
+
+    actual = SGLangGroupedMLP._ordered_topk_ids_from_probs(routing_probs, topk=2)
+
+    torch.testing.assert_close(actual, torch.tensor([[3, 1], [0, 2]]))
+
+
+def test_sglang_grouped_mlp_masks_nonlocal_topk_ids_for_standard_ep_path():
+    layer = object.__new__(SGLangGroupedMLP)
+    layer.num_local_experts = 2
+    global_topk_ids = torch.tensor([[0, 3, 2], [1, 2, 3]], dtype=torch.long)
+
+    actual = layer._local_masked_topk_ids(global_topk_ids, local_expert_indices=[2, 3])
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([[-1, 1, 0], [-1, 0, 1]], dtype=torch.int32),
+    )
+
+
+def test_sglang_ordered_moe_unpermute_uses_topk_slot_order():
+    routing_map = torch.tensor(
+        [
+            [True, False, True, True],
+            [True, True, False, True],
+            [False, True, True, True],
+        ],
+        dtype=torch.bool,
+    )
+    probs = torch.tensor(
+        [
+            [0.2, 0.0, 0.7, 0.1],
+            [0.2, 0.5, 0.0, 0.3],
+            [0.0, 0.25, 0.15, 0.6],
+        ],
+        dtype=torch.bfloat16,
+    )
+    sorted_indices = torch.tensor([0, 1, 1, 2, 0, 2, 0, 1, 2], dtype=torch.long)
+    expected_rows = torch.tensor([[4, 0, 6], [2, 7, 1], [8, 3, 5]], dtype=torch.long)
+
+    actual_rows = _sglang_ordered_moe_assignment_rows(
+        sorted_indices=sorted_indices.view(3, 3),
+        routing_map=routing_map,
+        probs=probs,
+        topk=3,
+    )
+
+    torch.testing.assert_close(actual_rows, expected_rows)
+
+    permuted_tokens = torch.arange(18, dtype=torch.float32).view(9, 2)
+    actual = _sglang_ordered_moe_unpermute(
+        permuted_tokens=permuted_tokens,
+        sorted_indices=sorted_indices,
+        restore_shape=torch.Size([3, 2]),
+        routing_map=routing_map,
+        probs=probs,
+        topk=3,
+    )
+    expected = permuted_tokens[expected_rows].sum(dim=1)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sglang_ordered_moe_unpermute_groups_by_ep_rank():
+    routing_map = torch.tensor([[True, False, True, True]], dtype=torch.bool)
+    probs = torch.tensor([[0.5, 0.0, 0.7, 0.3]], dtype=torch.float32)
+    sorted_indices = torch.tensor([0, 0, 0], dtype=torch.long)
+    permuted_tokens = torch.tensor([[1.0], [1.0e20], [-1.0e20]], dtype=torch.float32)
+
+    topk_order_output = _sglang_ordered_moe_unpermute(
+        permuted_tokens=permuted_tokens,
+        sorted_indices=sorted_indices,
+        restore_shape=torch.Size([1, 1]),
+        routing_map=routing_map,
+        probs=probs,
+        topk=3,
+    )
+    ep_order_output = _sglang_ordered_moe_unpermute(
+        permuted_tokens=permuted_tokens,
+        sorted_indices=sorted_indices,
+        restore_shape=torch.Size([1, 1]),
+        routing_map=routing_map,
+        probs=probs,
+        topk=3,
+        ep_size=2,
+        num_local_experts=2,
+    )
+
+    torch.testing.assert_close(topk_order_output, torch.tensor([[0.0]]))
+    torch.testing.assert_close(ep_order_output, torch.tensor([[1.0]]))
 
 
 def test_sglang_mtp_spec_uses_sglang_backend():
