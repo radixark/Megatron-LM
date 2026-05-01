@@ -485,7 +485,7 @@ class MoELayer(BaseMoELayer):
         if self.use_shared_expert or self.config.moe_latent_size:
             return False
 
-        from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+        from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
         policy = resolve_true_on_policy_runtime_policy(self.config)
         return (
@@ -543,7 +543,7 @@ class MoELayer(BaseMoELayer):
         if getattr(dispatcher, "tp_size", 1) != 1 or getattr(dispatcher, "ep_size", 1) <= 1:
             return False
 
-        from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+        from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
         policy = resolve_true_on_policy_runtime_policy(self.config)
         return policy.ep_invariant_moe and policy.deterministic_moe_dispatch
@@ -573,7 +573,7 @@ class MoELayer(BaseMoELayer):
         if getattr(dispatcher, "tp_size", 1) != 1 or getattr(dispatcher, "ep_size", 1) <= 1:
             return False
 
-        from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+        from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
         policy = resolve_true_on_policy_runtime_policy(self.config)
         return policy.ep_invariant_moe and policy.deterministic_moe_dispatch
@@ -643,7 +643,7 @@ class MoELayer(BaseMoELayer):
                     self.config.moe_router_topk,
                     self.local_expert_indices,
                 )
-                from megatron.core.true_on_policy.moe import sglang_moe_ep_tree_all_reduce
+                from miles_megatron_plugins.true_on_policy.moe import sglang_moe_ep_tree_all_reduce
 
                 source_output = sglang_moe_ep_tree_all_reduce(source_output, ep_group)
 
@@ -675,7 +675,7 @@ class MoELayer(BaseMoELayer):
             self.config.moe_router_topk,
             self.local_expert_indices,
         )
-        from megatron.core.true_on_policy.moe import sglang_moe_ep_tree_all_reduce
+        from miles_megatron_plugins.true_on_policy.moe import sglang_moe_ep_tree_all_reduce
 
         global_output = sglang_moe_ep_tree_all_reduce(global_output, ep_group)
 
@@ -696,7 +696,7 @@ class MoELayer(BaseMoELayer):
         ep_size: int,
     ) -> list[list[tuple[int, int]]] | None:
         try:
-            from megatron.core.true_on_policy.moe import get_sglang_moe_rollout_context
+            from miles_megatron_plugins.true_on_policy.moe import get_sglang_moe_rollout_context
         except Exception:
             return None
 

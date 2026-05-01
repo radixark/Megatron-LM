@@ -975,7 +975,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         ):
             return False
 
-        from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+        from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
         policy = resolve_true_on_policy_runtime_policy(self.config)
         return policy.use_sglang_backend and policy.deterministic_moe_combine

@@ -23,7 +23,7 @@ from megatron.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
 
 class Router(ABC, MegatronModule):

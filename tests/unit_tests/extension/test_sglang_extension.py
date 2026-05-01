@@ -256,7 +256,7 @@ def test_true_on_policy_moe_local_spec_keeps_pre_mlp_layernorm_checkpoint_key():
 
 
 def test_sglang_moe_ep_tree_all_reduce_uses_sglang_fixed_tree(monkeypatch):
-    from megatron.core.true_on_policy.moe import sglang_moe_ep_tree_all_reduce
+    from miles_megatron_plugins.true_on_policy.moe import sglang_moe_ep_tree_all_reduce
 
     calls = []
     tp_invariant_ops = types.ModuleType("sglang.srt.tp_invariant_ops")

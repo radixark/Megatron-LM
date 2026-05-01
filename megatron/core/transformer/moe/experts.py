@@ -34,7 +34,7 @@ from megatron.core.tensor_parallel.layers import (
     set_tensor_model_parallel_attributes,
 )
 from megatron.core.tensor_parallel.utils import divide
-from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
