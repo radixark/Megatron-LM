@@ -49,7 +49,10 @@ logger = logging.getLogger(__name__)
      num_global_tokens: num_local_tokens*TP*EP
 """
 
-logger = logging.getLogger(__name__)
+def _deterministic_moe_combine_enabled(config: TransformerConfig) -> bool:
+    from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+
+    return resolve_true_on_policy_runtime_policy(config).deterministic_moe_combine
 
 
 class MoETokenDispatcher:
@@ -338,7 +341,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
+                hidden_states.to(self.local_probs.dtype),
+                group=self.tp_ep_group,
+                deterministic=_deterministic_moe_combine_enabled(self.config),
             ).to(hidden_states.dtype)
         return hidden_states
 
@@ -782,6 +787,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 hidden_states.to(self.probs.dtype),
                 group=self.tp_group,
                 input_split_sizes=input_split_sizes,
+                deterministic=_deterministic_moe_combine_enabled(self.config),
             ).to(hidden_states.dtype)
 
         return hidden_states

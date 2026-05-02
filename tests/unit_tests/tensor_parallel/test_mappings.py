@@ -178,8 +178,18 @@ def test_ReduceScatterToSequenceParallelRegion():
     output_data = mappings.reduce_scatter_to_sequence_parallel_region(input_data)
     expected_output = torch.ones(4).cuda() * 4 * int(Utils.rank % 4)
     assert torch.equal(output_data[0], expected_output)
+    deterministic_output_data = mappings.reduce_scatter_to_sequence_parallel_region(
+        input_data, deterministic=True
+    )
+    assert torch.equal(deterministic_output_data[0], expected_output)
     assert torch.equal(
         mappings._ReduceScatterToSequenceParallelRegion.symbolic(None, input_data, tp_group),
+        expected_output.reshape((1, 4)),
+    )
+    assert torch.equal(
+        mappings._DeterministicReduceScatterToSequenceParallelRegion.symbolic(
+            None, input_data, tp_group
+        ),
         expected_output.reshape((1, 4)),
     )
     input_data = torch.ones(4).cuda() * Utils.rank
@@ -196,4 +206,36 @@ def test_ReduceScatterToSequenceParallelRegion():
     if Utils.rank >= 4:
         expected_output = expected_output + 4
     assert torch.equal(output_data[0], expected_output)
+    deterministic_backward_data = mappings._DeterministicReduceScatterToSequenceParallelRegion.backward(
+        Ctx(), input_data
+    )
+    assert torch.equal(deterministic_backward_data[0], expected_output)
+
+    split_sizes = [1, 2, 3, 4]
+    rank_in_group = Utils.rank % 4
+    explicit_input = torch.arange(sum(split_sizes) * 4, dtype=torch.float32).reshape(-1, 4).cuda()
+    explicit_output = mappings.reduce_scatter_to_sequence_parallel_region(
+        explicit_input,
+        input_split_sizes=split_sizes,
+        deterministic=True,
+    )
+    explicit_start = sum(split_sizes[:rank_in_group])
+    explicit_expected = explicit_input[
+        explicit_start : explicit_start + split_sizes[rank_in_group]
+    ] * 4
+    assert torch.equal(explicit_output, explicit_expected)
+
+    class SplitCtx:
+        input_split_sizes = split_sizes
+        group = tp_group
+        use_global_buffer = False
+
+    explicit_grad = torch.ones((split_sizes[rank_in_group], 4), device="cuda") * rank_in_group
+    explicit_backward_data = mappings._DeterministicReduceScatterToSequenceParallelRegion.backward(
+        SplitCtx(), explicit_grad
+    )
+    explicit_backward_expected = torch.cat(
+        [torch.ones((split_size, 4)) * rank for rank, split_size in enumerate(split_sizes)]
+    ).cuda()
+    assert torch.equal(explicit_backward_data[0], explicit_backward_expected)
     Utils.destroy_model_parallel()

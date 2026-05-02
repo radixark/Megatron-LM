@@ -24,6 +24,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
@@ -166,6 +167,20 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
 
 
+def deallocate_output_tensors(outputs, deallocate_pipeline_outputs=False):
+    """Deallocate one or more pipeline outputs after the send has completed."""
+    if not isinstance(outputs, list):
+        outputs = [outputs]
+    if len(outputs) > 1:
+        # The true-on-policy PP carrier sends [hidden_states, residual].  Mutating
+        # both TensorImpls to scalar placeholders can corrupt backward metadata for
+        # the residual path under full activation recompute, producing NaN wgrads
+        # from an otherwise zero upstream gradient.
+        return
+    for output in outputs:
+        deallocate_output_tensor(output, deallocate_pipeline_outputs)
+
+
 def custom_backward(output, grad_output):
     '''Directly call C++ autograd engine.
 
@@ -190,6 +205,33 @@ def custom_backward(output, grad_output):
     Variable._execution_engine.run_backward(
         tensors=(output,),
         grad_tensors=(grad_output,),
+        keep_graph=False,
+        create_graph=False,
+        inputs=tuple(),
+        allow_unreachable=True,
+        accumulate_grad=True,
+    )
+
+
+def custom_backward_multiple(outputs, grad_outputs):
+    """Directly call the C++ autograd engine for multiple pipeline outputs."""
+    tensors = []
+    grad_tensors = []
+    for output, grad_output in zip(outputs, grad_outputs):
+        if not output.requires_grad:
+            continue
+        if grad_output is None:
+            assert output.numel() == 1, "implicit grad requires scalar output."
+            grad_output = torch.ones_like(output, memory_format=torch.preserve_format)
+        tensors.append(output)
+        grad_tensors.append(grad_output)
+
+    if not tensors:
+        return
+
+    Variable._execution_engine.run_backward(
+        tensors=tuple(tensors),
+        grad_tensors=tuple(grad_tensors),
         keep_graph=False,
         create_graph=False,
         inputs=tuple(),
@@ -280,11 +322,12 @@ def forward_step_calc_loss(
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+        device_tensor = output_tensor[0] if isinstance(output_tensor, list) else output_tensor
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device_tensor.device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device_tensor.device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:
@@ -296,11 +339,12 @@ def forward_step_calc_loss(
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
+        device_tensor = output_tensor[0] if isinstance(output_tensor, list) else output_tensor
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device_tensor.device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device_tensor.device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:
@@ -443,6 +487,8 @@ def forward_step(
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
+    if isinstance(output_tensor, list):
+        return output_tensor, num_tokens
     return [output_tensor], num_tokens
 
 
@@ -480,16 +526,28 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
 
+    backward_tensors = [
+        tensor for tensor in output_tensor if tensor is not None and tensor.requires_grad
+    ]
+    backward_grads = [
+        grad
+        for tensor, grad in zip(output_tensor, output_tensor_grad)
+        if tensor is not None and tensor.requires_grad
+    ]
+
     # In multi-modal models like VLM, some batches may not have images.
     # When no image is present, the vision encoder (as a separate pipeline stage)
     # will not participate in the computation.
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    if output_tensor[0].requires_grad:
+    if backward_tensors:
         if config.deallocate_pipeline_outputs:
-            custom_backward(output_tensor[0], output_tensor_grad[0])
+            if len(backward_tensors) == 1:
+                custom_backward(backward_tensors[0], backward_grads[0])
+            else:
+                custom_backward_multiple(backward_tensors, backward_grads)
         else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+            torch.autograd.backward(backward_tensors, grad_tensors=backward_grads)
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -2098,7 +2156,14 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    tensor_shape = (effective_seq_length, micro_batch_size, config.hidden_size)
+    tensor_shapes.append(tensor_shape)
+    true_on_policy_policy = resolve_true_on_policy_runtime_policy(config)
+    if (
+        true_on_policy_policy.use_sglang_residual_pair
+        and parallel_state.get_pipeline_model_parallel_world_size() > 1
+    ):
+        tensor_shapes.append(tensor_shape)
     return tensor_shapes
 
 
@@ -2310,7 +2375,7 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            deallocate_output_tensors(output_tensor, config.deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -2367,7 +2432,7 @@ def forward_backward_pipelining_without_interleaving(
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            deallocate_output_tensors(output_tensor, config.deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.

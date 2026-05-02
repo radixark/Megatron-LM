@@ -687,14 +687,15 @@ def test_sglang_norm_rmsnorm_accepts_residual_pair():
     residual = torch.randn(2, 3, 4, dtype=torch.bfloat16)
 
     actual, actual_residual = norm(x, residual)
-    x_float = x.float() + residual.float()
+    rounded_residual = (x.float() + residual.float()).to(x.dtype)
+    x_float = rounded_residual.float()
     expected = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + norm.eps)
     expected = norm.weight.float() * expected
 
     assert actual.dtype == torch.float32
-    assert actual_residual.dtype == torch.float32
+    assert actual_residual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(actual_residual, x_float)
+    torch.testing.assert_close(actual_residual, rounded_residual)
 
 
 def test_sglang_qk_rmsnorm_matches_source_truth_dtype_boundary():

@@ -246,14 +246,19 @@ class SharedExpertMLP(MLP):
         """
         assert self.config.moe_shared_expert_overlap
         assert self.cached_fc2_output is not None
+        from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+
+        true_on_policy = resolve_true_on_policy_runtime_policy(self.config)
         with torch.cuda.stream(self.stream):
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output,
+                    deterministic=true_on_policy.deterministic_row_parallel_reduce,
                 )
             else:
                 self.cached_output = reduce_from_tensor_model_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output,
+                    deterministic=true_on_policy.deterministic_row_parallel_reduce,
                 )
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)

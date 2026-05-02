@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -15,7 +17,70 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
+from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
+    should_compact_true_on_policy_padding,
+    uses_true_on_policy_moe_kernel,
+)
 from tests.unit_tests.test_utilities import Utils
+
+
+class _FakeGroup:
+    def __init__(self, size: int):
+        self._size = size
+
+    def size(self) -> int:
+        return self._size
+
+
+class _FakeExperts:
+    def forward_sglang_local_masked(self):
+        raise AssertionError("not called")
+
+
+def _make_true_on_policy_moe_layer_for_gate_tests(
+    *,
+    sequence_parallel: bool,
+    attn_tp_size: int,
+) -> MoELayer:
+    layer = object.__new__(MoELayer)
+    layer.config = SimpleNamespace(
+        true_on_policy_contract="qwen3_moe_true_on_policy_v1",
+        context_parallel_size=1,
+        cp_comm_type=None,
+        batch_invariant_mode=False,
+        expert_model_parallel_size=4,
+        sequence_parallel=sequence_parallel,
+        moe_latent_size=None,
+        moe_router_topk=8,
+        moe_permute_fusion=False,
+    )
+    layer.attn_tp_group = _FakeGroup(attn_tp_size)
+    layer.use_shared_expert = False
+    layer.token_dispatcher = SimpleNamespace(drop_and_pad=False, tp_size=1, ep_size=4)
+    layer.experts = _FakeExperts()
+    return layer
+
+
+def test_true_on_policy_moe_padding_compaction_disabled_for_sp():
+    layer = _make_true_on_policy_moe_layer_for_gate_tests(
+        sequence_parallel=True,
+        attn_tp_size=2,
+    )
+    padding_mask = torch.tensor([[False, True]])
+
+    assert not should_compact_true_on_policy_padding(layer, padding_mask, None)
+    assert uses_true_on_policy_moe_kernel(layer)
+
+
+def test_true_on_policy_moe_padding_compaction_kept_without_sp():
+    layer = _make_true_on_policy_moe_layer_for_gate_tests(
+        sequence_parallel=False,
+        attn_tp_size=1,
+    )
+    padding_mask = torch.tensor([[False, True]])
+
+    assert should_compact_true_on_policy_padding(layer, padding_mask, None)
+    assert uses_true_on_policy_moe_kernel(layer)
 
 
 class TestMoELayerInit:

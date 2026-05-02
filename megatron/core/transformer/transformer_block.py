@@ -706,7 +706,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         model's forward_step_func won't have it. This function is thus
         used by internal code to bypass the input provided by the
         forward_step_func"""
-        self.input_tensor = input_tensor
+        if isinstance(input_tensor, list):
+            assert len(input_tensor) in (1, 2), (
+                "TransformerBlock input_tensor should be length 1, or length 2 for "
+                "the true-on-policy residual-pair pipeline carrier"
+            )
+            self.input_tensor = input_tensor[0]
+            self._sglang_input_residual = input_tensor[1] if len(input_tensor) == 2 else None
+        else:
+            self.input_tensor = input_tensor
+            self._sglang_input_residual = None
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """
@@ -816,6 +825,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
+            sglang_input_residual = getattr(self, "_sglang_input_residual", None)
+        else:
+            sglang_input_residual = None
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -833,6 +845,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+        if true_on_policy_policy.use_sglang_residual_pair and sglang_input_residual is not None:
+            hidden_states._sglang_residual = sglang_input_residual
+        if hasattr(self, "_sglang_input_residual"):
+            del self._sglang_input_residual
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -947,6 +964,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # on the computational graph and will lead to unexpected errors in pipeline schedules.
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
+
+        if not self.post_process:
+            true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+            sglang_residual = (
+                getattr(hidden_states, "_sglang_residual", None)
+                if true_on_policy_policy.use_sglang_residual_pair
+                else None
+            )
+            if sglang_residual is not None:
+                return [hidden_states, sglang_residual]
 
         return hidden_states
 

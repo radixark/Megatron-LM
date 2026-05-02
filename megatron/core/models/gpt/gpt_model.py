@@ -348,8 +348,11 @@ class GPTModel(LanguageModule):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
 
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
-        self.decoder.set_input_tensor(input_tensor[0])
+        assert len(input_tensor) in (1, 2), (
+            'input_tensor should be length 1 for gpt/bert, or length 2 for the '
+            'true-on-policy residual-pair pipeline carrier'
+        )
+        self.decoder.set_input_tensor(input_tensor[0] if len(input_tensor) == 1 else input_tensor)
 
     def _preprocess(
         self,

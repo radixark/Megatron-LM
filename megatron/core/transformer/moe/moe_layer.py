@@ -31,6 +31,7 @@ from megatron.core.utils import internal_api
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
     forward_compacted_true_on_policy_padding,
     run_direct_sglang_ep_forward,
+    should_compact_true_on_policy_padding,
     uses_true_on_policy_moe_kernel,
 )
 
@@ -391,8 +392,9 @@ class MoELayer(BaseMoELayer):
         """
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
-                "During training, performance may degrade if MoE and tensor parallelism"
-                "are enabled without also enabling sequence parallelism."
+                "Megatron MoE training with attention TP requires sequence parallel. "
+                "TODO: add a true-on-policy path for attention TP without sequence parallel "
+                "if that topology becomes necessary."
             )
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
@@ -455,12 +457,7 @@ class MoELayer(BaseMoELayer):
 
         use_compact = (
             use_true_on_policy_moe_kernel
-            and padding_mask is not None
-            and intermediate_tensors is None
-            and padding_mask.dtype == torch.bool
-            and bool(padding_mask.any().item())
-            and not self.use_shared_expert
-            and not self.config.moe_latent_size
+            and should_compact_true_on_policy_padding(self, padding_mask, intermediate_tensors)
         )
 
         if use_compact:
