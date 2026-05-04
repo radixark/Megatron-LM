@@ -6,7 +6,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
-from miles.miles_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
 
 class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):

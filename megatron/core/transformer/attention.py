@@ -20,7 +20,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
 )
 
 try:
-    from miles.miles_plugins.true_on_policy.sglang_backend import (
+    from miles_plugins.true_on_policy.sglang_backend import (
         is_sglang_rope_enabled,
         sglang_apply_rotary_pos_emb_with_freqs,
     )
@@ -47,7 +47,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from miles.miles_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
