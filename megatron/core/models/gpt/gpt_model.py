@@ -38,7 +38,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from miles_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,

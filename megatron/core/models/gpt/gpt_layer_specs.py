@@ -55,10 +55,10 @@ try:
 except ImportError:
     HAVE_KITCHEN = False
 
-from miles_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
-from miles_plugins.true_on_policy.rope import enable_sglang_rope
-from miles_plugins.true_on_policy.runtime import enable_sglang_batch_invariant_mode
-from miles_plugins.true_on_policy.sglang_backend import (
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.rope import enable_sglang_rope
+from miles_megatron_plugins.true_on_policy.runtime import enable_sglang_batch_invariant_mode
+from miles_megatron_plugins.true_on_policy.sglang_backend import (
     SGLangFinalRMSNorm,
     SGLangNorm,
     SGLangSpecProvider,
