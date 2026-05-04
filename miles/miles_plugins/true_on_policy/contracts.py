@@ -1,11 +1,9 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
 
-from megatron.core.true_on_policy.schema import (
+from .schema import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
     TrueOnPolicyContractName,
     TrueOnPolicyContractSchema,

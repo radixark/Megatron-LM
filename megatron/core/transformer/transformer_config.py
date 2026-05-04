@@ -937,7 +937,7 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         if self.true_on_policy_contract is not None:
-            from megatron.core.true_on_policy.contracts import validate_true_on_policy_contract
+            from miles.miles_plugins.true_on_policy.contracts import validate_true_on_policy_contract
 
             validate_true_on_policy_contract(self.true_on_policy_contract)
         if self.fp16 and self.bf16:

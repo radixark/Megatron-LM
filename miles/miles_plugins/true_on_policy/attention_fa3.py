@@ -1,5 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 from __future__ import annotations
 
 import inspect
@@ -15,7 +13,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.true_on_policy.cp_layout import SGLangUlyssesCPLayout
+from .cp_layout import SGLangUlyssesCPLayout
 from megatron.core.utils import divide
 
 try:

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 from __future__ import annotations
 
 import warnings
@@ -11,9 +9,9 @@ from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.true_on_policy.attention_fa3 import SGLangCoreAttention
-from megatron.core.true_on_policy.linear import SGLangColumnParallelLinear, SGLangRowParallelLinear
-from megatron.core.true_on_policy.norm import SGLangNorm, SGLangQKRMSNorm
+from .attention_fa3 import SGLangCoreAttention
+from .linear import SGLangColumnParallelLinear, SGLangRowParallelLinear
+from .norm import SGLangNorm, SGLangQKRMSNorm
 
 
 class SGLangSpecProvider(BackendSpecProvider):

@@ -1,10 +1,8 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 from __future__ import annotations
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.true_on_policy.matmul import sglang_reference_matmul
-from megatron.core.true_on_policy.runtime import ensure_batch_invariant_mode_from_config
+from .matmul import sglang_reference_matmul
+from .runtime import ensure_batch_invariant_mode_from_config
 
 
 class SGLangColumnParallelLinear(ColumnParallelLinear):

@@ -24,7 +24,7 @@ from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles.miles_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,

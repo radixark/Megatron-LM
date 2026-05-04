@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
-from megatron.core.true_on_policy.sglang_backend import (
+from miles.miles_plugins.true_on_policy.sglang_backend import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
     MegatronTrueOnPolicyRuntimePolicy,
     SGLangColumnParallelLinear,
@@ -26,11 +26,11 @@ from megatron.core.true_on_policy.sglang_backend import (
     is_sglang_rope_enabled,
     resolve_true_on_policy_runtime_policy,
 )
-from megatron.core.true_on_policy.contracts import get_true_on_policy_contract
+from miles.miles_plugins.true_on_policy.contracts import get_true_on_policy_contract
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.layers import linear_with_grad_accumulation_and_async_allreduce
-from megatron.core.true_on_policy.matmul import _sglang_row_parallel_matmul, sglang_reference_matmul
+from miles.miles_plugins.true_on_policy.matmul import _sglang_row_parallel_matmul, sglang_reference_matmul
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     matmul_persistent,
@@ -106,7 +106,7 @@ def test_sglang_extension_imports():
 def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
     from megatron.core.extensions import sglang as legacy_backend
     from megatron.core.tensor_parallel import matmul_tp_inv as legacy_matmul
-    from megatron.core.true_on_policy import (
+    from miles.miles_plugins.true_on_policy import (
         attention_fa3,
         bias_dropout,
         cp_layout,
@@ -116,7 +116,7 @@ def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
         rope,
         runtime,
     )
-    from megatron.core.true_on_policy import matmul, sglang_backend
+    from miles.miles_plugins.true_on_policy import matmul, sglang_backend
 
     assert legacy_backend.SGLangNorm is sglang_backend.SGLangNorm
     assert legacy_backend.SGLangRowParallelLinear is sglang_backend.SGLangRowParallelLinear
