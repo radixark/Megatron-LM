@@ -1,5 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 """Deterministic EP combine for true-on-policy MoE.
 
 Wraps SGLang's ``tree_all_reduce_sum`` so SGLang rollout and Megatron training

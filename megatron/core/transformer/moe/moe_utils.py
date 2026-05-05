@@ -710,12 +710,14 @@ def topk_routing_with_score_function(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
-    from miles.utils.replay_base import routing_replay_manager
+    try:
+        from miles.utils.replay_base import routing_replay_manager
 
-    # MTP layers cannot use rollout routing replay
-    if not is_mtp:
-        compute_topk = routing_replay_manager.get_topk_fn(_compute_topk, return_probs=True)
-    else:
+        if not is_mtp:
+            compute_topk = routing_replay_manager.get_topk_fn(_compute_topk, return_probs=True)
+        else:
+            compute_topk = _compute_topk
+    except ImportError:
         compute_topk = _compute_topk
 
     if score_function == "softmax":

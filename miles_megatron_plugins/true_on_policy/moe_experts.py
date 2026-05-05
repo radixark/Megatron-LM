@@ -1,5 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 """``SGLangGroupedMLP``: Megatron grouped expert with an SGLang no-grad forward.
 
 The autograd path stays on Megatron's ``GroupedMLP``. Inference (reference and

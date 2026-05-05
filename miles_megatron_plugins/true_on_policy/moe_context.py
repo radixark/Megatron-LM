@@ -1,5 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 """SGLang MoE rollout-segment context.
 
 Plumbs per-sample DP partitioning information from the rollout into the

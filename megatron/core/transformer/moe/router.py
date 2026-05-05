@@ -23,7 +23,15 @@ from megatron.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+
+try:
+    from miles_megatron_plugins.true_on_policy.contracts import (
+        resolve_true_on_policy_runtime_policy,
+    )
+
+    _HAS_TRUE_ON_POLICY = True
+except ImportError:
+    _HAS_TRUE_ON_POLICY = False
 
 
 class Router(ABC, MegatronModule):
@@ -93,12 +101,13 @@ class Router(ABC, MegatronModule):
         if self.bias is not None and self.bias.device.type == 'cpu':
             self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
 
-        # Convert to specified datatype for routing computation if enabled.
-        # The true-on-policy MoE contract follows SGLang's routed expert path:
-        # cast the post-norm activation back to parameter dtype for the router
-        # projection, then compute softmax/top-k from the resulting logits.
-        true_on_policy = resolve_true_on_policy_runtime_policy(self.config)
-        if true_on_policy.deterministic_moe_routing:
+        # When the true-on-policy MoE contract is active, cast the post-norm
+        # activation back to parameter dtype for the router projection so the
+        # softmax/top-k numerics match SGLang's routed expert path.
+        if (
+            _HAS_TRUE_ON_POLICY
+            and resolve_true_on_policy_runtime_policy(self.config).deterministic_moe_routing
+        ):
             router_dtype = self.config.params_dtype
         else:
             router_dtype = input.dtype
@@ -211,8 +220,12 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        from miles.utils.replay_base import routing_replay_manager
-        routing_replay_manager.register_to_module(self, "routing_replay")
+        try:
+            from miles.utils.replay_base import routing_replay_manager
+
+            routing_replay_manager.register_to_module(self, "routing_replay")
+        except ImportError:
+            pass
 
     def _maintain_float32_expert_bias(self):
         """
@@ -575,7 +588,11 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
-        true_on_policy = resolve_true_on_policy_runtime_policy(self.config)
+        if _HAS_TRUE_ON_POLICY:
+            _top = resolve_true_on_policy_runtime_policy(self.config)
+            _topk_tiebreak = _top.moe_topk_tiebreak if _top.deterministic_moe_routing else None
+        else:
+            _topk_tiebreak = None
 
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
@@ -592,11 +609,7 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 is_mtp=self.is_mtp,
-                topk_tiebreak=(
-                    true_on_policy.moe_topk_tiebreak
-                    if true_on_policy.deterministic_moe_routing
-                    else None
-                ),
+                topk_tiebreak=_topk_tiebreak,
             )
 
         # Apply token dropping to probs and routing_map.
@@ -619,11 +632,7 @@ class TopKRouter(Router):
                 self.score_function,
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
-                topk_tiebreak=(
-                    true_on_policy.moe_topk_tiebreak
-                    if true_on_policy.deterministic_moe_routing
-                    else None
-                ),
+                topk_tiebreak=_topk_tiebreak,
             )
             probs = self._apply_aux_loss(
                 probs,
