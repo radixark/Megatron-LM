@@ -600,7 +600,9 @@ class GPTModel(LanguageModule):
             if decoder_input is not None:
                 decoder_input = self.local_head_witness(witness_ids, decoder_input)
             else:
-                self.decoder.input_tensor = self.local_head_witness(witness_ids, self.decoder.input_tensor)
+                self.decoder.input_tensor = self.local_head_witness(
+                    witness_ids, self.decoder.input_tensor
+                )
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -633,6 +635,7 @@ class GPTModel(LanguageModule):
             loss_mask=loss_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
@@ -662,6 +665,7 @@ class GPTModel(LanguageModule):
         loss_mask=None,
         decoder_input=None,
         attention_mask=None,
+        padding_mask=None,
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
@@ -695,6 +699,7 @@ class GPTModel(LanguageModule):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
                 embedding=self.embedding,
                 **(extra_block_kwargs or {}),
             )
