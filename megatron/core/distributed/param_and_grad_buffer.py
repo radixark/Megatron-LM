@@ -18,6 +18,7 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
+from miles_megatron_plugins.true_on_policy.debug import dump_param_and_grad_buffer_debug
 
 from ..fp8_utils import (
     is_float8tensor,
@@ -226,7 +227,8 @@ class _ParamAndGradBucketGroup:
         for i in range(len(self.buckets)):
             grad_norm = self.buckets[i].grad_data.norm(p=2)
             if grad_debug_dir and not torch.isfinite(grad_norm).item():
-                self._dump_grad_debug(
+                dump_param_and_grad_buffer_debug(
+                    self,
                     bucket_index=i,
                     grad_norm=grad_norm,
                     grad_debug_dir=grad_debug_dir,
@@ -260,83 +262,6 @@ class _ParamAndGradBucketGroup:
                     tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
                     fatal=False,
                 )
-
-    def _dump_grad_debug(self, bucket_index: int, grad_norm: torch.Tensor, grad_debug_dir: str):
-        """
-        Dump bucket and per-parameter gradient stats before the normal rerun-state
-        validation raises. This is env-gated because it synchronizes tensors to CPU.
-        """
-        bucket = self.buckets[bucket_index]
-        dump_key = (bucket.bucket_id, bucket_index)
-        if dump_key in self._grad_debug_dumped_buckets:
-            return
-        self._grad_debug_dumped_buckets.add(dump_key)
-
-        def _tensor_stats(tensor: torch.Tensor):
-            flat = tensor.detach().view(-1)
-            finite = torch.isfinite(flat)
-            nan = torch.isnan(flat)
-            inf = torch.isinf(flat)
-            stats = {
-                "shape": tuple(tensor.shape),
-                "dtype": str(tensor.dtype),
-                "numel": flat.numel(),
-                "finite": int(finite.sum().item()),
-                "nan": int(nan.sum().item()),
-                "inf": int(inf.sum().item()),
-            }
-            if stats["finite"] > 0:
-                finite_values = flat[finite].float()
-                stats.update(
-                    {
-                        "max_abs_finite": float(finite_values.abs().max().item()),
-                        "min_finite": float(finite_values.min().item()),
-                        "max_finite": float(finite_values.max().item()),
-                    }
-                )
-            return stats
-
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-        else:
-            rank = -1
-
-        params = []
-        for param in bucket.params_list:
-            start, end = bucket.param_to_index[param]
-            grad_slice = bucket.grad_data.view(-1)[start:end].view(param.shape)
-            params.append(
-                {
-                    "name": bucket.param_to_name.get(param, "<unknown>"),
-                    "shape": tuple(param.shape),
-                    "requires_grad": bool(param.requires_grad),
-                    "grad_slice": _tensor_stats(grad_slice),
-                    "main_grad": _tensor_stats(param.main_grad)
-                    if hasattr(param, "main_grad") and param.main_grad is not None
-                    else None,
-                }
-            )
-
-        os.makedirs(grad_debug_dir, exist_ok=True)
-        path = os.path.join(
-            grad_debug_dir,
-            f"rank_{rank}_bucket_{bucket.bucket_id}_idx_{bucket_index}_pid_{os.getpid()}.pt",
-        )
-        torch.save(
-            {
-                "rank": rank,
-                "bucket_id": bucket.bucket_id,
-                "bucket_index": bucket_index,
-                "grad_norm": float(grad_norm.detach().float().cpu().item()),
-                "bucket_grad": _tensor_stats(bucket.grad_data),
-                "params": params,
-            },
-            path,
-        )
-        print(
-            f"[MILES_GRAD_DEBUG] wrote nonfinite grad dump to {path}",
-            flush=True,
-        )
 
     def start_param_sync(self, force_sync: bool = False):
         """

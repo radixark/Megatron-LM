@@ -2,7 +2,6 @@
 
 import functools
 import logging
-import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -25,6 +24,10 @@ from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.debug import (
+    register_activation_grad_debug,
+    register_norm_grad_debug as _register_norm_grad_debug,
+)
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
@@ -36,74 +39,6 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-_NORM_GRAD_DEBUG_COUNTER = 0
-
-
-def _register_norm_grad_debug(tensor: Tensor, *, layer_number: int, name: str) -> None:
-    debug_dir = os.environ.get("MILES_NORM_BACKWARD_DEBUG_DIR")
-    if not debug_dir or not torch.is_tensor(tensor) or not tensor.requires_grad:
-        return
-
-    debug_all = os.environ.get("MILES_NORM_BACKWARD_DEBUG_ALL") == "1"
-    threshold = float(os.environ.get("MILES_NORM_BACKWARD_DEBUG_THRESHOLD", "1e20"))
-    debug_key = f"{layer_number}:{name}"
-
-    def _hook(grad: Tensor) -> Tensor:
-        flat = grad.detach().view(-1)
-        finite = torch.isfinite(flat)
-        has_nan = int(torch.isnan(flat).sum().item())
-        has_inf = int(torch.isinf(flat).sum().item())
-        max_abs_finite = None
-        min_finite = None
-        max_finite = None
-        if finite.any().item():
-            finite_values = flat[finite].float()
-            max_abs_finite = float(finite_values.abs().max().item())
-            min_finite = float(finite_values.min().item())
-            max_finite = float(finite_values.max().item())
-
-        should_dump = debug_all or has_nan or has_inf
-        if max_abs_finite is not None and max_abs_finite >= threshold:
-            should_dump = True
-        if not should_dump:
-            return grad
-
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        if not debug_all:
-            seen = getattr(_register_norm_grad_debug, "_seen", set())
-            seen_key = (rank, debug_key)
-            if seen_key in seen:
-                return grad
-            seen.add(seen_key)
-            _register_norm_grad_debug._seen = seen
-
-        global _NORM_GRAD_DEBUG_COUNTER
-        counter = _NORM_GRAD_DEBUG_COUNTER
-        _NORM_GRAD_DEBUG_COUNTER += 1
-        stats = {
-            "rank": rank,
-            "layer_number": layer_number,
-            "name": name,
-            "shape": tuple(grad.shape),
-            "dtype": str(grad.dtype),
-            "numel": flat.numel(),
-            "finite": int(finite.sum().item()),
-            "nan": has_nan,
-            "inf": has_inf,
-            "max_abs_finite": max_abs_finite,
-            "min_finite": min_finite,
-            "max_finite": max_finite,
-        }
-        os.makedirs(debug_dir, exist_ok=True)
-        path = os.path.join(
-            debug_dir, f"rank_{rank}_layer_{layer_number}_{counter:05d}_{name}_pid_{os.getpid()}.pt"
-        )
-        torch.save(stats, path)
-        print(f"[MILES_NORM_BACKWARD_DEBUG] {stats} wrote {path}", flush=True)
-        return grad
-
-    tensor.register_hook(_hook)
 
 
 def get_transformer_layer_offset(
@@ -598,71 +533,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        self._register_activation_grad_debug(hidden_states, "after_attention")
+        register_activation_grad_debug(
+            self, hidden_states, layer_number=self.layer_number, name="after_attention"
+        )
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
         )
-        self._register_activation_grad_debug(output, "layer_output")
+        register_activation_grad_debug(self, output, layer_number=self.layer_number, name="layer_output")
         return output, context
-
-    def _register_activation_grad_debug(self, tensor: Tensor, name: str) -> None:
-        """Print/dump first nonfinite activation gradient for this layer when env-gated."""
-        debug_dir = os.environ.get("MILES_ACTIVATION_GRAD_DEBUG_DIR")
-        if not debug_dir or not torch.is_tensor(tensor) or not tensor.requires_grad:
-            return
-
-        layer_number = self.layer_number
-        debug_key = f"{layer_number}:{name}"
-
-        def _hook(grad: Tensor) -> Tensor:
-            if torch.isfinite(grad).all().item():
-                return grad
-
-            seen = getattr(self, "_activation_grad_debug_seen", set())
-            if debug_key in seen:
-                return grad
-            seen.add(debug_key)
-            self._activation_grad_debug_seen = seen
-
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                rank = torch.distributed.get_rank()
-            else:
-                rank = -1
-
-            flat = grad.detach().view(-1)
-            finite = torch.isfinite(flat)
-            stats = {
-                "rank": rank,
-                "layer_number": layer_number,
-                "name": name,
-                "shape": tuple(grad.shape),
-                "dtype": str(grad.dtype),
-                "numel": flat.numel(),
-                "finite": int(finite.sum().item()),
-                "nan": int(torch.isnan(flat).sum().item()),
-                "inf": int(torch.isinf(flat).sum().item()),
-            }
-            if stats["finite"] > 0:
-                finite_values = flat[finite].float()
-                stats.update(
-                    {
-                        "max_abs_finite": float(finite_values.abs().max().item()),
-                        "min_finite": float(finite_values.min().item()),
-                        "max_finite": float(finite_values.max().item()),
-                    }
-                )
-
-            os.makedirs(debug_dir, exist_ok=True)
-            path = os.path.join(
-                debug_dir, f"rank_{rank}_layer_{layer_number}_{name}_pid_{os.getpid()}.pt"
-            )
-            torch.save(stats, path)
-            print(f"[MILES_ACTIVATION_GRAD_DEBUG] {stats} wrote {path}", flush=True)
-            return grad
-
-        tensor.register_hook(_hook)
 
     def _forward_attention(
         self,
