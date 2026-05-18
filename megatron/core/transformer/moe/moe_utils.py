@@ -668,6 +668,14 @@ def topk_routing_with_score_function(
         )
 
     def _stable_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not (torch.is_grad_enabled() and scores.requires_grad):
+            try:
+                from sglang.srt.tp_invariant_ops import stable_topk as sglang_stable_topk
+
+                return sglang_stable_topk(scores, k)
+            except ImportError:
+                pass
+
         expert_ids = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.float32)
         scores_fp32 = scores.float()
         tie_step = torch.finfo(torch.float32).eps * scores_fp32.abs().clamp_min(

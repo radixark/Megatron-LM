@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import sys
 import types
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -754,6 +756,19 @@ def test_sglang_final_rmsnorm_matches_source_truth_dtype_boundary():
     torch.testing.assert_close(actual_residual, x_with_residual)
 
 
+def test_sglang_exact_forward_native_grad_wrapper_preserves_exact_value():
+    from miles_megatron_plugins.true_on_policy.norm import _with_native_grad
+
+    exact = torch.tensor([1.0], dtype=torch.float32)
+    native = torch.tensor([1.0e8], dtype=torch.float32, requires_grad=True)
+
+    actual = _with_native_grad(exact, native)
+
+    torch.testing.assert_close(actual.detach(), exact, atol=0.0, rtol=0.0)
+    actual.sum().backward()
+    torch.testing.assert_close(native.grad, torch.ones_like(native))
+
+
 def test_sglang_bias_dropout_add_keeps_residual_add_in_float():
     x = torch.randn(2, 3, 4, dtype=torch.bfloat16)
     residual = torch.randn(2, 3, 4, dtype=torch.float32)
@@ -802,6 +817,44 @@ def test_sglang_grouped_mlp_weight_views_match_megatron_grouped_layout():
 
     torch.testing.assert_close(layer._sglang_w13_weight(), expected_w13)
     torch.testing.assert_close(layer._sglang_w2_weight(), expected_w2)
+
+
+def test_sglang_grouped_mlp_weight_cache_reuses_and_invalidates_on_update():
+    config = _make_config(hidden_size=2, moe_ffn_hidden_size=3, num_moe_experts=2)
+    layer = object.__new__(SGLangGroupedMLP)
+    layer.config = config
+    layer.num_local_experts = 2
+    layer.weight1 = torch.arange(2 * 2 * 2 * 3, dtype=torch.bfloat16).reshape(2, 12)
+    layer.weight2 = torch.arange(2 * 3 * 2, dtype=torch.bfloat16).reshape(6, 2)
+
+    with patch.dict(os.environ, {"MILES_TRUE_ON_POLICY_CACHE_SGLANG_EXPERT_WEIGHTS": "1"}):
+        with torch.no_grad():
+            first = layer._sglang_w13_weight()
+            second = layer._sglang_w13_weight()
+            assert first.data_ptr() == second.data_ptr()
+
+            layer.weight1.add_(1)
+            updated = layer._sglang_w13_weight()
+
+    assert updated.data_ptr() != first.data_ptr()
+    torch.testing.assert_close(
+        updated,
+        layer.weight1.view(2, 2, 6).permute(0, 2, 1).contiguous(),
+    )
+
+
+def test_sglang_grouped_mlp_weight_cache_disabled_by_default():
+    config = _make_config(hidden_size=2, moe_ffn_hidden_size=3, num_moe_experts=2)
+    layer = object.__new__(SGLangGroupedMLP)
+    layer.config = config
+    layer.num_local_experts = 2
+    layer.weight1 = torch.arange(2 * 2 * 2 * 3, dtype=torch.bfloat16).reshape(2, 12)
+
+    with torch.no_grad():
+        first = layer._sglang_w13_weight()
+        second = layer._sglang_w13_weight()
+
+    assert first.data_ptr() != second.data_ptr()
 
 
 def test_sglang_grouped_mlp_builds_sglang_ordered_topk_ids_from_routing_probs():

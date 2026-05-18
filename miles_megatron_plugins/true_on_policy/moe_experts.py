@@ -7,6 +7,7 @@ the forward numerics match the rollout engine exactly.
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import torch
@@ -92,6 +93,47 @@ class SGLangGroupedMLP(GroupedMLP):
             index=global_topk_ids.to(device=flat_hidden_states.device),
         ).to(flat_hidden_states.dtype)
 
+        return self.forward_sglang_local_masked_topk(
+            hidden_states=flat_hidden_states,
+            topk_weights=topk_weights,
+            global_topk_ids=global_topk_ids,
+            local_expert_indices=local_expert_indices,
+        )
+
+    def forward_sglang_local_masked_topk(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        global_topk_ids: torch.Tensor,
+        local_expert_indices: list[int],
+    ) -> torch.Tensor:
+        """Run SGLang's local-masked fused expert path with precomputed top-k.
+
+        The caller can use this when it already has SGLang-ordered top-k ids and
+        weights.  This avoids materializing a full sparse routing matrix and
+        avoids running stable-topk twice in the Megatron exact no-grad path.
+        """
+        if torch.is_grad_enabled():
+            raise RuntimeError("SGLang local-masked MoE fused path is inference-only")
+        if hidden_states.numel() == 0:
+            return torch.empty_like(hidden_states)
+
+        self._ensure_sglang_server_args()
+
+        from sglang.srt.layers.moe import MoeRunnerConfig
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if flat_hidden_states.dtype != self.weight1.dtype:
+            flat_hidden_states = flat_hidden_states.to(self.weight1.dtype)
+
+        local_topk_ids = self._local_masked_topk_ids(global_topk_ids, local_expert_indices)
+        topk_weights = topk_weights.to(
+            device=flat_hidden_states.device,
+            dtype=flat_hidden_states.dtype,
+        )
+
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights,
             topk_ids=local_topk_ids,
@@ -105,7 +147,7 @@ class SGLangGroupedMLP(GroupedMLP):
             num_local_experts=self.num_local_experts,
             hidden_size=self.config.hidden_size,
             intermediate_size_per_partition=self.config.moe_ffn_hidden_size,
-            top_k=topk,
+            top_k=topk_weights.shape[-1],
             params_dtype=self.config.params_dtype,
             activation="silu",
             is_gated=True,
@@ -286,26 +328,52 @@ class SGLangGroupedMLP(GroupedMLP):
         return torch.where(local_mask, local_ids, torch.full_like(local_ids, -1))
 
     def _sglang_w13_weight(self) -> torch.Tensor:
-        return (
-            self.weight1.view(
-                self.num_local_experts,
-                self.config.hidden_size,
-                -1,
-            )
-            .permute(0, 2, 1)
-            .contiguous()
+        return self._cached_sglang_weight(
+            cache_name="_sglang_w13_weight_cache",
+            weight=self.weight1,
+            view_shape=(self.num_local_experts, self.config.hidden_size, -1),
+            permute_dims=(0, 2, 1),
         )
 
     def _sglang_w2_weight(self) -> torch.Tensor:
-        return (
-            self.weight2.view(
-                self.num_local_experts,
-                -1,
-                self.config.hidden_size,
-            )
-            .permute(0, 2, 1)
-            .contiguous()
+        return self._cached_sglang_weight(
+            cache_name="_sglang_w2_weight_cache",
+            weight=self.weight2,
+            view_shape=(self.num_local_experts, -1, self.config.hidden_size),
+            permute_dims=(0, 2, 1),
         )
+
+    def _cached_sglang_weight(
+        self,
+        *,
+        cache_name: str,
+        weight: torch.Tensor,
+        view_shape: tuple[int, ...],
+        permute_dims: tuple[int, ...],
+    ) -> torch.Tensor:
+        if (
+            os.environ.get("MILES_TRUE_ON_POLICY_CACHE_SGLANG_EXPERT_WEIGHTS", "0")
+            != "1"
+            or (torch.is_grad_enabled() and weight.requires_grad)
+        ):
+            return weight.view(*view_shape).permute(*permute_dims).contiguous()
+
+        key = (
+            weight.data_ptr(),
+            tuple(weight.shape),
+            tuple(weight.stride()),
+            weight.dtype,
+            weight.device,
+            getattr(weight, "_version", None),
+        )
+        cached = getattr(self, cache_name, None)
+        if cached is None or cached[0] != key:
+            cached = (
+                key,
+                weight.view(*view_shape).permute(*permute_dims).contiguous(),
+            )
+            setattr(self, cache_name, cached)
+        return cached[1]
 
     @staticmethod
     def _ensure_sglang_server_args() -> None:

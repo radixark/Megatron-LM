@@ -1,8 +1,7 @@
 """True-on-policy MoE layer extensions.
 
-EP-invariant local-masked forward, padding compaction, and rollout-segment
-gathering extracted from Megatron's ``MoELayer`` so the core file stays
-close to upstream.
+EP-invariant local-masked forward and padding compaction extracted from
+Megatron's ``MoELayer`` so the core file stays close to upstream.
 """
 
 from __future__ import annotations
@@ -186,48 +185,10 @@ def _forward_sglang_local_masked_ep(moe_layer, hidden_states: torch.Tensor):
     if max_num_tokens == 0:
         return torch.zeros_like(hidden_states), None
 
-    rollout_segments = _gather_ep_rollout_segments(
-        local_num_tokens, flat_hidden_states.device, ep_group, ep_size
+    return _forward_global_padded(
+        moe_layer, hidden_states, hidden_chunks,
+        max_num_tokens, token_counts, ep_group, ep_rank,
     )
-    if rollout_segments is None:
-        return _forward_global_padded(
-            moe_layer, hidden_states, hidden_chunks,
-            max_num_tokens, token_counts, ep_group, ep_rank,
-        )
-
-    local_output = flat_hidden_states.new_zeros(flat_hidden_states.shape)
-    for source_rank, source_segments in enumerate(rollout_segments):
-        source_offset = 0
-        for source_num_tokens, source_active_rank in source_segments:
-            if source_num_tokens == 0:
-                continue
-
-            source_global_hidden = flat_hidden_states.new_zeros(
-                (ep_size * source_num_tokens, hidden_shape[-1])
-            )
-            source_start = source_active_rank * source_num_tokens
-            source_global_hidden[source_start : source_start + source_num_tokens] = (
-                hidden_chunks[source_rank][source_offset : source_offset + source_num_tokens]
-            )
-
-            source_probs, _ = apply_module(moe_layer.router)(
-                source_global_hidden.view(-1, 1, hidden_shape[-1]), None
-            )
-            source_output = moe_layer.experts.forward_sglang_local_masked(
-                source_global_hidden,
-                source_probs,
-                moe_layer.config.moe_router_topk,
-                moe_layer.local_expert_indices,
-            )
-            source_output = sglang_moe_ep_tree_all_reduce(source_output, ep_group)
-
-            if source_rank == ep_rank:
-                local_output[source_offset : source_offset + source_num_tokens] = (
-                    source_output[source_start : source_start + source_num_tokens]
-                )
-            source_offset += source_num_tokens
-
-    return local_output.view(hidden_shape), None
 
 
 def _forward_global_padded(
@@ -241,15 +202,27 @@ def _forward_global_padded(
 ):
     hidden_shape = hidden_states.shape
     global_hidden_states = torch.cat(hidden_chunks, dim=0)
-    global_probs, _ = apply_module(moe_layer.router)(
-        global_hidden_states.view(-1, 1, hidden_shape[-1]), None
+    topk_route = _try_sglang_ordered_topk_route(
+        moe_layer, global_hidden_states, hidden_shape[-1]
     )
-    global_output = moe_layer.experts.forward_sglang_local_masked(
-        global_hidden_states,
-        global_probs,
-        moe_layer.config.moe_router_topk,
-        moe_layer.local_expert_indices,
-    )
+    if topk_route is None:
+        global_probs, _ = apply_module(moe_layer.router)(
+            global_hidden_states.view(-1, 1, hidden_shape[-1]), None
+        )
+        global_output = moe_layer.experts.forward_sglang_local_masked(
+            global_hidden_states,
+            global_probs,
+            moe_layer.config.moe_router_topk,
+            moe_layer.local_expert_indices,
+        )
+    else:
+        topk_weights, global_topk_ids = topk_route
+        global_output = moe_layer.experts.forward_sglang_local_masked_topk(
+            global_hidden_states,
+            topk_weights,
+            global_topk_ids,
+            moe_layer.local_expert_indices,
+        )
     global_output = sglang_moe_ep_tree_all_reduce(global_output, ep_group)
 
     local_num_tokens = token_counts[ep_rank]
@@ -262,6 +235,61 @@ def _forward_global_padded(
         padded_output[:local_num_tokens] = local_output
         local_output = padded_output
     return local_output.view(hidden_shape), None
+
+
+def _try_sglang_ordered_topk_route(
+    moe_layer,
+    global_hidden_states: torch.Tensor,
+    hidden_size: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return SGLang-ordered top-k weights/ids for the simple Qwen3 MoE route.
+
+    This is deliberately narrow.  When a config needs grouped routing, expert
+    bias, token dropping, forced routing, or non-softmax scoring, the caller
+    falls back to Megatron's router so those behaviors stay centralized.
+    """
+    router = moe_layer.router
+    config = moe_layer.config
+    if not hasattr(moe_layer.experts, "forward_sglang_local_masked_topk"):
+        return None
+    if getattr(router, "routing_type", None) == "sinkhorn":
+        return None
+    if getattr(router, "score_function", None) != "softmax":
+        return None
+    if getattr(config, "moe_router_pre_softmax", False):
+        return None
+    if (
+        getattr(config, "moe_router_num_groups", None) is not None
+        or getattr(config, "moe_router_group_topk", None) is not None
+    ):
+        return None
+    if getattr(config, "moe_router_fusion", False):
+        return None
+    if getattr(router, "expert_bias", None) is not None:
+        return None
+    if getattr(config, "moe_expert_capacity_factor", None) is not None:
+        return None
+    if (
+        getattr(config, "moe_router_force_load_balancing", False)
+        or getattr(config, "moe_router_force_biased", None) is not None
+    ):
+        return None
+    if getattr(config, "moe_input_jitter_eps", None) is not None:
+        return None
+
+    router._maintain_float32_expert_bias()
+    logits = router.gating(global_hidden_states.view(-1, 1, hidden_size)).view(
+        -1, config.num_moe_experts
+    )
+    logits = router.apply_z_loss(logits, padding_mask=None)
+
+    from sglang.srt.tp_invariant_ops import stable_topk_softmax
+
+    topk_weights, topk_ids = stable_topk_softmax(logits, config.moe_router_topk)
+    topk_scaling = getattr(config, "moe_router_topk_scaling_factor", None)
+    if topk_scaling:
+        topk_weights = topk_weights * topk_scaling
+    return topk_weights.type_as(logits), topk_ids
 
 
 # ---------------------------------------------------------------------------
@@ -294,78 +322,3 @@ def _all_gather_padded_ep_tensor(
     gathered = [torch.empty_like(padded_local) for _ in range(ep_size)]
     torch.distributed.all_gather(gathered, padded_local, group=ep_group)
     return gathered
-
-
-def _all_gather_padded_ep_ints(
-    local_values: list[int],
-    max_num_values: int,
-    device: torch.device,
-    ep_group,
-    ep_size: int,
-) -> list[list[int]]:
-    padded_local = torch.full(
-        (max_num_values,), -1, device=device, dtype=torch.long,
-    )
-    if local_values:
-        local_tensor = torch.tensor(local_values, device=device, dtype=torch.long)
-        padded_local[: local_tensor.shape[0]] = local_tensor
-    gathered = [torch.empty_like(padded_local) for _ in range(ep_size)]
-    torch.distributed.all_gather(gathered, padded_local, group=ep_group)
-    return [[int(value.item()) for value in rank_values] for rank_values in gathered]
-
-
-def _gather_ep_rollout_segments(
-    local_num_tokens: int,
-    device: torch.device,
-    ep_group,
-    ep_size: int,
-) -> list[list[tuple[int, int]]] | None:
-    from .moe_context import get_sglang_moe_rollout_context
-
-    context = get_sglang_moe_rollout_context()
-    if context is None or context.rollout_dp_ranks is None:
-        return None
-
-    local_token_counts = context.token_counts
-    if local_token_counts is None:
-        local_token_counts = (local_num_tokens,)
-    if sum(local_token_counts) != local_num_tokens:
-        return None
-
-    local_active_ranks = context.rollout_dp_ranks
-    if len(local_active_ranks) < len(local_token_counts):
-        return None
-
-    local_segments = [
-        (int(num_tokens), int(active_rank))
-        for num_tokens, active_rank in zip(local_token_counts, local_active_ranks, strict=False)
-    ]
-    if any(active_rank < 0 or active_rank >= ep_size for _, active_rank in local_segments):
-        return None
-
-    max_num_segments, segment_counts = _gather_ep_token_counts(
-        len(local_segments), device, ep_group, ep_size
-    )
-    if max_num_segments == 0:
-        return [[] for _ in range(ep_size)]
-
-    gathered_num_tokens = _all_gather_padded_ep_ints(
-        [segment[0] for segment in local_segments],
-        max_num_segments, device, ep_group, ep_size,
-    )
-    gathered_active_ranks = _all_gather_padded_ep_ints(
-        [segment[1] for segment in local_segments],
-        max_num_segments, device, ep_group, ep_size,
-    )
-
-    rollout_segments: list[list[tuple[int, int]]] = []
-    for source_rank, num_segments in enumerate(segment_counts):
-        source_segments = []
-        for segment_idx in range(num_segments):
-            num_tokens = gathered_num_tokens[source_rank][segment_idx]
-            active_rank = gathered_active_ranks[source_rank][segment_idx]
-            if num_tokens < 0 or active_rank < 0 or active_rank >= ep_size:
-                return None
-            source_segments.append((num_tokens, active_rank))
-        rollout_segments.append(source_segments)
-    return rollout_segments
