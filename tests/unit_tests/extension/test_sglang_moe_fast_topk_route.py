@@ -8,8 +8,7 @@ from miles_megatron_plugins.true_on_policy import moe_layer_ext
 from miles_megatron_plugins.true_on_policy.moe_experts import SGLangGroupedMLP
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
     _try_sglang_ordered_topk_route,
-    requires_direct_sglang_moe,
-    should_compact_true_on_policy_padding,
+    is_qwen3_moe_true_on_policy_ep_enabled,
 )
 from miles_megatron_plugins.true_on_policy.sglang_backend import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
@@ -27,42 +26,16 @@ def _predicate_layer(contract_name, ep_size: int):
     return types.SimpleNamespace(config=config, use_shared_expert=False)
 
 
-def test_sglang_moe_direct_path_predicate_matches_contract_and_ep():
-    assert not requires_direct_sglang_moe(_predicate_layer(None, ep_size=4))
-    assert not requires_direct_sglang_moe(
+def test_sglang_moe_true_on_policy_mode_matches_contract_and_ep():
+    assert not is_qwen3_moe_true_on_policy_ep_enabled(_predicate_layer(None, ep_size=4))
+    assert not is_qwen3_moe_true_on_policy_ep_enabled(
         _predicate_layer(QWEN3_DENSE_TRUE_ON_POLICY_V1, ep_size=4)
     )
-    assert not requires_direct_sglang_moe(
+    assert not is_qwen3_moe_true_on_policy_ep_enabled(
         _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=1)
     )
-    assert requires_direct_sglang_moe(
+    assert is_qwen3_moe_true_on_policy_ep_enabled(
         _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=4)
-    )
-
-
-def test_sglang_moe_padding_compaction_uses_direct_path_predicate():
-    padding_mask = torch.tensor([[False, True]], dtype=torch.bool)
-    non_bool_mask = padding_mask.to(torch.int32)
-
-    assert should_compact_true_on_policy_padding(
-        _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=4),
-        padding_mask,
-        intermediate_tensors=None,
-    )
-    assert not should_compact_true_on_policy_padding(
-        _predicate_layer(QWEN3_DENSE_TRUE_ON_POLICY_V1, ep_size=4),
-        padding_mask,
-        intermediate_tensors=None,
-    )
-    assert not should_compact_true_on_policy_padding(
-        _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=1),
-        padding_mask,
-        intermediate_tensors=None,
-    )
-    assert not should_compact_true_on_policy_padding(
-        _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=4),
-        non_bool_mask,
-        intermediate_tensors=None,
     )
 
 

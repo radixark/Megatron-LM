@@ -38,8 +38,8 @@ _MOE_DEBUG_DUMP_COUNTS: dict[tuple[int, int, str], int] = {}
 # Guard helpers
 # ---------------------------------------------------------------------------
 
-def requires_direct_sglang_moe(moe_layer) -> bool:
-    """Return whether this layer must use the direct SGLang MoE path.
+def is_qwen3_moe_true_on_policy_ep_enabled(moe_layer) -> bool:
+    """Return whether this layer is in the Qwen3 MoE true-on-policy EP mode.
 
     Mirrors ``MegatronTrueOnPolicyContract.policy_for``: the direct path is
     required only for the Qwen3 MoE true-on-policy contract when EP is enabled.
@@ -79,23 +79,6 @@ def _require_direct_sglang_moe_ready(moe_layer) -> None:
         raise RuntimeError("Qwen3 true-on-policy MoE currently requires MoE TP size 1")
     if getattr(dispatcher, "ep_size", 1) <= 1:
         raise RuntimeError("Qwen3 true-on-policy MoE direct path requires EP size > 1")
-
-
-def should_compact_true_on_policy_padding(
-    moe_layer,
-    padding_mask: Optional[torch.Tensor],
-    intermediate_tensors,
-) -> bool:
-    if padding_mask is None or intermediate_tensors is not None:
-        return False
-    if moe_layer.use_shared_expert or moe_layer.config.moe_latent_size:
-        return False
-
-    return (
-        requires_direct_sglang_moe(moe_layer)
-        and padding_mask.dtype == torch.bool
-        and bool(padding_mask.any().item())
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -139,13 +122,14 @@ def run_direct_sglang_ep_forward(
 ) -> tuple:
     """Run the SGLang local-masked EP forward path.
 
-    The caller should gate this with ``requires_direct_sglang_moe``.  This
-    function raises when the required true-on-policy SGLang path is not wired
-    correctly; it never falls through to Megatron MoE.  The grad-enabled path
-    uses a PyTorch autograd wrapper around the SGLang forward and Triton
-    backward kernels, without running a side Megatron MoE forward.
+    The caller should gate this with
+    ``is_qwen3_moe_true_on_policy_ep_enabled``.  This function raises when the
+    required true-on-policy SGLang path is not wired correctly; it never falls
+    through to Megatron MoE.  The grad-enabled path uses a PyTorch autograd
+    wrapper around the SGLang forward and Triton backward kernels, without
+    running a side Megatron MoE forward.
     """
-    if not requires_direct_sglang_moe(moe_layer):
+    if not is_qwen3_moe_true_on_policy_ep_enabled(moe_layer):
         raise RuntimeError(
             "Direct SGLang MoE forward was called without a true-on-policy MoE policy"
         )
