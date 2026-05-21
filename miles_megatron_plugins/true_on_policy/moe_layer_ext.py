@@ -13,7 +13,7 @@ import torch
 
 from megatron.core.transformer.moe.moe_utils import router_gating_linear
 
-from .contracts import resolve_true_on_policy_runtime_policy
+from .contracts import QWEN3_MOE_TRUE_ON_POLICY_V1, resolve_true_on_policy_runtime_policy
 from .moe_experts import SGLangGroupedMLP
 from .moe_reduce import sglang_moe_ep_tree_all_reduce
 
@@ -39,9 +39,17 @@ _MOE_DEBUG_DUMP_COUNTS: dict[tuple[int, int, str], int] = {}
 # ---------------------------------------------------------------------------
 
 def requires_direct_sglang_moe(moe_layer) -> bool:
-    """Return whether this layer must use the direct SGLang MoE path."""
+    """Return whether this layer must use the direct SGLang MoE path.
+
+    Mirrors ``MegatronTrueOnPolicyContract.policy_for``: the direct path is
+    required only for the Qwen3 MoE true-on-policy contract when EP is enabled.
+    """
     policy = resolve_true_on_policy_runtime_policy(moe_layer.config)
-    return policy.ep_invariant_moe and policy.deterministic_moe_dispatch
+    return (
+        policy.contract_name == QWEN3_MOE_TRUE_ON_POLICY_V1
+        and policy.ep_invariant_moe
+        and policy.deterministic_moe_dispatch
+    )
 
 
 def _has_true_on_policy_padding(padding_mask: Optional[torch.Tensor]) -> bool:
@@ -83,9 +91,8 @@ def should_compact_true_on_policy_padding(
     if moe_layer.use_shared_expert or moe_layer.config.moe_latent_size:
         return False
 
-    policy = resolve_true_on_policy_runtime_policy(moe_layer.config)
     return (
-        policy.ep_invariant_moe
+        requires_direct_sglang_moe(moe_layer)
         and padding_mask.dtype == torch.bool
         and bool(padding_mask.any().item())
     )
