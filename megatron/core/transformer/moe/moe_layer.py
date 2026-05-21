@@ -28,11 +28,20 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
+from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
+    forward_compacted_true_on_policy_padding,
+    should_compact_true_on_policy_padding,
+    try_sglang_ep_forward,
+)
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import (
+        TELinear,
+        set_save_original_input,
+        te_checkpoint,
+    )
 
     HAVE_TE = True
 except ImportError:
@@ -394,21 +403,13 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-
-                    try:
-                        from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
-                            try_sglang_ep_forward,
-                        )
-
-                        ep_result = try_sglang_ep_forward(
-                            self,
-                            hidden_states,
-                            padding_mask,
-                            shared_expert_output,
-                            intermediate_tensors,
-                        )
-                    except ImportError:
-                        ep_result = None
+                    ep_result = try_sglang_ep_forward(
+                        self,
+                        hidden_states,
+                        padding_mask,
+                        shared_expert_output,
+                        intermediate_tensors,
+                    )
 
                     if ep_result is not None:
                         return ep_result
@@ -452,17 +453,9 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        try:
-            from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
-                forward_compacted_true_on_policy_padding,
-                should_compact_true_on_policy_padding,
-            )
-
-            use_compact = should_compact_true_on_policy_padding(
-                self, padding_mask, intermediate_tensors
-            )
-        except ImportError:
-            use_compact = False
+        use_compact = should_compact_true_on_policy_padding(
+            self, padding_mask, intermediate_tensors
+        )
 
         if use_compact:
             outputs = forward_compacted_true_on_policy_padding(
@@ -499,6 +492,4 @@ class MoELayer(BaseMoELayer):
         # If shared_experts_recompute is used, nothing needs to be done because the checkpoint
         # function will save the original input tensors.
         if self.shared_experts is not None and not self.shared_experts_recompute:
-            from megatron.core.extensions.transformer_engine import set_save_original_input
-
             set_save_original_input(self.shared_experts.linear_fc1)

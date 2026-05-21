@@ -11,8 +11,16 @@ from typing import Optional
 
 import torch
 
+from megatron.core.transformer.moe.moe_utils import router_gating_linear
+
 from .contracts import resolve_true_on_policy_runtime_policy
+from .moe_experts import SGLangGroupedMLP
 from .moe_reduce import sglang_moe_ep_tree_all_reduce
+
+try:
+    from sglang.srt.tp_invariant_ops import stable_topk_softmax
+except ImportError:
+    stable_topk_softmax = None
 
 try:
     from megatron.core.transformer.moe.sgl_fused_moe.autograd import (
@@ -30,62 +38,38 @@ _MOE_DEBUG_DUMP_COUNTS: dict[tuple[int, int, str], int] = {}
 # Guard helpers
 # ---------------------------------------------------------------------------
 
-def _has_true_on_policy_padding(padding_mask: Optional[torch.Tensor]) -> bool:
-    return padding_mask is not None and bool(padding_mask.any().item())
-
-
-def _ep_invariant_moe_eligible(moe_layer) -> bool:
-    """Common preconditions shared by the no-grad and autograd SGLang paths."""
-    if moe_layer.use_shared_expert or moe_layer.config.moe_latent_size:
-        return False
-    if moe_layer.config.moe_router_topk <= 1:
-        return False
-    if moe_layer.config.moe_permute_fusion:
-        return False
-    if not hasattr(moe_layer.experts, "forward_sglang_local_masked_topk"):
-        return False
-
-    dispatcher = moe_layer.token_dispatcher
-    if getattr(dispatcher, "drop_and_pad", False):
-        return False
-    if getattr(dispatcher, "tp_size", 1) != 1 or getattr(dispatcher, "ep_size", 1) <= 1:
-        return False
-
+def _direct_sglang_moe_required(moe_layer) -> bool:
     policy = resolve_true_on_policy_runtime_policy(moe_layer.config)
     return policy.ep_invariant_moe and policy.deterministic_moe_dispatch
 
 
-def should_use_sglang_local_masked_ep_forward(
-    moe_layer,
-    padding_mask: Optional[torch.Tensor],
-    shared_expert_output: Optional[torch.Tensor],
-) -> bool:
-    if torch.is_grad_enabled():
-        return False
-    if _has_true_on_policy_padding(padding_mask) or shared_expert_output is not None:
-        return False
-    return _ep_invariant_moe_eligible(moe_layer)
+def _has_true_on_policy_padding(padding_mask: Optional[torch.Tensor]) -> bool:
+    return padding_mask is not None and bool(padding_mask.any().item())
 
 
-def should_use_sglang_local_masked_ep_autograd(
-    moe_layer,
-    padding_mask: Optional[torch.Tensor],
-    shared_expert_output: Optional[torch.Tensor],
-    intermediate_tensors,
-) -> bool:
-    if not torch.is_grad_enabled() or intermediate_tensors is not None:
-        return False
-    if _has_true_on_policy_padding(padding_mask) or shared_expert_output is not None:
-        return False
-    if os.environ.get("MILES_TRUE_ON_POLICY_USE_SGLANG_MOE_TRITON_BWD", "1") != "1":
-        return False
-    if not HAVE_SGLANG_FUSED_EXPERTS_AUTOGRAD:
-        return False
-    if not hasattr(moe_layer.experts, "_sglang_w13_weight"):
-        return False
-    if not hasattr(moe_layer.experts, "_sglang_w2_weight"):
-        return False
-    return _ep_invariant_moe_eligible(moe_layer)
+def _require_direct_sglang_moe_ready(moe_layer) -> None:
+    config = moe_layer.config
+    if moe_layer.use_shared_expert:
+        raise RuntimeError("Qwen3 true-on-policy MoE does not support shared experts")
+    if config.moe_latent_size:
+        raise RuntimeError("Qwen3 true-on-policy MoE does not support MoE latent projection")
+    if config.moe_router_topk <= 1:
+        raise RuntimeError("Qwen3 true-on-policy MoE requires moe_router_topk > 1")
+    if config.moe_permute_fusion:
+        raise RuntimeError("Qwen3 true-on-policy MoE requires MoE permute fusion disabled")
+    if not isinstance(moe_layer.experts, SGLangGroupedMLP):
+        raise TypeError(
+            "Qwen3 true-on-policy MoE requires SGLangGroupedMLP experts; "
+            f"got {type(moe_layer.experts).__name__}"
+        )
+
+    dispatcher = moe_layer.token_dispatcher
+    if getattr(dispatcher, "drop_and_pad", False):
+        raise RuntimeError("Qwen3 true-on-policy MoE does not support drop-and-pad dispatch")
+    if getattr(dispatcher, "tp_size", 1) != 1:
+        raise RuntimeError("Qwen3 true-on-policy MoE currently requires MoE TP size 1")
+    if getattr(dispatcher, "ep_size", 1) <= 1:
+        raise RuntimeError("Qwen3 true-on-policy MoE direct path requires EP size > 1")
 
 
 def should_compact_true_on_policy_padding(
@@ -146,29 +130,50 @@ def try_sglang_ep_forward(
     shared_expert_output: Optional[torch.Tensor],
     intermediate_tensors,
 ) -> tuple | None:
-    """Try the SGLang local-masked EP forward path.
+    """Run the SGLang local-masked EP forward path when the policy requires it.
 
-    Returns ``None`` when the path is not applicable, allowing the caller to
-    fall through to the normal Megatron MoE forward.  Otherwise returns the
-    direct SGLang fused-kernel output.  The grad-enabled path uses a PyTorch
-    autograd wrapper around the SGLang forward and Triton backward kernels; it
-    does not run a side Megatron MoE forward.
+    Returns ``None`` only when the runtime policy does not require direct
+    SGLang EP MoE.  Once the true-on-policy MoE contract requires this path,
+    unsupported wiring raises instead of falling through to Megatron MoE.
+    The grad-enabled path uses a PyTorch autograd wrapper around the SGLang
+    forward and Triton backward kernels; it does not run a side Megatron MoE
+    forward.
     """
-    if should_use_sglang_local_masked_ep_forward(
-        moe_layer, padding_mask, shared_expert_output
-    ):
-        output = _forward_sglang_local_masked_ep(moe_layer, hidden_states)
-        if output is not None:
-            return output
+    if not _direct_sglang_moe_required(moe_layer):
+        return None
 
-    if should_use_sglang_local_masked_ep_autograd(
-        moe_layer, padding_mask, shared_expert_output, intermediate_tensors
-    ):
+    _require_direct_sglang_moe_ready(moe_layer)
+    if _has_true_on_policy_padding(padding_mask):
+        raise RuntimeError(
+            "Qwen3 true-on-policy MoE received padding in the direct SGLang path; "
+            "padding should be compacted before the MoE forward"
+        )
+    if shared_expert_output is not None:
+        raise RuntimeError("Qwen3 true-on-policy MoE does not support shared expert output")
+
+    if torch.is_grad_enabled():
+        if intermediate_tensors is not None:
+            raise RuntimeError(
+                "Qwen3 true-on-policy MoE direct autograd path does not support "
+                "intermediate_tensors"
+            )
+        if os.environ.get("MILES_TRUE_ON_POLICY_USE_SGLANG_MOE_TRITON_BWD", "1") != "1":
+            raise RuntimeError(
+                "Qwen3 true-on-policy MoE requires the SGLang Triton backward path; "
+                "MILES_TRUE_ON_POLICY_USE_SGLANG_MOE_TRITON_BWD disabled it"
+            )
+        if not HAVE_SGLANG_FUSED_EXPERTS_AUTOGRAD:
+            raise RuntimeError("SGLang fused MoE autograd path is not available")
         output = _forward_sglang_local_masked_ep_autograd(moe_layer, hidden_states)
-        if output is not None:
-            return output
+    else:
+        output = _forward_sglang_local_masked_ep(moe_layer, hidden_states)
 
-    return None
+    if output is None:
+        raise RuntimeError(
+            "Qwen3 true-on-policy MoE requires the direct SGLang MoE path, but the "
+            "current router/config is not supported"
+        )
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -553,16 +558,17 @@ def _try_sglang_ordered_topk_route(
     """Return SGLang-ordered top-k weights/ids for the simple Qwen3 MoE route.
 
     This is deliberately narrow. When a config needs grouped routing, expert
-    bias, token dropping, forced routing, or non-softmax scoring, the caller
-    falls back to Megatron's normal MoE path.
+    bias, token dropping, forced routing, or non-softmax scoring, ``None``
+    marks the route unsupported; the top-level direct path raises if the
+    true-on-policy MoE contract required SGLang execution.
     """
     router = moe_layer.router
     config = moe_layer.config
     policy = resolve_true_on_policy_runtime_policy(config)
     if not policy.deterministic_moe_routing or policy.moe_topk_tiebreak != "stable_sort":
         return None
-    if not hasattr(moe_layer.experts, "forward_sglang_local_masked_topk"):
-        return None
+    if stable_topk_softmax is None:
+        raise RuntimeError("SGLang stable_topk_softmax is not available")
     if getattr(router, "routing_type", None) == "sinkhorn":
         return None
     if getattr(router, "score_function", None) != "softmax":
@@ -589,31 +595,23 @@ def _try_sglang_ordered_topk_route(
         return None
 
     router._maintain_float32_expert_bias()
-    if hasattr(router, "weight"):
-        if router.weight.device.type == "cpu" and global_hidden_states.is_cuda:
-            router.weight.data = router.weight.data.to(device=torch.cuda.current_device())
-        bias = getattr(router, "bias", None)
-        if bias is not None and bias.device.type == "cpu" and global_hidden_states.is_cuda:
-            bias.data = bias.data.to(device=torch.cuda.current_device())
+    router_weight = router.weight
+    if router_weight.device.type == "cpu" and global_hidden_states.is_cuda:
+        router_weight.data = router_weight.data.to(device=torch.cuda.current_device())
+    bias = getattr(router, "bias", None)
+    if bias is not None and bias.device.type == "cpu" and global_hidden_states.is_cuda:
+        bias.data = bias.data.to(device=torch.cuda.current_device())
 
-        from megatron.core.transformer.moe.moe_utils import router_gating_linear
-
-        router_input = global_hidden_states.to(config.params_dtype).view(-1, 1, hidden_size)
-        logits = router_gating_linear(
-            router_input,
-            router.weight,
-            bias,
-            config.params_dtype,
-        ).view(-1, config.num_moe_experts)
-    else:
-        logits = router.gating(global_hidden_states.view(-1, 1, hidden_size)).view(
-            -1, config.num_moe_experts
-        )
+    router_input = global_hidden_states.to(config.params_dtype).view(-1, 1, hidden_size)
+    logits = router_gating_linear(
+        router_input,
+        router_weight,
+        bias,
+        config.params_dtype,
+    ).view(-1, config.num_moe_experts)
     logits = router.apply_z_loss(logits, padding_mask=None)
     debug_prefix = "autograd" if torch.is_grad_enabled() else "nograd"
     _maybe_dump_moe_debug(moe_layer, f"{debug_prefix}_router_logits", logits)
-
-    from sglang.srt.tp_invariant_ops import stable_topk_softmax
 
     topk_weights, topk_ids = stable_topk_softmax(logits, config.moe_router_topk)
     topk_scaling = getattr(config, "moe_router_topk_scaling_factor", None)

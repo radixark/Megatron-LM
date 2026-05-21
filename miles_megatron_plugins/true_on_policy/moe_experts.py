@@ -15,6 +15,24 @@ import torch
 
 from megatron.core.transformer.moe.experts import GroupedMLP
 
+try:
+    from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.server_args import (
+        get_global_server_args,
+        set_global_server_args_for_scheduler,
+    )
+
+    HAVE_SGLANG_FUSED_MOE_FORWARD = True
+except ImportError:
+    MoeRunnerConfig = None
+    StandardTopKOutput = None
+    fused_experts = None
+    get_global_server_args = None
+    set_global_server_args_for_scheduler = None
+    HAVE_SGLANG_FUSED_MOE_FORWARD = False
+
 
 class SGLangGroupedMLP(GroupedMLP):
     """GroupedMLP subclass exposing the SGLang local-masked fused expert call."""
@@ -34,14 +52,12 @@ class SGLangGroupedMLP(GroupedMLP):
         """
         if torch.is_grad_enabled():
             raise RuntimeError("SGLang local-masked MoE fused path is inference-only")
+        if not HAVE_SGLANG_FUSED_MOE_FORWARD:
+            raise RuntimeError("SGLang fused MoE forward path is not available")
         if hidden_states.numel() == 0:
             return torch.empty_like(hidden_states)
 
         self._ensure_sglang_server_args()
-
-        from sglang.srt.layers.moe import MoeRunnerConfig
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
 
         flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         if flat_hidden_states.dtype != self.weight1.dtype:
@@ -144,10 +160,8 @@ class SGLangGroupedMLP(GroupedMLP):
 
     @staticmethod
     def _ensure_sglang_server_args() -> None:
-        from sglang.srt.server_args import (
-            get_global_server_args,
-            set_global_server_args_for_scheduler,
-        )
+        if not HAVE_SGLANG_FUSED_MOE_FORWARD:
+            raise RuntimeError("SGLang server args helpers are not available")
 
         try:
             get_global_server_args()

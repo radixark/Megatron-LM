@@ -4,6 +4,7 @@ import types
 
 import torch
 
+from miles_megatron_plugins.true_on_policy import moe_layer_ext
 from miles_megatron_plugins.true_on_policy.moe_experts import SGLangGroupedMLP
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
     _try_sglang_ordered_topk_route,
@@ -11,14 +12,14 @@ from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
 from miles_megatron_plugins.true_on_policy.sglang_backend import (
     QWEN3_MOE_TRUE_ON_POLICY_V1,
 )
+from sglang.srt.tp_invariant_ops import stable_topk
 
 
-def test_sglang_moe_fast_topk_route_matches_router_contract():
-    from sglang.srt.tp_invariant_ops import stable_topk
-
+def test_sglang_moe_fast_topk_route_matches_router_contract(monkeypatch):
     config = types.SimpleNamespace(
         num_moe_experts=4,
         moe_router_topk=2,
+        params_dtype=torch.bfloat16,
         moe_router_pre_softmax=False,
         moe_router_num_groups=None,
         moe_router_group_topk=None,
@@ -41,9 +42,15 @@ def test_sglang_moe_fast_topk_route_matches_router_contract():
         routing_type="aux_loss",
         score_function="softmax",
         expert_bias=None,
+        weight=torch.empty(4, 8, dtype=torch.bfloat16),
+        bias=None,
         _maintain_float32_expert_bias=lambda: None,
         apply_z_loss=lambda router_logits, padding_mask=None: router_logits,
-        gating=lambda _: logits,
+    )
+    monkeypatch.setattr(
+        moe_layer_ext,
+        "router_gating_linear",
+        lambda router_input, weight, bias, dtype: logits.to(dtype),
     )
     experts = types.SimpleNamespace(forward_sglang_local_masked_topk=lambda *args: None)
     moe_layer = types.SimpleNamespace(config=config, router=router, experts=experts)
