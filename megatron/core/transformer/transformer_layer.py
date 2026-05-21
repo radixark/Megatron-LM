@@ -25,6 +25,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from miles_megatron_plugins.true_on_policy.debug import (
+    dump_layer_activation_debug,
     register_activation_grad_debug,
     register_norm_grad_debug as _register_norm_grad_debug,
 )
@@ -541,6 +542,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
         )
+        dump_layer_activation_debug(output, layer_number=self.layer_number, name="layer_output")
         register_activation_grad_debug(self, output, layer_number=self.layer_number, name="layer_output")
         return output, context
 
@@ -604,6 +606,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             else None
         )
         residual = sglang_carried_residual if sglang_carried_residual is not None else hidden_states
+        dump_layer_activation_debug(
+            residual,
+            layer_number=self.layer_number,
+            name="layer_input",
+            extra={"has_sglang_carried_residual": sglang_carried_residual is not None},
+        )
 
         # Optional Input Layer norm
         if sglang_carried_residual is not None:
@@ -616,6 +624,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             _register_norm_grad_debug(
                 residual, layer_number=self.layer_number, name="input_layernorm_residual_output"
             )
+            dump_layer_activation_debug(
+                input_layernorm_output,
+                layer_number=self.layer_number,
+                name="input_layernorm_output",
+            )
         elif self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
@@ -627,10 +640,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 layer_number=self.layer_number,
                 name="input_layernorm_output",
             )
+            dump_layer_activation_debug(
+                input_layernorm_output,
+                layer_number=self.layer_number,
+                name="input_layernorm_output",
+            )
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
             _register_norm_grad_debug(
+                input_layernorm_output,
+                layer_number=self.layer_number,
+                name="input_layernorm_output",
+            )
+            dump_layer_activation_debug(
                 input_layernorm_output,
                 layer_number=self.layer_number,
                 name="input_layernorm_output",
@@ -669,6 +692,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         attention_output, attention_output_bias = attention_output_with_bias
+        dump_layer_activation_debug(
+            attention_output, layer_number=self.layer_number, name="attn_output"
+        )
         attention_output = self.post_self_attn_layernorm(attention_output)
         attention_output_with_bias = (attention_output, attention_output_bias)
 
@@ -688,11 +714,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output, p=self.hidden_dropout, training=self.training
             )
             self._sglang_pre_mlp_residual = residual
+            dump_layer_activation_debug(
+                hidden_states, layer_number=self.layer_number, name="after_attention"
+            )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
                     attention_output_with_bias, residual, self.hidden_dropout
                 )
+            dump_layer_activation_debug(
+                hidden_states, layer_number=self.layer_number, name="after_attention"
+            )
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
@@ -796,6 +828,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         else:
             pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        dump_layer_activation_debug(
+            residual, layer_number=self.layer_number, name="pre_mlp_residual"
+        )
+        dump_layer_activation_debug(
+            pre_mlp_layernorm_output,
+            layer_number=self.layer_number,
+            name="pre_mlp_layernorm_output",
+        )
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -851,6 +891,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
 
         mlp_output, mlp_output_bias = mlp_output_with_bias
+        dump_layer_activation_debug(mlp_output, layer_number=self.layer_number, name="mlp_output")
         mlp_output = self.post_mlp_layernorm(mlp_output)
         mlp_output_with_bias = (mlp_output, mlp_output_bias)
 

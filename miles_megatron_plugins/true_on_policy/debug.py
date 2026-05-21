@@ -8,6 +8,7 @@ from torch import Tensor
 
 
 _NORM_GRAD_DEBUG_COUNTER = 0
+_LAYER_DEBUG_DUMP_COUNTS: dict[tuple[int, int, str], int] = {}
 
 
 def _rank() -> int:
@@ -42,6 +43,68 @@ def _tensor_stats(tensor: Tensor) -> dict[str, Any]:
             }
         )
     return stats
+
+
+def _selected_layer(layer_number: int, env_name: str) -> bool:
+    layers = os.environ.get(env_name)
+    if not layers:
+        return True
+    selected = {
+        int(item)
+        for item in layers.replace(";", ",").split(",")
+        if item.strip()
+    }
+    return layer_number in selected
+
+
+def dump_layer_activation_debug(
+    tensor: Tensor,
+    *,
+    layer_number: int,
+    name: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    debug_dir = os.environ.get("MILES_TRUE_ON_POLICY_LAYER_DEBUG_DIR")
+    if not debug_dir or not torch.is_tensor(tensor):
+        return
+    if not _selected_layer(layer_number, "MILES_TRUE_ON_POLICY_LAYER_DEBUG_LAYERS"):
+        return
+    if os.environ.get("MILES_TRUE_ON_POLICY_LAYER_DEBUG_REQUIRE_NOGRAD", "1") == "1":
+        if torch.is_grad_enabled():
+            return
+
+    max_per_name = int(os.environ.get("MILES_TRUE_ON_POLICY_LAYER_DEBUG_MAX_PER_NAME", "1"))
+    rank = _rank()
+    key = (rank, layer_number, name)
+    count = _LAYER_DEBUG_DUMP_COUNTS.get(key, 0)
+    if count >= max_per_name:
+        return
+    _LAYER_DEBUG_DUMP_COUNTS[key] = count + 1
+
+    os.makedirs(debug_dir, exist_ok=True)
+    path = os.path.join(
+        debug_dir, f"rank_{rank}_layer_{layer_number:02d}_{name}_{count:05d}_pid_{os.getpid()}.pt"
+    )
+    torch.save(
+        {
+            "tensor": tensor.detach().cpu().clone(),
+            "rank": rank,
+            "layer_number": layer_number,
+            "name": name,
+            "count": count,
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "requires_grad": bool(tensor.requires_grad),
+            "grad_enabled": bool(torch.is_grad_enabled()),
+            "extra": extra or {},
+        },
+        path,
+    )
+    print(
+        f"[MILES_LAYER_DEBUG] rank={rank} layer={layer_number} name={name} "
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} wrote {path}",
+        flush=True,
+    )
 
 
 def register_norm_grad_debug(tensor: Tensor, *, layer_number: int, name: str) -> None:

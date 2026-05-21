@@ -519,6 +519,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     ):
         """Forward method with activation checkpointing."""
 
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+        use_sglang_residual_pair = true_on_policy_policy.use_sglang_residual_pair
+
         def custom(start: int, end: int):
             def custom_forward(
                 hidden_states,
@@ -527,7 +530,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 context_mask,
                 rotary_pos_emb,
                 padding_mask=None,
+                sglang_residual=None,
             ):
+                if use_sglang_residual_pair and sglang_residual is not None:
+                    hidden_states._sglang_residual = sglang_residual
+
                 for index in range(start, end):
                     layer = self._get_layer(index)
 
@@ -559,13 +566,25 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
                         )
+                if use_sglang_residual_pair:
+                    return hidden_states, context, getattr(hidden_states, "_sglang_residual", None)
                 return hidden_states, context
 
             return custom_forward
 
-        def checkpoint_handler(forward_func):
+        def checkpoint_handler(forward_func, sglang_residual=None):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+            checkpoint_args = (
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                padding_mask,
+            )
+            if sglang_residual is not None:
+                checkpoint_args = (*checkpoint_args, sglang_residual)
+
             if true_on_policy_policy.use_ulysses_cp_recompute_fallback:
                 mode = _get_sglang_cp_recompute_mode()
                 global _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK
@@ -578,12 +597,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         )
                         _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = True
                     return forward_func(
-                        hidden_states,
-                        attention_mask,
-                        context,
-                        context_mask,
-                        rotary_pos_emb,
-                        padding_mask,
+                        *checkpoint_args,
                     )
                 if mode == "non_reentrant":
                     if not _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK:
@@ -594,12 +608,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = True
                     return torch_checkpoint(
                         forward_func,
-                        hidden_states,
-                        attention_mask,
-                        context,
-                        context_mask,
-                        rotary_pos_emb,
-                        padding_mask,
+                        *checkpoint_args,
                         use_reentrant=False,
                         preserve_rng_state=True,
                     )
@@ -616,34 +625,32 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    padding_mask,
+                    *checkpoint_args,
                 )
             else:
                 return tensor_parallel.checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    padding_mask,
+                    *checkpoint_args,
                 )
 
+        sglang_residual = (
+            getattr(hidden_states, "_sglang_residual", None) if use_sglang_residual_pair else None
+        )
         if self.config.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
             # A method to further reduce memory usage reducing checkpoints.
             layer_idx = 0
             while layer_idx < self.num_layers_per_pipeline_rank:
-                hidden_states, context = checkpoint_handler(
-                    custom(layer_idx, layer_idx + self.config.recompute_num_layers)
+                checkpoint_output = checkpoint_handler(
+                    custom(layer_idx, layer_idx + self.config.recompute_num_layers),
+                    sglang_residual,
                 )
+                if use_sglang_residual_pair:
+                    hidden_states, context, sglang_residual = checkpoint_output
+                else:
+                    hidden_states, context = checkpoint_output
 
                 layer_idx += self.config.recompute_num_layers
 
@@ -663,14 +670,32 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     layer_idx >= recompute_skip_num_layers
                     and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
                 ):
-                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
-                else:
-                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                    checkpoint_output = checkpoint_handler(
+                        custom(layer_idx, layer_idx + 1), sglang_residual
                     )
+                    if use_sglang_residual_pair:
+                        hidden_states, context, sglang_residual = checkpoint_output
+                    else:
+                        hidden_states, context = checkpoint_output
+                else:
+                    forward_output = custom(layer_idx, layer_idx + 1)(
+                        hidden_states,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        rotary_pos_emb,
+                        padding_mask,
+                        sglang_residual,
+                    )
+                    if use_sglang_residual_pair:
+                        hidden_states, context, sglang_residual = forward_output
+                    else:
+                        hidden_states, context = forward_output
         else:
             raise ValueError("Invalid activation recompute method.")
 
+        if use_sglang_residual_pair and sglang_residual is not None:
+            hidden_states._sglang_residual = sglang_residual
         return hidden_states
 
     def set_input_tensor(self, input_tensor: Tensor):

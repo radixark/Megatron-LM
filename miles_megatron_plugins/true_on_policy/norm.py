@@ -220,18 +220,20 @@ class SGLangNorm(torch.nn.Module):
             weight = self.weight + 1 if self.zero_centered_gamma else self.weight
             return F.layer_norm(x, self.hidden_size, weight, self.bias, self.eps)
 
-        fused = _maybe_true_on_policy_fused_rms_norm(
-            x,
-            self.weight.float(),
-            self.eps,
-            debug_label="SGLangNorm",
-            residual=residual,
-            post_residual_addition=post_residual_addition,
-            cast_x_before_out_mul=self.cast_x_before_out_mul,
-            norm_cast_dtype=self.override_orig_dtype or x.dtype,
-            weight_cast_dtype=torch.float32,
-            residual_dtype=self.override_orig_dtype or x.dtype,
-        )
+        fused = None
+        if residual is None:
+            fused = _maybe_true_on_policy_fused_rms_norm(
+                x,
+                self.weight.float(),
+                self.eps,
+                debug_label="SGLangNorm",
+                residual=residual,
+                post_residual_addition=post_residual_addition,
+                cast_x_before_out_mul=self.cast_x_before_out_mul,
+                norm_cast_dtype=self.override_orig_dtype or x.dtype,
+                weight_cast_dtype=torch.float32,
+                residual_dtype=x.dtype,
+            )
         if fused is not None:
             if not _needs_native_grad(x, self.weight, residual, post_residual_addition):
                 return fused
@@ -254,7 +256,8 @@ class SGLangNorm(torch.nn.Module):
             x_float = x_float + residual.float()
             if post_residual_addition is not None:
                 x_float = x_float + post_residual_addition.float()
-            residual = x_float.to(orig_dtype)
+            residual = x_float.to(x.dtype)
+            x_float = residual.float()
 
         output = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
         if self.cast_x_before_out_mul:

@@ -305,6 +305,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                     is_truncation_coef=args.rl_importance_sampling_truncation_coef,
                     seq_starts=seq_starts,
                     seq_lengths=seq_lengths,
+                    loss_mask=loss_mask,
                 )
             )
             output_tensor = loss
