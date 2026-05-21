@@ -9,9 +9,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 def enable_sglang_batch_invariant_mode() -> None:
     """Enable deterministic runtime knobs expected by the SGLang backend."""
-    if os.environ.get("MILES_TRUE_ON_POLICY_DISABLE_BATCH_INVARIANT", "0") == "1":
-        return
-
     from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
         enable_batch_invariant_mode,
         is_batch_invariant_mode_enabled,
@@ -28,8 +25,6 @@ def enable_sglang_batch_invariant_mode() -> None:
 
 
 def ensure_batch_invariant_mode_from_config(config: TransformerConfig) -> None:
-    if os.environ.get("MILES_TRUE_ON_POLICY_DISABLE_BATCH_INVARIANT", "0") == "1":
-        return
     if not getattr(config, "batch_invariant_mode", False):
         return
 
