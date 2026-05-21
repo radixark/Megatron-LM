@@ -47,7 +47,6 @@ class MegatronTrueOnPolicyRuntimePolicy:
     deterministic_moe_routing: bool
     moe_topk_tiebreak: Optional[str]
     deterministic_moe_dispatch: bool
-    deterministic_moe_combine: bool
     ep_invariant_moe: bool
 
 
@@ -73,7 +72,6 @@ DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
     deterministic_moe_routing=False,
     moe_topk_tiebreak=None,
     deterministic_moe_dispatch=False,
-    deterministic_moe_combine=False,
     ep_invariant_moe=False,
 )
 
@@ -116,7 +114,6 @@ class MegatronTrueOnPolicyContract:
             deterministic_moe_routing=is_moe,
             moe_topk_tiebreak="stable_sort" if is_moe else None,
             deterministic_moe_dispatch=is_moe and uses_ep,
-            deterministic_moe_combine=is_moe and uses_ep,
             ep_invariant_moe=is_moe and uses_ep,
         )
 

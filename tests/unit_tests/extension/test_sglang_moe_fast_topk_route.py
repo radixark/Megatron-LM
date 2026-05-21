@@ -8,6 +8,9 @@ from miles_megatron_plugins.true_on_policy.moe_experts import SGLangGroupedMLP
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
     _try_sglang_ordered_topk_route,
 )
+from miles_megatron_plugins.true_on_policy.sglang_backend import (
+    QWEN3_MOE_TRUE_ON_POLICY_V1,
+)
 
 
 def test_sglang_moe_fast_topk_route_matches_router_contract():
@@ -25,6 +28,7 @@ def test_sglang_moe_fast_topk_route_matches_router_contract():
         moe_router_force_biased=None,
         moe_input_jitter_eps=None,
         moe_router_topk_scaling_factor=None,
+        true_on_policy_contract=QWEN3_MOE_TRUE_ON_POLICY_V1,
     )
     logits = torch.tensor(
         [
@@ -67,6 +71,7 @@ def test_sglang_moe_fast_topk_route_falls_back_for_grouped_routing():
         moe_router_force_load_balancing=False,
         moe_router_force_biased=None,
         moe_input_jitter_eps=None,
+        true_on_policy_contract=QWEN3_MOE_TRUE_ON_POLICY_V1,
     )
     router = types.SimpleNamespace(
         routing_type="aux_loss",

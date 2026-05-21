@@ -7,12 +7,9 @@ Megatron's ``MoELayer`` so the core file stays close to upstream.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
-
-from megatron.core.typed_torch import apply_module
 
 from .contracts import resolve_true_on_policy_runtime_policy
 from .moe_reduce import sglang_moe_ep_tree_all_reduce
@@ -29,14 +26,6 @@ except ImportError:
 _MOE_DEBUG_DUMP_COUNTS: dict[tuple[int, int, str], int] = {}
 
 
-@dataclass
-class SglangEPResult:
-    """Wrapper returned by ``try_sglang_ep_forward`` to the MoE layer."""
-
-    is_final: bool
-    output: tuple | None = None
-
-
 # ---------------------------------------------------------------------------
 # Guard helpers
 # ---------------------------------------------------------------------------
@@ -46,14 +35,14 @@ def _has_true_on_policy_padding(padding_mask: Optional[torch.Tensor]) -> bool:
 
 
 def _ep_invariant_moe_eligible(moe_layer) -> bool:
-    """Common preconditions shared by the no-grad and straight-through paths."""
+    """Common preconditions shared by the no-grad and autograd SGLang paths."""
     if moe_layer.use_shared_expert or moe_layer.config.moe_latent_size:
         return False
     if moe_layer.config.moe_router_topk <= 1:
         return False
     if moe_layer.config.moe_permute_fusion:
         return False
-    if not hasattr(moe_layer.experts, "forward_sglang_local_masked"):
+    if not hasattr(moe_layer.experts, "forward_sglang_local_masked_topk"):
         return False
 
     dispatcher = moe_layer.token_dispatcher
@@ -156,7 +145,7 @@ def try_sglang_ep_forward(
     padding_mask: Optional[torch.Tensor],
     shared_expert_output: Optional[torch.Tensor],
     intermediate_tensors,
-) -> SglangEPResult | None:
+) -> tuple | None:
     """Try the SGLang local-masked EP forward path.
 
     Returns ``None`` when the path is not applicable, allowing the caller to
@@ -168,17 +157,16 @@ def try_sglang_ep_forward(
     if should_use_sglang_local_masked_ep_forward(
         moe_layer, padding_mask, shared_expert_output
     ):
-        return SglangEPResult(
-            is_final=True,
-            output=_forward_sglang_local_masked_ep(moe_layer, hidden_states),
-        )
+        output = _forward_sglang_local_masked_ep(moe_layer, hidden_states)
+        if output is not None:
+            return output
 
     if should_use_sglang_local_masked_ep_autograd(
         moe_layer, padding_mask, shared_expert_output, intermediate_tensors
     ):
         output = _forward_sglang_local_masked_ep_autograd(moe_layer, hidden_states)
         if output is not None:
-            return SglangEPResult(is_final=True, output=output)
+            return output
 
     return None
 
@@ -380,26 +368,17 @@ def _forward_global_padded(
         moe_layer, global_hidden_states, hidden_shape[-1]
     )
     if topk_route is None:
-        global_probs, _ = apply_module(moe_layer.router)(
-            global_hidden_states.view(-1, 1, hidden_shape[-1]), None
-        )
-        _maybe_dump_moe_debug(moe_layer, "nograd_router_probs", global_probs)
-        global_output = moe_layer.experts.forward_sglang_local_masked(
-            global_hidden_states,
-            global_probs,
-            moe_layer.config.moe_router_topk,
-            moe_layer.local_expert_indices,
-        )
-    else:
-        topk_weights, global_topk_ids = topk_route
-        _maybe_dump_moe_debug(moe_layer, "nograd_topk_weights", topk_weights)
-        _maybe_dump_moe_debug(moe_layer, "nograd_topk_ids", global_topk_ids)
-        global_output = moe_layer.experts.forward_sglang_local_masked_topk(
-            global_hidden_states,
-            topk_weights,
-            global_topk_ids,
-            moe_layer.local_expert_indices,
-        )
+        return None
+
+    topk_weights, global_topk_ids = topk_route
+    _maybe_dump_moe_debug(moe_layer, "nograd_topk_weights", topk_weights)
+    _maybe_dump_moe_debug(moe_layer, "nograd_topk_ids", global_topk_ids)
+    global_output = moe_layer.experts.forward_sglang_local_masked_topk(
+        global_hidden_states,
+        topk_weights,
+        global_topk_ids,
+        moe_layer.local_expert_indices,
+    )
     _maybe_dump_moe_debug(moe_layer, "nograd_local_expert_output", global_output)
     global_output = sglang_moe_ep_tree_all_reduce(global_output, ep_group)
     _maybe_dump_moe_debug(moe_layer, "nograd_ep_reduced_output", global_output)
@@ -573,12 +552,15 @@ def _try_sglang_ordered_topk_route(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Return SGLang-ordered top-k weights/ids for the simple Qwen3 MoE route.
 
-    This is deliberately narrow.  When a config needs grouped routing, expert
+    This is deliberately narrow. When a config needs grouped routing, expert
     bias, token dropping, forced routing, or non-softmax scoring, the caller
-    falls back to Megatron's router so those behaviors stay centralized.
+    falls back to Megatron's normal MoE path.
     """
     router = moe_layer.router
     config = moe_layer.config
+    policy = resolve_true_on_policy_runtime_policy(config)
+    if not policy.deterministic_moe_routing or policy.moe_topk_tiebreak != "stable_sort":
+        return None
     if not hasattr(moe_layer.experts, "forward_sglang_local_masked_topk"):
         return None
     if getattr(router, "routing_type", None) == "sinkhorn":
@@ -607,9 +589,26 @@ def _try_sglang_ordered_topk_route(
         return None
 
     router._maintain_float32_expert_bias()
-    logits = router.gating(global_hidden_states.view(-1, 1, hidden_size)).view(
-        -1, config.num_moe_experts
-    )
+    if hasattr(router, "weight"):
+        if router.weight.device.type == "cpu" and global_hidden_states.is_cuda:
+            router.weight.data = router.weight.data.to(device=torch.cuda.current_device())
+        bias = getattr(router, "bias", None)
+        if bias is not None and bias.device.type == "cpu" and global_hidden_states.is_cuda:
+            bias.data = bias.data.to(device=torch.cuda.current_device())
+
+        from megatron.core.transformer.moe.moe_utils import router_gating_linear
+
+        router_input = global_hidden_states.to(config.params_dtype).view(-1, 1, hidden_size)
+        logits = router_gating_linear(
+            router_input,
+            router.weight,
+            bias,
+            config.params_dtype,
+        ).view(-1, config.num_moe_experts)
+    else:
+        logits = router.gating(global_hidden_states.view(-1, 1, hidden_size)).view(
+            -1, config.num_moe_experts
+        )
     logits = router.apply_z_loss(logits, padding_mask=None)
     debug_prefix = "autograd" if torch.is_grad_enabled() else "nograd"
     _maybe_dump_moe_debug(moe_layer, f"{debug_prefix}_router_logits", logits)

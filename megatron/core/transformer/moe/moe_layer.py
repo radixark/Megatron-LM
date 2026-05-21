@@ -324,10 +324,6 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self.experts, "set_sglang_alltoall_source_counts"):
-            self.experts.set_sglang_alltoall_source_counts(
-                getattr(self.token_dispatcher, "num_global_tokens_per_local_expert", None)
-            )
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
@@ -415,8 +411,7 @@ class MoELayer(BaseMoELayer):
                         ep_result = None
 
                     if ep_result is not None:
-                        if ep_result.is_final:
-                            return ep_result.output
+                        return ep_result
 
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
@@ -425,6 +420,11 @@ class MoELayer(BaseMoELayer):
                         return hidden_states, probs, shared_expert_output
 
             except MoECudaGraphPartialCaptureSignal as e:
+                # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
+                # It means we should early-return from the MoE layer forward pass.
+                # This happens when we are partially capturing the CUDA graph of the MoE layer,
+                # like cuda_graph_scope=["moe_router", "moe_preprocess"].
+                # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
             if "expert_compute" in self.fwd_execution_map:

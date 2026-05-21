@@ -832,36 +832,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
 
         # Unpermutation 1: AlltoAll output to output
-        try:
-            from miles_megatron_plugins.true_on_policy.moe_combine import (
-                sglang_ordered_moe_unpermute,
-                should_use_sglang_ordered_combine,
-            )
-
-            use_sglang_combine = should_use_sglang_ordered_combine(self.config)
-        except ImportError:
-            use_sglang_combine = False
-
-        if use_sglang_combine:
-            output = sglang_ordered_moe_unpermute(
-                permuted_tokens=permutated_local_input_tokens,
-                sorted_indices=self.reversed_local_input_permutation_mapping,
-                restore_shape=self.hidden_shape_before_permute,
-                routing_map=self.routing_map,
-                probs=self.probs,
-                topk=self.config.moe_router_topk,
-                ep_size=self.ep_size,
-                num_local_experts=self.num_local_experts,
-            )
-        else:
-            output = unpermute(
-                permutated_local_input_tokens,
-                self.reversed_local_input_permutation_mapping,
-                restore_shape=self.hidden_shape_before_permute,
-                routing_map=self.routing_map,
-                fused=self.config.moe_permute_fusion,
-                drop_and_pad=self.drop_and_pad,
-            )
+        output = unpermute(
+            permutated_local_input_tokens,
+            self.reversed_local_input_permutation_mapping,
+            restore_shape=self.hidden_shape_before_permute,
+            routing_map=self.routing_map,
+            fused=self.config.moe_permute_fusion,
+            drop_and_pad=self.drop_and_pad,
+        )
 
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
