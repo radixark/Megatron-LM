@@ -30,8 +30,8 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
     forward_compacted_true_on_policy_padding,
-    is_qwen3_moe_true_on_policy_ep_enabled,
     run_direct_sglang_ep_forward,
+    uses_true_on_policy_moe_kernel,
 )
 
 try:
@@ -398,14 +398,14 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
-        use_qwen3_moe_true_on_policy = is_qwen3_moe_true_on_policy_ep_enabled(self)
+        use_true_on_policy_moe_kernel = uses_true_on_policy_moe_kernel(self)
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors, padding_mask=None):
             shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
-                    if use_qwen3_moe_true_on_policy:
+                    if use_true_on_policy_moe_kernel:
                         return run_direct_sglang_ep_forward(
                             self,
                             hidden_states,
@@ -454,7 +454,7 @@ class MoELayer(BaseMoELayer):
             return output, mlp_bias
 
         use_compact = (
-            use_qwen3_moe_true_on_policy
+            use_true_on_policy_moe_kernel
             and padding_mask is not None
             and intermediate_tensors is None
             and padding_mask.dtype == torch.bool

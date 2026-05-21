@@ -8,7 +8,7 @@ from miles_megatron_plugins.true_on_policy import moe_layer_ext
 from miles_megatron_plugins.true_on_policy.moe_experts import SGLangGroupedMLP
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
     _try_sglang_ordered_topk_route,
-    is_qwen3_moe_true_on_policy_ep_enabled,
+    uses_true_on_policy_moe_kernel,
 )
 from miles_megatron_plugins.true_on_policy.sglang_backend import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
@@ -26,15 +26,15 @@ def _predicate_layer(contract_name, ep_size: int):
     return types.SimpleNamespace(config=config, use_shared_expert=False)
 
 
-def test_sglang_moe_true_on_policy_mode_matches_contract_and_ep():
-    assert not is_qwen3_moe_true_on_policy_ep_enabled(_predicate_layer(None, ep_size=4))
-    assert not is_qwen3_moe_true_on_policy_ep_enabled(
+def test_sglang_moe_kernel_mode_matches_contract_and_ep():
+    assert not uses_true_on_policy_moe_kernel(_predicate_layer(None, ep_size=4))
+    assert not uses_true_on_policy_moe_kernel(
         _predicate_layer(QWEN3_DENSE_TRUE_ON_POLICY_V1, ep_size=4)
     )
-    assert not is_qwen3_moe_true_on_policy_ep_enabled(
+    assert not uses_true_on_policy_moe_kernel(
         _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=1)
     )
-    assert is_qwen3_moe_true_on_policy_ep_enabled(
+    assert uses_true_on_policy_moe_kernel(
         _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=4)
     )
 

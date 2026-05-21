@@ -6,6 +6,7 @@ from typing import Optional
 from .schema import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
     QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA,
+    KernelContract,
     TrueOnPolicyContractName,
     TrueOnPolicyContractSchema,
 )
@@ -28,6 +29,7 @@ class MegatronTrueOnPolicyRuntimePolicy:
 
     contract_name: Optional[str]
     enabled: bool
+    required_kernel_contracts: tuple[KernelContract, ...]
     use_sglang_backend: bool
     batch_invariant_mode: bool
     disable_rope_fusion: bool
@@ -49,10 +51,14 @@ class MegatronTrueOnPolicyRuntimePolicy:
     deterministic_moe_dispatch: bool
     ep_invariant_moe: bool
 
+    def requires_kernel(self, kernel_contract: KernelContract) -> bool:
+        return kernel_contract in self.required_kernel_contracts
+
 
 DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
     contract_name=None,
     enabled=False,
+    required_kernel_contracts=(),
     use_sglang_backend=False,
     batch_invariant_mode=False,
     disable_rope_fusion=False,
@@ -95,6 +101,7 @@ class MegatronTrueOnPolicyContract:
         return MegatronTrueOnPolicyRuntimePolicy(
             contract_name=self.name,
             enabled=True,
+            required_kernel_contracts=self.schema.required_kernel_contracts,
             use_sglang_backend=True,
             batch_invariant_mode=getattr(config, "batch_invariant_mode", False),
             disable_rope_fusion=True,

@@ -11,6 +11,9 @@ ModelFamily = Literal["qwen3_dense", "qwen3_moe", "qwen3_next"]
 KernelContract = Literal["qwen3_dense_sglang_math", "qwen3_moe_sglang_math"]
 LogprobContract = Literal["sglang_prefill"]
 
+QWEN3_DENSE_SGLANG_MATH: KernelContract = "qwen3_dense_sglang_math"
+QWEN3_MOE_SGLANG_MATH: KernelContract = "qwen3_moe_sglang_math"
+
 
 @dataclass(frozen=True)
 class TrueOnPolicyContractSchema:
@@ -28,7 +31,7 @@ class TrueOnPolicyContractSchema:
 QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema(
     name="qwen3_dense_true_on_policy_v1",
     model_family="qwen3_dense",
-    required_kernel_contracts=("qwen3_dense_sglang_math",),
+    required_kernel_contracts=(QWEN3_DENSE_SGLANG_MATH,),
     logprob_contract="sglang_prefill",
     sglang_attention_backend="fa3",
     fsdp_attention_implementation="flash_attention_3",
@@ -38,7 +41,7 @@ QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema(
 QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema(
     name="qwen3_moe_true_on_policy_v1",
     model_family="qwen3_moe",
-    required_kernel_contracts=("qwen3_dense_sglang_math", "qwen3_moe_sglang_math"),
+    required_kernel_contracts=(QWEN3_DENSE_SGLANG_MATH, QWEN3_MOE_SGLANG_MATH),
     logprob_contract="sglang_prefill",
     sglang_attention_backend="fa3",
     fsdp_attention_implementation="flash_attention_3",

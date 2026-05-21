@@ -14,7 +14,9 @@ import torch
 
 import megatron.core.parallel_state as parallel_state
 from miles_megatron_plugins.true_on_policy.sglang_backend import (
+    QWEN3_DENSE_SGLANG_MATH,
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    QWEN3_MOE_SGLANG_MATH,
     QWEN3_MOE_TRUE_ON_POLICY_V1,
     MegatronTrueOnPolicyRuntimePolicy,
     SGLangColumnParallelLinear,
@@ -191,6 +193,8 @@ def test_contract_object_owns_megatron_runtime_policy_values():
     assert contract.schema.model_family == "qwen3_dense"
     assert policy.contract_name == QWEN3_DENSE_TRUE_ON_POLICY_V1
     assert policy.enabled
+    assert policy.requires_kernel(QWEN3_DENSE_SGLANG_MATH)
+    assert not policy.requires_kernel(QWEN3_MOE_SGLANG_MATH)
     assert policy.use_sglang_backend
     assert policy.batch_invariant_mode
     assert policy.disable_rope_fusion
@@ -223,6 +227,8 @@ def test_qwen3_moe_contract_splits_tp_cp_and_ep_policy_values():
 
     assert contract.schema.model_family == "qwen3_moe"
     assert policy.contract_name == QWEN3_MOE_TRUE_ON_POLICY_V1
+    assert policy.requires_kernel(QWEN3_DENSE_SGLANG_MATH)
+    assert policy.requires_kernel(QWEN3_MOE_SGLANG_MATH)
     assert policy.use_sglang_backend
     assert policy.cp_layout == "ulysses_a2a"
     assert policy.deterministic_moe_routing
@@ -298,6 +304,8 @@ def test_missing_true_on_policy_contract_uses_default_policy():
 
     assert policy.contract_name is None
     assert not policy.enabled
+    assert not policy.required_kernel_contracts
+    assert not policy.requires_kernel(QWEN3_DENSE_SGLANG_MATH)
 
 
 def test_invalid_true_on_policy_contract_is_rejected_by_config():
