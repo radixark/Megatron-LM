@@ -48,7 +48,6 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
-from miles_megatron_plugins.true_on_policy.debug import dump_layer_activation_debug
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -1154,8 +1153,6 @@ class Attention(MegatronModule, ABC):
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
-        if split_qkv:
-            dump_layer_activation_debug(value, layer_number=self.layer_number, name="attn_v")
         nvtx_range_pop(suffix="adjust_key_value")
 
         # ================================================
@@ -1249,8 +1246,6 @@ class Attention(MegatronModule, ABC):
             query = _sglang_cast_dense_tensor_math_input(query)
             key = _sglang_cast_dense_tensor_math_input(key)
         if split_qkv:
-            dump_layer_activation_debug(query, layer_number=self.layer_number, name="attn_q")
-            dump_layer_activation_debug(key, layer_number=self.layer_number, name="attn_k")
             _register_attention_grad_debug(query, layer_number=self.layer_number, name="query")
             _register_attention_grad_debug(key, layer_number=self.layer_number, name="key")
             _register_attention_grad_debug(value, layer_number=self.layer_number, name="value")
@@ -1324,9 +1319,6 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         _register_attention_grad_debug(
             core_attn_out, layer_number=self.layer_number, name="core_attn_out"
-        )
-        dump_layer_activation_debug(
-            core_attn_out, layer_number=self.layer_number, name="attn_pre_o_proj"
         )
         nvtx_range_pop(suffix="core_attention")
 

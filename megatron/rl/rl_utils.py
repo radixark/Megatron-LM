@@ -7,7 +7,6 @@ import itertools
 import json
 import logging
 import math
-import os
 import pickle
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
@@ -1519,11 +1518,6 @@ def calculate_grpo_loss(
             f"WARNING: Shape mismatch - current_logprobs: {current_logprobs.shape}, old_logprobs: {old_logprobs.shape}",
         )
 
-    raw_current_logprobs = current_logprobs
-    raw_old_logprobs = old_logprobs
-    raw_ref_logprobs = ref_logprobs
-    loss_mask_bool = None
-
     old_logprobs = old_logprobs.to(current_logprobs.device)
     ref_logprobs = ref_logprobs.to(current_logprobs.device)
     if inference_logprobs is not None:
@@ -1590,73 +1584,7 @@ def calculate_grpo_loss(
         - entropy_weight * entropy_term
     )
 
-    if os.environ.get("MILES_RL_LOSS_DEBUG", "0") == "1" or os.environ.get(
-        "MILES_RL_LOSS_DEBUG_DIR"
-    ):
-        _maybe_dump_grpo_loss_debug(
-            raw_current_logprobs=raw_current_logprobs,
-            raw_old_logprobs=raw_old_logprobs,
-            raw_ref_logprobs=raw_ref_logprobs,
-            current_logprobs=current_logprobs,
-            old_logprobs=old_logprobs,
-            ref_logprobs=ref_logprobs,
-            advantages=advantages,
-            loss_mask=loss_mask_bool,
-            ratios=ratios,
-            kl_term=kl_term,
-            entropy_term=entropy_term,
-            loss=loss,
-        )
-
     return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below
-
-
-def _maybe_dump_grpo_loss_debug(**tensors: torch.Tensor | None) -> None:
-    if getattr(_maybe_dump_grpo_loss_debug, "_has_dumped", False):
-        return
-    _maybe_dump_grpo_loss_debug._has_dumped = True
-
-    def stats(tensor):
-        if tensor is None:
-            return None
-        data = tensor.detach()
-        if data.dtype == torch.bool:
-            data = data.float()
-        else:
-            data = data.float()
-        finite = torch.isfinite(data)
-        out = {
-            "shape": tuple(data.shape),
-            "dtype": str(tensor.dtype),
-            "finite": int(finite.sum().item()),
-            "nan": int(torch.isnan(data).sum().item()),
-            "inf": int(torch.isinf(data).sum().item()),
-            "numel": data.numel(),
-        }
-        if finite.any():
-            finite_data = data[finite]
-            out.update(
-                {
-                    "min": float(finite_data.min().item()),
-                    "max": float(finite_data.max().item()),
-                    "mean": float(finite_data.mean().item()),
-                    "absmax": float(finite_data.abs().max().item()),
-                }
-            )
-        return out
-
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    payload = {name: stats(tensor) for name, tensor in tensors.items()}
-    loss_mask = tensors.get("loss_mask")
-    if loss_mask is not None:
-        payload["loss_mask_true"] = int(loss_mask.detach().sum().item())
-        payload["loss_mask_false"] = int((~loss_mask.detach()).sum().item())
-
-    debug_dir = os.environ.get("MILES_RL_LOSS_DEBUG_DIR")
-    if debug_dir:
-        Path(debug_dir).mkdir(parents=True, exist_ok=True)
-        torch.save(payload, Path(debug_dir) / f"grpo_loss_debug_rank{rank}.pt")
-    log_single_rank(logger, logging.INFO, f"[GRPO_LOSS_DEBUG][rank={rank}] {payload}")
 
 
 @contextmanager

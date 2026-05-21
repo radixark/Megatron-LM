@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 from typing import Optional
 
@@ -12,11 +11,6 @@ from .contracts import resolve_true_on_policy_runtime_policy
 
 
 _FUSED_RMSNORM_ENV = "SGLANG_TRUE_ON_POLICY_FUSED_RMSNORM"
-_FUSED_RMSNORM_DEBUG_ENV = "SGLANG_TRUE_ON_POLICY_FUSED_RMSNORM_DEBUG"
-_fused_rmsnorm_debug_keys: set[tuple[str, tuple[int, ...], bool, bool]] = set()
-_fused_rmsnorm_entry_debug_keys: set[tuple[str, tuple[int, ...], bool, bool]] = set()
-
-logger = logging.getLogger(__name__)
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -49,69 +43,11 @@ def _with_native_grad(
     return exact.detach() + (native - native.detach())
 
 
-def _debug_fused_rms_norm(
-    label: str,
-    x: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    post_residual_addition: Optional[torch.Tensor],
-) -> None:
-    if not _env_flag_enabled(_FUSED_RMSNORM_DEBUG_ENV):
-        return
-
-    key = (
-        label,
-        tuple(x.shape),
-        residual is not None,
-        post_residual_addition is not None,
-    )
-    if key in _fused_rmsnorm_debug_keys or len(_fused_rmsnorm_debug_keys) >= 16:
-        return
-
-    _fused_rmsnorm_debug_keys.add(key)
-    logger.warning(
-        "[true-on-policy] Megatron fused RMSNorm "
-        f"label={label} shape={tuple(x.shape)} dtype={x.dtype} "
-        f"residual={residual is not None} "
-        f"post_residual={post_residual_addition is not None}"
-    )
-
-
-def _debug_rms_norm_entry(
-    label: str,
-    x: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    post_residual_addition: Optional[torch.Tensor],
-) -> None:
-    if not _env_flag_enabled(_FUSED_RMSNORM_DEBUG_ENV):
-        return
-
-    key = (
-        label,
-        tuple(x.shape),
-        residual is not None,
-        post_residual_addition is not None,
-    )
-    if key in _fused_rmsnorm_entry_debug_keys or len(_fused_rmsnorm_entry_debug_keys) >= 16:
-        return
-
-    _fused_rmsnorm_entry_debug_keys.add(key)
-    logger.warning(
-        "[true-on-policy] Megatron RMSNorm entry "
-        f"label={label} shape={tuple(x.shape)} dtype={x.dtype} "
-        f"residual={residual is not None} "
-        f"post_residual={post_residual_addition is not None} "
-        f"env={os.environ.get(_FUSED_RMSNORM_ENV)!r} "
-        f"cuda={x.is_cuda} grad_enabled={torch.is_grad_enabled()} "
-        f"requires_grad={x.requires_grad}"
-    )
-
-
 def _maybe_true_on_policy_fused_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
     *,
-    debug_label: str,
     residual: Optional[torch.Tensor] = None,
     post_residual_addition: Optional[torch.Tensor] = None,
     cast_x_before_out_mul: bool = True,
@@ -140,7 +76,6 @@ def _maybe_true_on_policy_fused_rms_norm(
         output_dtype=output_dtype,
         residual_dtype=residual_dtype,
     )
-    _debug_fused_rms_norm(debug_label, x, residual, post_residual_addition)
     return output
 
 
@@ -211,7 +146,6 @@ class SGLangNorm(torch.nn.Module):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        _debug_rms_norm_entry("SGLangNorm", x, residual, post_residual_addition)
         if self.normalization == "LayerNorm":
             if residual is not None:
                 x = x + residual
@@ -226,7 +160,6 @@ class SGLangNorm(torch.nn.Module):
                 x,
                 self.weight.float(),
                 self.eps,
-                debug_label="SGLangNorm",
                 residual=residual,
                 post_residual_addition=post_residual_addition,
                 cast_x_before_out_mul=self.cast_x_before_out_mul,
@@ -297,7 +230,6 @@ class SGLangQKRMSNorm(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _debug_rms_norm_entry("SGLangQKRMSNorm", x, None, None)
         if not x.is_contiguous():
             x = x.contiguous()
 
@@ -305,7 +237,6 @@ class SGLangQKRMSNorm(torch.nn.Module):
             x,
             self.weight.float(),
             self.eps,
-            debug_label="SGLangQKRMSNorm",
             cast_x_before_out_mul=self.cast_x_before_out_mul,
             norm_cast_dtype=x.dtype,
             weight_cast_dtype=torch.float32,
@@ -358,7 +289,6 @@ class SGLangFinalRMSNorm(torch.nn.Module):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        _debug_rms_norm_entry("SGLangFinalRMSNorm", x, residual, post_residual_addition)
         if not x.is_contiguous():
             x = x.contiguous()
 
