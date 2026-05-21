@@ -43,16 +43,12 @@ def uses_true_on_policy_moe_kernel(moe_layer) -> bool:
     """Return whether this layer should use the contract-selected MoE kernel.
 
     The true-on-policy contract chooses kernel requirements.  The direct MoE
-    path is enabled only when the active contract requires the MoE SGLang math
-    kernel and the runtime policy says EP-invariant MoE dispatch is required.
+    path is enabled when the active contract requires the MoE SGLang math
+    kernel.  Unsupported runtime layouts raise from the direct path instead of
+    silently falling back to Megatron MoE.
     """
     policy = resolve_true_on_policy_runtime_policy(moe_layer.config)
-    return (
-        policy.enabled
-        and policy.requires_kernel(QWEN3_MOE_SGLANG_MATH)
-        and policy.ep_invariant_moe
-        and policy.deterministic_moe_dispatch
-    )
+    return policy.enabled and policy.requires_kernel(QWEN3_MOE_SGLANG_MATH)
 
 
 def _has_true_on_policy_padding(padding_mask: Optional[torch.Tensor]) -> bool:
@@ -73,6 +69,14 @@ def _require_direct_sglang_moe_ready(moe_layer) -> None:
         raise TypeError(
             "Qwen3 true-on-policy MoE requires SGLangGroupedMLP experts; "
             f"got {type(moe_layer.experts).__name__}"
+        )
+
+    router = moe_layer.router
+    if getattr(config, "moe_z_loss_coeff", None) is not None:
+        raise RuntimeError("Qwen3 true-on-policy MoE does not support router z-loss")
+    if hasattr(router, "is_aux_loss_enabled") and router.is_aux_loss_enabled():
+        raise RuntimeError(
+            "Qwen3 true-on-policy MoE does not support router auxiliary load-balancing loss"
         )
 
     dispatcher = moe_layer.token_dispatcher

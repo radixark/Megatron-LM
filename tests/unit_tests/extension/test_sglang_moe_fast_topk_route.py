@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import types
 
+import pytest
 import torch
 
 from miles_megatron_plugins.true_on_policy import moe_layer_ext
 from miles_megatron_plugins.true_on_policy.moe_experts import SGLangGroupedMLP
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
+    _require_direct_sglang_moe_ready,
     _try_sglang_ordered_topk_route,
     uses_true_on_policy_moe_kernel,
 )
@@ -26,17 +28,55 @@ def _predicate_layer(contract_name, ep_size: int):
     return types.SimpleNamespace(config=config, use_shared_expert=False)
 
 
+def _ready_direct_layer(**overrides):
+    config = types.SimpleNamespace(
+        moe_latent_size=None,
+        moe_router_topk=2,
+        moe_permute_fusion=False,
+        moe_z_loss_coeff=None,
+    )
+    router = types.SimpleNamespace(is_aux_loss_enabled=lambda: False)
+    dispatcher = types.SimpleNamespace(drop_and_pad=False, tp_size=1, ep_size=4)
+    layer = types.SimpleNamespace(
+        config=config,
+        use_shared_expert=False,
+        experts=object.__new__(SGLangGroupedMLP),
+        router=router,
+        token_dispatcher=dispatcher,
+    )
+    for name, value in overrides.items():
+        setattr(layer, name, value)
+    return layer
+
+
 def test_sglang_moe_kernel_mode_matches_contract_and_ep():
     assert not uses_true_on_policy_moe_kernel(_predicate_layer(None, ep_size=4))
     assert not uses_true_on_policy_moe_kernel(
         _predicate_layer(QWEN3_DENSE_TRUE_ON_POLICY_V1, ep_size=4)
     )
-    assert not uses_true_on_policy_moe_kernel(
+    assert uses_true_on_policy_moe_kernel(
         _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=1)
     )
     assert uses_true_on_policy_moe_kernel(
         _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=4)
     )
+
+
+def test_direct_sglang_moe_rejects_active_router_auxiliary_losses():
+    layer = _ready_direct_layer(
+        router=types.SimpleNamespace(is_aux_loss_enabled=lambda: True)
+    )
+
+    with pytest.raises(RuntimeError, match="auxiliary load-balancing loss"):
+        _require_direct_sglang_moe_ready(layer)
+
+
+def test_direct_sglang_moe_rejects_router_z_loss():
+    layer = _ready_direct_layer()
+    layer.config.moe_z_loss_coeff = 1.0e-3
+
+    with pytest.raises(RuntimeError, match="router z-loss"):
+        _require_direct_sglang_moe_ready(layer)
 
 
 def test_sglang_moe_fast_topk_route_matches_router_contract(monkeypatch):
