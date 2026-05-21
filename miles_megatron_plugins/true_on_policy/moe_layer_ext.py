@@ -38,7 +38,8 @@ _MOE_DEBUG_DUMP_COUNTS: dict[tuple[int, int, str], int] = {}
 # Guard helpers
 # ---------------------------------------------------------------------------
 
-def _direct_sglang_moe_required(moe_layer) -> bool:
+def requires_direct_sglang_moe(moe_layer) -> bool:
+    """Return whether this layer must use the direct SGLang MoE path."""
     policy = resolve_true_on_policy_runtime_policy(moe_layer.config)
     return policy.ep_invariant_moe and policy.deterministic_moe_dispatch
 
@@ -123,24 +124,24 @@ def forward_compacted_true_on_policy_padding(
 # Top-level entry point called from MoELayer.forward
 # ---------------------------------------------------------------------------
 
-def try_sglang_ep_forward(
+def run_direct_sglang_ep_forward(
     moe_layer,
     hidden_states: torch.Tensor,
     padding_mask: Optional[torch.Tensor],
-    shared_expert_output: Optional[torch.Tensor],
     intermediate_tensors,
-) -> tuple | None:
-    """Run the SGLang local-masked EP forward path when the policy requires it.
+) -> tuple:
+    """Run the SGLang local-masked EP forward path.
 
-    Returns ``None`` only when the runtime policy does not require direct
-    SGLang EP MoE.  Once the true-on-policy MoE contract requires this path,
-    unsupported wiring raises instead of falling through to Megatron MoE.
-    The grad-enabled path uses a PyTorch autograd wrapper around the SGLang
-    forward and Triton backward kernels; it does not run a side Megatron MoE
-    forward.
+    The caller should gate this with ``requires_direct_sglang_moe``.  This
+    function raises when the required true-on-policy SGLang path is not wired
+    correctly; it never falls through to Megatron MoE.  The grad-enabled path
+    uses a PyTorch autograd wrapper around the SGLang forward and Triton
+    backward kernels, without running a side Megatron MoE forward.
     """
-    if not _direct_sglang_moe_required(moe_layer):
-        return None
+    if not requires_direct_sglang_moe(moe_layer):
+        raise RuntimeError(
+            "Direct SGLang MoE forward was called without a true-on-policy MoE policy"
+        )
 
     _require_direct_sglang_moe_ready(moe_layer)
     if _has_true_on_policy_padding(padding_mask):
@@ -148,8 +149,6 @@ def try_sglang_ep_forward(
             "Qwen3 true-on-policy MoE received padding in the direct SGLang path; "
             "padding should be compacted before the MoE forward"
         )
-    if shared_expert_output is not None:
-        raise RuntimeError("Qwen3 true-on-policy MoE does not support shared expert output")
 
     if torch.is_grad_enabled():
         if intermediate_tensors is not None:

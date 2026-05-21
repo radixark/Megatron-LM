@@ -30,8 +30,9 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
     forward_compacted_true_on_policy_padding,
+    requires_direct_sglang_moe,
+    run_direct_sglang_ep_forward,
     should_compact_true_on_policy_padding,
-    try_sglang_ep_forward,
 )
 
 try:
@@ -400,20 +401,18 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors, padding_mask=None):
+            shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
+                    if requires_direct_sglang_moe(self):
+                        return run_direct_sglang_ep_forward(
+                            self,
+                            hidden_states,
+                            padding_mask,
+                            intermediate_tensors,
+                        )
+
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    ep_result = try_sglang_ep_forward(
-                        self,
-                        hidden_states,
-                        padding_mask,
-                        shared_expert_output,
-                        intermediate_tensors,
-                    )
-
-                    if ep_result is not None:
-                        return ep_result
-
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
