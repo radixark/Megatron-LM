@@ -395,7 +395,6 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors, padding_mask=None):
-            sglang_exact_output = None
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
@@ -418,7 +417,6 @@ class MoELayer(BaseMoELayer):
                     if ep_result is not None:
                         if ep_result.is_final:
                             return ep_result.output
-                        sglang_exact_output = ep_result.exact_output
 
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
@@ -451,9 +449,6 @@ class MoELayer(BaseMoELayer):
 
                 if intermediate_tensors is not None:
                     return output
-
-            if sglang_exact_output is not None:
-                output = sglang_exact_output + (output - output.detach())
 
             return output, mlp_bias
 

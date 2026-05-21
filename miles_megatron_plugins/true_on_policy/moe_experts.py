@@ -1,8 +1,9 @@
-"""``SGLangGroupedMLP``: Megatron grouped expert with an SGLang no-grad forward.
+"""``SGLangGroupedMLP``: Megatron grouped expert with SGLang fused forwards.
 
-The autograd path stays on Megatron's ``GroupedMLP``. Inference (reference and
-logprob recompute) routes to SGLang's ``fused_experts`` Triton entry point so
-the forward numerics match the rollout engine exactly.
+Inference/reference paths route to SGLang's ``fused_experts`` Triton entry
+point so the forward numerics match the rollout engine exactly.  The strict
+grad-enabled EP path is orchestrated at the MoE layer level, where the SGLang
+forward is wrapped with custom backward kernels.
 """
 
 from __future__ import annotations
@@ -19,9 +20,10 @@ from megatron.core.transformer.moe.experts import GroupedMLP
 class SGLangGroupedMLP(GroupedMLP):
     """Grouped MoE expert surface with an SGLang-compatible no-grad forward.
 
-    The autograd path stays on Megatron's GroupedMLP. The true-on-policy
-    reference/logprob path runs under no-grad, where using the same fused expert
-    primitive as rollout removes grouped-GEMM arithmetic drift.
+    The true-on-policy reference/logprob path runs under no-grad, where using
+    the same fused expert primitive as rollout removes grouped-GEMM arithmetic
+    drift.  Grad-enabled direct SGLang execution is handled by
+    ``moe_layer_ext`` before the normal dispatcher reaches this module.
     """
 
     def forward(

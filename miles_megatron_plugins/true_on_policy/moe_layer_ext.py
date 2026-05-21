@@ -35,7 +35,6 @@ class SglangEPResult:
 
     is_final: bool
     output: tuple | None = None
-    exact_output: torch.Tensor | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -73,19 +72,6 @@ def should_use_sglang_local_masked_ep_forward(
     shared_expert_output: Optional[torch.Tensor],
 ) -> bool:
     if torch.is_grad_enabled():
-        return False
-    if _has_true_on_policy_padding(padding_mask) or shared_expert_output is not None:
-        return False
-    return _ep_invariant_moe_eligible(moe_layer)
-
-
-def should_use_sglang_local_masked_ep_straight_through(
-    moe_layer,
-    padding_mask: Optional[torch.Tensor],
-    shared_expert_output: Optional[torch.Tensor],
-    intermediate_tensors,
-) -> bool:
-    if not torch.is_grad_enabled() or intermediate_tensors is not None:
         return False
     if _has_true_on_policy_padding(padding_mask) or shared_expert_output is not None:
         return False
@@ -174,9 +160,10 @@ def try_sglang_ep_forward(
     """Try the SGLang local-masked EP forward path.
 
     Returns ``None`` when the path is not applicable, allowing the caller to
-    fall through to the normal Megatron MoE forward.  Otherwise returns a
-    ``SglangEPResult`` indicating whether the result is final (no-grad) or
-    a straight-through exact output (grad-enabled).
+    fall through to the normal Megatron MoE forward.  Otherwise returns the
+    direct SGLang fused-kernel output.  The grad-enabled path uses a PyTorch
+    autograd wrapper around the SGLang forward and Triton backward kernels; it
+    does not run a side Megatron MoE forward.
     """
     if should_use_sglang_local_masked_ep_forward(
         moe_layer, padding_mask, shared_expert_output
@@ -192,13 +179,6 @@ def try_sglang_ep_forward(
         output = _forward_sglang_local_masked_ep_autograd(moe_layer, hidden_states)
         if output is not None:
             return SglangEPResult(is_final=True, output=output)
-
-    if should_use_sglang_local_masked_ep_straight_through(
-        moe_layer, padding_mask, shared_expert_output, intermediate_tensors
-    ):
-        with torch.no_grad():
-            exact_output = _forward_sglang_local_masked_ep(moe_layer, hidden_states)[0]
-        return SglangEPResult(is_final=False, exact_output=exact_output)
 
     return None
 
