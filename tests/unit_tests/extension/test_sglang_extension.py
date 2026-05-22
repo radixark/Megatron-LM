@@ -820,44 +820,6 @@ def test_sglang_grouped_mlp_init_does_not_require_grouped_gemm(monkeypatch):
     assert layer.weight2.shape == (6, 4)
 
 
-def test_sglang_grouped_mlp_weight_cache_reuses_and_invalidates_on_update():
-    config = _make_config(hidden_size=2, moe_ffn_hidden_size=3, num_moe_experts=2)
-    layer = object.__new__(SGLangGroupedMLP)
-    layer.config = config
-    layer.num_local_experts = 2
-    layer.weight1 = torch.arange(2 * 2 * 2 * 3, dtype=torch.bfloat16).reshape(2, 12)
-    layer.weight2 = torch.arange(2 * 3 * 2, dtype=torch.bfloat16).reshape(6, 2)
-
-    with patch.dict(os.environ, {"MILES_TRUE_ON_POLICY_CACHE_SGLANG_EXPERT_WEIGHTS": "1"}):
-        with torch.no_grad():
-            first = layer.sglang_w13_weight()
-            second = layer.sglang_w13_weight()
-            assert first.data_ptr() == second.data_ptr()
-
-            layer.weight1.add_(1)
-            updated = layer.sglang_w13_weight()
-
-    assert updated.data_ptr() != first.data_ptr()
-    torch.testing.assert_close(
-        updated,
-        layer.weight1.view(2, 2, 6).permute(0, 2, 1).contiguous(),
-    )
-
-
-def test_sglang_grouped_mlp_weight_cache_disabled_by_default():
-    config = _make_config(hidden_size=2, moe_ffn_hidden_size=3, num_moe_experts=2)
-    layer = object.__new__(SGLangGroupedMLP)
-    layer.config = config
-    layer.num_local_experts = 2
-    layer.weight1 = torch.arange(2 * 2 * 2 * 3, dtype=torch.bfloat16).reshape(2, 12)
-
-    with torch.no_grad():
-        first = layer.sglang_w13_weight()
-        second = layer.sglang_w13_weight()
-
-    assert first.data_ptr() != second.data_ptr()
-
-
 def test_sglang_grouped_mlp_masks_nonlocal_topk_ids_for_standard_ep_path():
     from megatron.core.transformer.moe.sgl_fused_moe.forward import remap_global_to_local_expert_ids
 

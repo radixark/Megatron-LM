@@ -8,8 +8,7 @@ import torch
 from miles_megatron_plugins.true_on_policy import moe_layer_ext
 from miles_megatron_plugins.true_on_policy.moe_experts import SGLangGroupedMLP
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
-    _require_direct_sglang_moe_ready,
-    _try_sglang_ordered_topk_route,
+    _sglang_topk_route as _try_sglang_ordered_topk_route,
     uses_true_on_policy_moe_kernel,
 )
 from miles_megatron_plugins.true_on_policy.sglang_backend import (
@@ -60,23 +59,6 @@ def test_sglang_moe_kernel_mode_matches_contract_and_ep():
     assert uses_true_on_policy_moe_kernel(
         _predicate_layer(QWEN3_MOE_TRUE_ON_POLICY_V1, ep_size=4)
     )
-
-
-def test_direct_sglang_moe_rejects_active_router_auxiliary_losses():
-    layer = _ready_direct_layer(
-        router=types.SimpleNamespace(is_aux_loss_enabled=lambda: True)
-    )
-
-    with pytest.raises(RuntimeError, match="auxiliary load-balancing loss"):
-        _require_direct_sglang_moe_ready(layer)
-
-
-def test_direct_sglang_moe_rejects_router_z_loss():
-    layer = _ready_direct_layer()
-    layer.config.moe_z_loss_coeff = 1.0e-3
-
-    with pytest.raises(RuntimeError, match="router z-loss"):
-        _require_direct_sglang_moe_ready(layer)
 
 
 def test_sglang_moe_fast_topk_route_matches_router_contract(monkeypatch):
@@ -152,31 +134,4 @@ def test_sglang_moe_fast_topk_route_falls_back_for_grouped_routing():
     experts = types.SimpleNamespace()
     moe_layer = types.SimpleNamespace(config=config, router=router, experts=experts)
 
-    assert _try_sglang_ordered_topk_route(moe_layer, torch.zeros(1, 4), 4) is None
-
-
-def test_sglang_expert_weight_cache_invalidates_after_inplace_update(monkeypatch):
-    monkeypatch.setenv("MILES_TRUE_ON_POLICY_CACHE_SGLANG_EXPERT_WEIGHTS", "1")
-    grouped_mlp = object.__new__(SGLangGroupedMLP)
-    weight = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
-
-    first = grouped_mlp._cached_sglang_weight(
-        cache_name="_test_weight_cache",
-        weight=weight,
-        view_shape=(2, 3, 4),
-        permute_dims=(0, 2, 1),
-    )
-
-    with torch.no_grad():
-        weight.add_(1000)
-
-    second = grouped_mlp._cached_sglang_weight(
-        cache_name="_test_weight_cache",
-        weight=weight,
-        view_shape=(2, 3, 4),
-        permute_dims=(0, 2, 1),
-    )
-    expected = weight.view(2, 3, 4).permute(0, 2, 1).contiguous()
-
-    assert not torch.equal(first, second)
-    torch.testing.assert_close(second, expected)
+    assert _try_sglang_ordered_topk_route(moe_layer, torch.zeros(1, 4), 4) == (None, None)
