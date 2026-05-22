@@ -2,6 +2,12 @@
 
 EP-invariant local-masked forward and padding compaction extracted from
 Megatron's ``MoELayer`` so the core file stays close to upstream.
+
+Architecture:
+  - ONE orchestration path: gather -> route -> forward -> reduce -> slice
+  - The only branch is ``if torch.is_grad_enabled()``, which controls whether
+    the autograd wrapper (backward kernels) is attached.  The forward math is
+    always the same ``sglang_moe_forward`` function.
 """
 
 from __future__ import annotations
@@ -17,6 +23,14 @@ from .contracts import resolve_true_on_policy_runtime_policy
 from .moe_experts import SGLangGroupedMLP
 from .moe_reduce import sglang_moe_ep_tree_all_reduce
 from .schema import QWEN3_MOE_SGLANG_MATH
+
+try:
+    from megatron.core.transformer.moe.sgl_fused_moe.forward import sglang_moe_forward
+
+    HAVE_SGLANG_MOE_FORWARD = True
+except ImportError:
+    sglang_moe_forward = None
+    HAVE_SGLANG_MOE_FORWARD = False
 
 try:
     from sglang.srt.tp_invariant_ops import stable_topk_softmax
@@ -38,13 +52,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def uses_true_on_policy_moe_kernel(moe_layer) -> bool:
-    """Return whether this layer should use the contract-selected MoE kernel.
-
-    The true-on-policy contract chooses kernel requirements.  The direct MoE
-    path is enabled when the active contract requires the MoE SGLang math
-    kernel.  Unsupported runtime layouts raise from the direct path instead of
-    silently falling back to Megatron MoE.
-    """
+    """Return whether this layer should use the contract-selected MoE kernel."""
     policy = resolve_true_on_policy_runtime_policy(moe_layer.config)
     return policy.enabled and policy.requires_kernel(QWEN3_MOE_SGLANG_MATH)
 
@@ -127,12 +135,8 @@ def run_direct_sglang_ep_forward(
 ) -> tuple:
     """Run the SGLang local-masked EP forward path.
 
-    The caller should gate this with
-    ``uses_true_on_policy_moe_kernel``.  This function raises when the
-    required true-on-policy SGLang path is not wired correctly; it never falls
-    through to Megatron MoE.  The grad-enabled path uses a PyTorch autograd
-    wrapper around the SGLang forward and Triton backward kernels, without
-    running a side Megatron MoE forward.
+    This is the SINGLE orchestration path for both inference and training.
+    The only difference is whether the autograd backward is attached.
     """
     if not uses_true_on_policy_moe_kernel(moe_layer):
         raise RuntimeError(
@@ -159,10 +163,11 @@ def run_direct_sglang_ep_forward(
             )
         if not HAVE_SGLANG_FUSED_EXPERTS_AUTOGRAD:
             raise RuntimeError("SGLang fused MoE autograd path is not available")
-        output = _forward_sglang_local_masked_ep_autograd(moe_layer, hidden_states)
     else:
-        output = _forward_sglang_local_masked_ep(moe_layer, hidden_states)
+        if not HAVE_SGLANG_MOE_FORWARD:
+            raise RuntimeError("SGLang fused MoE forward is not available")
 
+    output = _forward_sglang_ep(moe_layer, hidden_states)
     if output is None:
         raise RuntimeError(
             "Qwen3 true-on-policy MoE requires the direct SGLang MoE path, but the "
@@ -172,7 +177,7 @@ def run_direct_sglang_ep_forward(
 
 
 # ---------------------------------------------------------------------------
-# EP-invariant forward implementation
+# Unified EP forward: one path, branch only on grad_enabled for backward
 # ---------------------------------------------------------------------------
 
 class _PaddedEPAllGather(torch.autograd.Function):
@@ -237,7 +242,11 @@ def _average_ep_reduce_backward() -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
-def _forward_sglang_local_masked_ep(moe_layer, hidden_states: torch.Tensor):
+def _forward_sglang_ep(moe_layer, hidden_states: torch.Tensor):
+    """Single unified EP forward path.
+
+    Flow: gather -> route -> [adjust grad ownership] -> forward -> reduce -> slice
+    """
     hidden_shape = hidden_states.shape
     flat_hidden_states = hidden_states.reshape(-1, hidden_shape[-1])
     ep_group = moe_layer.token_dispatcher.ep_group
@@ -248,78 +257,26 @@ def _forward_sglang_local_masked_ep(moe_layer, hidden_states: torch.Tensor):
         local_num_tokens, flat_hidden_states.device, ep_group, ep_size
     )
 
-    hidden_chunks = _all_gather_padded_ep_tensor(
-        flat_hidden_states, max_num_tokens, ep_group, ep_size
-    )
-
     if max_num_tokens == 0:
         return torch.zeros_like(hidden_states), None
 
-    return _forward_global_padded(
-        moe_layer, hidden_states, hidden_chunks,
-        max_num_tokens, token_counts, ep_group, ep_rank,
-    )
-
-
-def _forward_global_padded(
-    moe_layer,
-    hidden_states: torch.Tensor,
-    hidden_chunks: list[torch.Tensor],
-    max_num_tokens: int,
-    token_counts: list[int],
-    ep_group,
-    ep_rank: int,
-):
-    hidden_shape = hidden_states.shape
-    global_hidden_states = torch.cat(hidden_chunks, dim=0)
-    topk_route = _try_sglang_ordered_topk_route(
-        moe_layer, global_hidden_states, hidden_shape[-1]
-    )
-    if topk_route is None:
-        return None
-
-    topk_weights, global_topk_ids = topk_route
-    global_output = moe_layer.experts.forward_sglang_local_masked_topk(
-        global_hidden_states,
-        topk_weights,
-        global_topk_ids,
-        moe_layer.local_expert_indices,
-    )
-    global_output = sglang_moe_ep_tree_all_reduce(global_output, ep_group)
-
-    local_num_tokens = token_counts[ep_rank]
-    local_start = ep_rank * max_num_tokens
-    local_output = global_output[local_start : local_start + local_num_tokens].contiguous()
-    if local_num_tokens < hidden_states.reshape(-1, hidden_shape[-1]).shape[0]:
-        padded_output = hidden_states.new_zeros(
-            hidden_states.reshape(-1, hidden_shape[-1]).shape
+    # --- Step 1: EP all-gather (autograd-aware when training) ---
+    if torch.is_grad_enabled():
+        global_hidden_states = _PaddedEPAllGather.apply(
+            flat_hidden_states,
+            max_num_tokens,
+            tuple(token_counts),
+            ep_group,
+            ep_rank,
+            ep_size,
         )
-        padded_output[:local_num_tokens] = local_output
-        local_output = padded_output
-    return local_output.view(hidden_shape), None
+    else:
+        chunks = _all_gather_padded_ep_tensor(
+            flat_hidden_states, max_num_tokens, ep_group, ep_size
+        )
+        global_hidden_states = torch.cat(chunks, dim=0)
 
-
-def _forward_sglang_local_masked_ep_autograd(moe_layer, hidden_states: torch.Tensor):
-    hidden_shape = hidden_states.shape
-    flat_hidden_states = hidden_states.reshape(-1, hidden_shape[-1])
-    ep_group = moe_layer.token_dispatcher.ep_group
-    ep_size = moe_layer.token_dispatcher.ep_size
-    ep_rank = torch.distributed.get_rank(group=ep_group)
-    local_num_tokens = flat_hidden_states.shape[0]
-    max_num_tokens, token_counts = _gather_ep_token_counts(
-        local_num_tokens, flat_hidden_states.device, ep_group, ep_size
-    )
-    if max_num_tokens == 0:
-        return torch.zeros_like(hidden_states), None
-
-    global_hidden_states = _PaddedEPAllGather.apply(
-        flat_hidden_states,
-        max_num_tokens,
-        tuple(token_counts),
-        ep_group,
-        ep_rank,
-        ep_size,
-    )
+    # --- Step 2: Router ---
     topk_route = _try_sglang_ordered_topk_route(
         moe_layer, global_hidden_states, hidden_shape[-1]
     )
@@ -327,37 +284,72 @@ def _forward_sglang_local_masked_ep_autograd(moe_layer, hidden_states: torch.Ten
         return None
 
     topk_weights, global_topk_ids = topk_route
+
+    # --- Step 3: Router grad ownership (training only) ---
+    if torch.is_grad_enabled():
+        local_start = ep_rank * max_num_tokens
+        local_count = token_counts[ep_rank]
+        topk_weights = _with_local_router_grad_owner(
+            topk_weights, local_start, local_count
+        )
+
+    # --- Step 4: Expert forward (same math, different backward attachment) ---
+    w1 = moe_layer.experts.sglang_w13_weight()
+    w2 = moe_layer.experts.sglang_w2_weight()
+
+    if torch.is_grad_enabled():
+        global_output = sglang_fused_experts_autograd(
+            layer_number=moe_layer.layer_number,
+            hidden_states=global_hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=global_topk_ids,
+            num_experts=moe_layer.config.num_moe_experts,
+            num_local_experts=moe_layer.num_local_experts,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            ep_group=ep_group,
+            activation="silu",
+            allreduce_grad_hidden=False,
+        )
+    else:
+        global_output = sglang_moe_forward(
+            hidden_states=global_hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=global_topk_ids,
+            num_experts=moe_layer.config.num_moe_experts,
+            num_local_experts=moe_layer.num_local_experts,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            activation="silu",
+            layer_id=moe_layer.layer_number,
+        )
+
+    # --- Step 5: EP reduce (autograd-aware when training) ---
+    if torch.is_grad_enabled():
+        global_output = _SGLangEPAllReduceSum.apply(global_output, ep_group)
+    else:
+        global_output = sglang_moe_ep_tree_all_reduce(global_output, ep_group)
+
+    # --- Step 6: Slice local tokens ---
     local_start = ep_rank * max_num_tokens
     local_count = token_counts[ep_rank]
-    topk_weights = _with_local_router_grad_owner(
-        topk_weights, local_start, local_count
-    )
-    w1 = moe_layer.experts._sglang_w13_weight()
-    w2 = moe_layer.experts._sglang_w2_weight()
-    global_output = sglang_fused_experts_autograd(
-        layer_number=moe_layer.layer_number,
-        hidden_states=global_hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weights=topk_weights,
-        topk_ids=global_topk_ids,
-        num_experts=moe_layer.config.num_moe_experts,
-        num_local_experts=moe_layer.num_local_experts,
-        ep_rank=ep_rank,
-        ep_size=ep_size,
-        ep_group=ep_group,
-        activation="silu",
-        # The input was produced by an EP all-gather. Its backward reduce
-        # already sums per-expert hidden-state gradients across EP ranks.
-        allreduce_grad_hidden=False,
-    )
-    global_output = _SGLangEPAllReduceSum.apply(global_output, ep_group)
+    local_output = global_output[local_start : local_start + local_count].contiguous()
 
-    local_output = global_output[
-        local_start : local_start + token_counts[ep_rank]
-    ].contiguous()
+    if local_count < flat_hidden_states.shape[0]:
+        padded_output = hidden_states.new_zeros(flat_hidden_states.shape)
+        padded_output[:local_count] = local_output
+        local_output = padded_output
+
     return local_output.view(hidden_shape), None
 
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
 
 def _with_local_router_grad_owner(
     topk_weights: torch.Tensor,
@@ -382,13 +374,7 @@ def _try_sglang_ordered_topk_route(
     global_hidden_states: torch.Tensor,
     hidden_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return SGLang-ordered top-k weights/ids for the simple Qwen3 MoE route.
-
-    This is deliberately narrow. When a config needs grouped routing, expert
-    bias, token dropping, forced routing, or non-softmax scoring, ``None``
-    marks the route unsupported; the top-level direct path raises if the
-    true-on-policy MoE contract required SGLang execution.
-    """
+    """Return SGLang-ordered top-k weights/ids for the simple Qwen3 MoE route."""
     router = moe_layer.router
     config = moe_layer.config
     policy = resolve_true_on_policy_runtime_policy(config)

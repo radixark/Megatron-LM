@@ -789,8 +789,35 @@ def test_sglang_grouped_mlp_weight_views_match_megatron_grouped_layout():
     expected_w13 = layer.weight1.view(2, 2, 6).permute(0, 2, 1).contiguous()
     expected_w2 = layer.weight2.view(2, 3, 2).permute(0, 2, 1).contiguous()
 
-    torch.testing.assert_close(layer._sglang_w13_weight(), expected_w13)
-    torch.testing.assert_close(layer._sglang_w2_weight(), expected_w2)
+    torch.testing.assert_close(layer.sglang_w13_weight(), expected_w13)
+    torch.testing.assert_close(layer.sglang_w2_weight(), expected_w2)
+
+
+def test_sglang_grouped_mlp_init_does_not_require_grouped_gemm(monkeypatch):
+    from megatron.core.transformer.moe import grouped_gemm_util as gg
+
+    def fail_grouped_gemm_check():
+        raise AssertionError("grouped_gemm should not be required for SGLangGroupedMLP")
+
+    monkeypatch.setattr(gg, "assert_grouped_gemm_is_available", fail_grouped_gemm_check)
+    config = _make_config(
+        hidden_size=4,
+        moe_ffn_hidden_size=3,
+        num_moe_experts=8,
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        expert_model_parallel_size=4,
+    )
+    pg_collection = types.SimpleNamespace(
+        ep=_FakeCPGroup(4, 1),
+        expt_tp=_FakeCPGroup(1, 0),
+        expt_dp=_FakeCPGroup(1, 0),
+    )
+
+    layer = SGLangGroupedMLP(2, config, pg_collection)
+
+    assert layer.weight1.shape == (4, 12)
+    assert layer.weight2.shape == (6, 4)
 
 
 def test_sglang_grouped_mlp_weight_cache_reuses_and_invalidates_on_update():
@@ -803,12 +830,12 @@ def test_sglang_grouped_mlp_weight_cache_reuses_and_invalidates_on_update():
 
     with patch.dict(os.environ, {"MILES_TRUE_ON_POLICY_CACHE_SGLANG_EXPERT_WEIGHTS": "1"}):
         with torch.no_grad():
-            first = layer._sglang_w13_weight()
-            second = layer._sglang_w13_weight()
+            first = layer.sglang_w13_weight()
+            second = layer.sglang_w13_weight()
             assert first.data_ptr() == second.data_ptr()
 
             layer.weight1.add_(1)
-            updated = layer._sglang_w13_weight()
+            updated = layer.sglang_w13_weight()
 
     assert updated.data_ptr() != first.data_ptr()
     torch.testing.assert_close(
@@ -825,22 +852,79 @@ def test_sglang_grouped_mlp_weight_cache_disabled_by_default():
     layer.weight1 = torch.arange(2 * 2 * 2 * 3, dtype=torch.bfloat16).reshape(2, 12)
 
     with torch.no_grad():
-        first = layer._sglang_w13_weight()
-        second = layer._sglang_w13_weight()
+        first = layer.sglang_w13_weight()
+        second = layer.sglang_w13_weight()
 
     assert first.data_ptr() != second.data_ptr()
 
 
 def test_sglang_grouped_mlp_masks_nonlocal_topk_ids_for_standard_ep_path():
-    layer = object.__new__(SGLangGroupedMLP)
-    layer.num_local_experts = 2
+    from megatron.core.transformer.moe.sgl_fused_moe.forward import remap_global_to_local_expert_ids
+
     global_topk_ids = torch.tensor([[0, 3, 2], [1, 2, 3]], dtype=torch.long)
 
-    actual = layer._local_masked_topk_ids(global_topk_ids, local_expert_indices=[2, 3])
+    actual = remap_global_to_local_expert_ids(
+        global_topk_ids, num_experts=4, num_local_experts=2, ep_rank=1, ep_size=2
+    )
 
     torch.testing.assert_close(
         actual,
         torch.tensor([[-1, 1, 0], [-1, 0, 1]], dtype=torch.int32),
+    )
+
+
+def test_sglang_moe_forward_uses_hidden_size_from_sglang_weight_layout(monkeypatch):
+    from megatron.core.transformer.moe.sgl_fused_moe import forward as moe_forward
+
+    captured = {}
+
+    def fake_fused_experts(*, hidden_states, w1, w2, topk_output, moe_runner_config):
+        captured["hidden_states"] = hidden_states
+        captured["topk_output"] = topk_output
+        captured["moe_runner_config"] = moe_runner_config
+        return hidden_states
+
+    monkeypatch.setattr(moe_forward, "HAVE_SGLANG_FUSED_MOE", True)
+    monkeypatch.setattr(moe_forward, "get_global_server_args", lambda: object())
+    monkeypatch.setattr(
+        moe_forward,
+        "StandardTopKOutput",
+        lambda **kwargs: types.SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        moe_forward,
+        "MoeRunnerConfig",
+        lambda **kwargs: types.SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(moe_forward, "fused_experts", fake_fused_experts)
+
+    hidden_states = torch.randn(4, 2, dtype=torch.bfloat16)
+    w1 = torch.randn(2, 6, 2, dtype=torch.bfloat16)
+    w2 = torch.randn(2, 2, 3, dtype=torch.bfloat16)
+    topk_weights = torch.ones(4, 2, dtype=torch.float32)
+    topk_ids = torch.tensor([[0, 2], [1, 3], [2, 0], [3, 1]], dtype=torch.long)
+
+    actual = moe_forward.sglang_moe_forward(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        num_experts=4,
+        num_local_experts=2,
+        ep_rank=1,
+        ep_size=2,
+        layer_id=7,
+    )
+
+    torch.testing.assert_close(actual, hidden_states)
+    runner_config = captured["moe_runner_config"]
+    assert runner_config.hidden_size == 2
+    assert runner_config.intermediate_size_per_partition == 3
+    assert runner_config.layer_id == 7
+    torch.testing.assert_close(
+        captured["topk_output"].topk_ids,
+        torch.tensor([[-1, 0], [-1, 1], [0, -1], [1, -1]], dtype=torch.int32),
     )
 
 

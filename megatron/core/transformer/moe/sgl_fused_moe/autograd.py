@@ -1,55 +1,40 @@
+"""Autograd wrapper for SGLang fused MoE.
+
+The forward is delegated to ``forward.sglang_moe_forward`` (the single
+source of truth).  This module only adds the custom backward pass using
+Triton kernels for weight and activation gradients.
+
+The ID remap uses ``forward.remap_global_to_local_expert_ids`` - the same
+function used by the no-grad path, so both paths produce identical local
+IDs.
+"""
+
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
-from typing import Optional
 
 import torch
 
 try:
     import triton.language as tl
-    from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-        fused_experts,
-        fused_experts_impl,
         invoke_fused_moe_kernel,
         moe_align_block_size,
         silu_and_mul,
     )
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
     from .fused_moe_triton_backward_kernels import invoke_fused_moe_backward_kernel
 
     HAVE_SGLANG_FUSED_EXPERTS_AUTOGRAD = True
 except ImportError:
     tl = None
-    MoeRunnerConfig = None
-    StandardTopKOutput = None
-    fused_experts = None
-    fused_experts_impl = None
     invoke_fused_moe_kernel = None
     invoke_fused_moe_backward_kernel = None
     moe_align_block_size = None
     silu_and_mul = None
     HAVE_SGLANG_FUSED_EXPERTS_AUTOGRAD = False
 
-
-def _ensure_sglang_server_args() -> None:
-    from sglang.srt.server_args import (
-        get_global_server_args,
-        set_global_server_args_for_scheduler,
-    )
-
-    try:
-        get_global_server_args()
-    except ValueError:
-        set_global_server_args_for_scheduler(
-            SimpleNamespace(
-                enable_deterministic_inference=True,
-                enable_fused_moe_sum_all_reduce=False,
-                rl_on_policy_target="fsdp_tp",
-            )
-        )
+from .forward import remap_global_to_local_expert_ids, sglang_moe_forward
 
 
 def _scale_hidden_dgrad_by_ep() -> bool:
@@ -58,7 +43,7 @@ def _scale_hidden_dgrad_by_ep() -> bool:
 
 
 class _FusedExpertsTritonBackward(torch.autograd.Function):
-    """SGLang fused MoE forward with Triton backward kernels."""
+    """Wrap the shared SGLang forward and provide Triton-based backward."""
 
     @staticmethod
     def forward(
@@ -72,39 +57,30 @@ class _FusedExpertsTritonBackward(torch.autograd.Function):
         layer_id: int,
         num_experts: int,
         num_local_experts: int,
+        ep_rank: int,
+        ep_size: int,
         ep_group,
         allreduce_grad_hidden: bool,
     ):
-        _ensure_sglang_server_args()
         with torch.no_grad():
-            topk_output = StandardTopKOutput(
-                topk_weights=topk_weights.contiguous(),
-                topk_ids=topk_ids.contiguous(),
-                router_logits=None,
-            )
-            runner_config = MoeRunnerConfig(
+            output = sglang_moe_forward(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
                 num_experts=num_experts,
                 num_local_experts=num_local_experts,
-                hidden_size=w2.shape[1],
-                intermediate_size_per_partition=w2.shape[2],
-                layer_id=layer_id,
-                top_k=topk_weights.shape[-1],
-                params_dtype=w1.dtype,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
                 activation=activation,
-                is_gated=True,
-                apply_router_weight_on_input=False,
-                inplace=True,
-                no_combine=False,
-            )
-            output = fused_experts(
-                hidden_states=hidden_states.contiguous().clone(),
-                w1=w1.contiguous(),
-                w2=w2.contiguous(),
-                topk_output=topk_output,
-                moe_runner_config=runner_config,
+                layer_id=layer_id,
             )
 
-        ctx.save_for_backward(hidden_states, w1, w2, topk_weights, topk_ids)
+        local_topk_ids = remap_global_to_local_expert_ids(
+            topk_ids, num_experts, num_local_experts, ep_rank, ep_size
+        )
+        ctx.save_for_backward(hidden_states, w1, w2, topk_weights, local_topk_ids)
         ctx.activation = activation
         ctx.layer_id = layer_id
         ctx.ep_group = ep_group
@@ -145,6 +121,7 @@ class _FusedExpertsTritonBackward(torch.autograd.Function):
                 curr_topk_ids, config["BLOCK_SIZE_M"], num_experts
             )
 
+            # Recompute w1 forward
             intermediate_cache1 = torch.empty(
                 (curr_tokens * topk, ffn_hidden_size),
                 device=hidden_states.device,
@@ -184,6 +161,7 @@ class _FusedExpertsTritonBackward(torch.autograd.Function):
             )
             silu_and_mul(intermediate_cache1.view(-1, ffn_hidden_size), intermediate_cache2)
 
+            # Backward w2 (down-proj, routed)
             grad_intermediate_cache3 = curr_grad_output.unsqueeze(1).expand(
                 curr_tokens, topk, hidden_size
             ).contiguous()
@@ -214,6 +192,7 @@ class _FusedExpertsTritonBackward(torch.autograd.Function):
             grad_w2 += curr_grad_w2
             grad_topk_weights[chunk_start:chunk_end] = curr_grad_topk_weights
 
+            # Manual SiLU backward
             x1, x2 = intermediate_cache1.view(-1, ffn_hidden_size).chunk(2, dim=-1)
             silu_x1 = torch.nn.functional.silu(x1)
             sig = torch.sigmoid(x1)
@@ -222,6 +201,7 @@ class _FusedExpertsTritonBackward(torch.autograd.Function):
             grad_x2 = grad_intermediate_cache2 * silu_x1
             grad_intermediate_cache1 = torch.cat([grad_x1, grad_x2], dim=-1)
 
+            # Backward w1 (up-proj, unrouted)
             curr_grad_hidden = torch.zeros_like(curr_hidden)
             curr_grad_w1 = torch.zeros_like(w1)
             invoke_fused_moe_backward_kernel(
@@ -258,13 +238,15 @@ class _FusedExpertsTritonBackward(torch.autograd.Function):
             grad_w1,
             grad_w2,
             grad_topk_weights,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # topk_ids
+            None,  # activation
+            None,  # layer_id
+            None,  # num_experts
+            None,  # num_local_experts
+            None,  # ep_rank
+            None,  # ep_size
+            None,  # ep_group
+            None,  # allreduce_grad_hidden
         )
 
 
@@ -284,20 +266,14 @@ def sglang_fused_experts_autograd(
     activation: str = "silu",
     allreduce_grad_hidden: bool = True,
 ) -> torch.Tensor:
+    """Autograd-wrapped SGLang MoE forward with Triton backward.
+
+    The forward uses the same ``sglang_moe_forward`` as the no-grad path.
+    The ID remap uses the same ``remap_global_to_local_expert_ids``.
+    This wrapper only attaches the backward pass.
+    """
     if not HAVE_SGLANG_FUSED_EXPERTS_AUTOGRAD:
         raise RuntimeError("SGLang fused MoE Triton backward is not available")
-
-    if ep_size > 1:
-        local_expert_mapping = torch.full(
-            (num_experts,), -1, dtype=torch.int32, device=topk_ids.device
-        )
-        local_start = ep_rank * num_local_experts
-        local_expert_mapping[local_start : local_start + num_local_experts] = torch.arange(
-            num_local_experts, dtype=torch.int32, device=topk_ids.device
-        )
-        topk_ids = local_expert_mapping[topk_ids.long()]
-    else:
-        topk_ids = topk_ids.to(torch.int32)
 
     if hidden_states.dtype != w1.dtype:
         hidden_states = hidden_states.to(w1.dtype)
@@ -312,6 +288,8 @@ def sglang_fused_experts_autograd(
         layer_number,
         num_experts,
         num_local_experts,
+        ep_rank,
+        ep_size,
         ep_group,
         allreduce_grad_hidden,
     )

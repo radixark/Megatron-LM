@@ -116,7 +116,7 @@ def test_sglang_moe_fast_topk_route_matches_router_contract(monkeypatch):
         "router_gating_linear",
         lambda router_input, weight, bias, dtype: logits.to(dtype),
     )
-    experts = types.SimpleNamespace(forward_sglang_local_masked_topk=lambda *args: None)
+    experts = types.SimpleNamespace()
     moe_layer = types.SimpleNamespace(config=config, router=router, experts=experts)
     hidden_states = torch.zeros(2, 8, dtype=torch.bfloat16)
 
@@ -149,7 +149,7 @@ def test_sglang_moe_fast_topk_route_falls_back_for_grouped_routing():
         score_function="softmax",
         expert_bias=None,
     )
-    experts = types.SimpleNamespace(forward_sglang_local_masked_topk=lambda *args: None)
+    experts = types.SimpleNamespace()
     moe_layer = types.SimpleNamespace(config=config, router=router, experts=experts)
 
     assert _try_sglang_ordered_topk_route(moe_layer, torch.zeros(1, 4), 4) is None

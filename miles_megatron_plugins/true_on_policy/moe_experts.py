@@ -1,116 +1,172 @@
-"""``SGLangGroupedMLP`` helpers for direct SGLang MoE execution.
+"""``SGLangGroupedMLP`` weight-layout adapter for SGLang MoE kernels.
 
-The MoE layer calls these helpers only on the direct local-masked EP path:
-no-grad/reference uses SGLang ``fused_experts`` directly, while grad-enabled
-training uses the layer-level autograd wrapper with the same SGLang weight
-layout helpers.
+This module subclasses Megatron's ``GroupedMLP`` and exposes weight views in
+SGLang's expected layout.  It contains NO forward logic; the canonical
+forward lives in ``sgl_fused_moe.forward.sglang_moe_forward``.
 """
 
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
+from typing import Optional
 
 import torch
+from torch.nn.parameter import Parameter
 
+from megatron.core.tensor_parallel.layers import (
+    _initialize_affine_weight_cpu,
+    _initialize_affine_weight_gpu,
+    set_tensor_model_parallel_attributes,
+)
+from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.moe.experts import GroupedMLP
-
-try:
-    from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
-    from sglang.srt.server_args import (
-        get_global_server_args,
-        set_global_server_args_for_scheduler,
-    )
-
-    HAVE_SGLANG_FUSED_MOE_FORWARD = True
-except ImportError:
-    MoeRunnerConfig = None
-    StandardTopKOutput = None
-    fused_experts = None
-    get_global_server_args = None
-    set_global_server_args_for_scheduler = None
-    HAVE_SGLANG_FUSED_MOE_FORWARD = False
+from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class SGLangGroupedMLP(GroupedMLP):
-    """GroupedMLP subclass exposing the SGLang local-masked fused expert call."""
+    """GroupedMLP subclass that provides SGLang-compatible weight accessors.
 
-    def forward_sglang_local_masked_topk(
+    The only responsibility of this class is to reshape/permute Megatron's
+    weight tensors into the layout that SGLang's fused_experts kernel expects:
+      - w1 (gate+up): [num_local_experts, hidden_size, 2*intermediate] ->
+                       SGLang wants [num_local_experts, 2*intermediate, hidden_size]
+      - w2 (down):    [num_local_experts, intermediate, hidden_size] ->
+                       SGLang wants [num_local_experts, hidden_size, intermediate]
+
+    All forward computation is in sgl_fused_moe.forward or autograd.py.
+    """
+
+    def __init__(
         self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        global_topk_ids: torch.Tensor,
-        local_expert_indices: list[int],
-    ) -> torch.Tensor:
-        """Run SGLang's local-masked fused expert path with precomputed top-k.
+        num_local_experts: int,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        MegatronModule.__init__(self, config=config)
+        self.config: TransformerConfig = config
+        self.num_local_experts = num_local_experts
+        if pg_collection is None:
+            raise ValueError("SGLangGroupedMLP requires a ProcessGroupCollection")
+        assert (
+            config.add_bias_linear == False
+        ), "bias not supported in SGLangGroupedMLP, please set '--disable-bias-linear'."
+        assert (
+            config.moe_latent_size is None
+        ), "MoE latent projection not supported in SGLangGroupedMLP."
 
-        The caller can use this when it already has SGLang-ordered top-k ids and
-        weights.  This avoids materializing a full sparse routing matrix and
-        avoids running stable-topk twice in the Megatron exact no-grad path.
-        """
-        if torch.is_grad_enabled():
-            raise RuntimeError("SGLang local-masked MoE fused path is inference-only")
-        if not HAVE_SGLANG_FUSED_MOE_FORWARD:
-            raise RuntimeError("SGLang fused MoE forward path is not available")
-        if hidden_states.numel() == 0:
-            return torch.empty_like(hidden_states)
+        self.expert_parallel = config.expert_model_parallel_size > 1
+        self.ep_group = pg_collection.ep
+        self.tp_group = pg_collection.expt_tp
+        self.dp_group = pg_collection.expt_dp
 
-        self._ensure_sglang_server_args()
+        tp_size = self.tp_group.size()
+        tp_rank = self.tp_group.rank()
 
-        flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        if flat_hidden_states.dtype != self.weight1.dtype:
-            flat_hidden_states = flat_hidden_states.to(self.weight1.dtype)
+        fc1_output_size = self.config.moe_ffn_hidden_size * self.num_local_experts
+        if config.gated_linear_unit:
+            fc1_output_size *= 2
+        fc1_output_size_per_partition = divide(fc1_output_size, tp_size)
 
-        local_topk_ids = self._local_masked_topk_ids(global_topk_ids, local_expert_indices)
-        topk_weights = topk_weights.to(
-            device=flat_hidden_states.device,
-            dtype=flat_hidden_states.dtype,
+        fc2_input_size = self.config.moe_ffn_hidden_size * self.num_local_experts
+        fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
+
+        if config.use_cpu_initialization:
+            self.weight1 = Parameter(
+                torch.empty(
+                    self.config.hidden_size,
+                    fc1_output_size_per_partition,
+                    dtype=config.params_dtype,
+                )
+            )
+            self.weight2 = Parameter(
+                torch.empty(
+                    fc2_input_size_per_partition,
+                    self.config.hidden_size,
+                    dtype=config.params_dtype,
+                )
+            )
+            if config.perform_initialization:
+                _initialize_affine_weight_cpu(
+                    self.weight1,
+                    self.config.hidden_size,
+                    fc1_output_size,
+                    fc1_output_size_per_partition,
+                    partition_dim=1,
+                    init_method=config.init_method,
+                    params_dtype=config.params_dtype,
+                    rank=tp_rank,
+                    world_size=tp_size,
+                )
+                _initialize_affine_weight_cpu(
+                    self.weight2,
+                    fc2_input_size,
+                    self.config.hidden_size,
+                    fc2_input_size_per_partition,
+                    partition_dim=0,
+                    init_method=config.output_layer_init_method,
+                    params_dtype=config.params_dtype,
+                    rank=tp_rank,
+                    world_size=tp_size,
+                )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight1, is_parallel=True, dim=1, stride=1
+                )
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight2, is_parallel=True, dim=0, stride=1
+                )
+        else:
+            self.weight1 = Parameter(
+                torch.empty(
+                    self.config.hidden_size,
+                    fc1_output_size_per_partition,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
+                )
+            )
+            self.weight2 = Parameter(
+                torch.empty(
+                    fc2_input_size_per_partition,
+                    self.config.hidden_size,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
+                )
+            )
+            if config.perform_initialization:
+                _initialize_affine_weight_gpu(
+                    self.weight1, config.init_method, partition_dim=1, is_expert=True
+                )
+                _initialize_affine_weight_gpu(
+                    self.weight2, config.output_layer_init_method, partition_dim=0, is_expert=True
+                )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight1, is_parallel=True, dim=1, stride=1
+                )
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight2, is_parallel=True, dim=0, stride=1
+                )
+        setattr(self.weight1, "allreduce", not self.expert_parallel)
+        setattr(self.weight2, "allreduce", not self.expert_parallel)
+
+        def remove_extra_states_check(self, incompatible_keys):
+            keys = list(incompatible_keys.unexpected_keys)
+            for key in keys:
+                if "_extra_state" in key:
+                    incompatible_keys.unexpected_keys.remove(key)
+
+        self.register_load_state_dict_post_hook(remove_extra_states_check)
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError(
+            "SGLangGroupedMLP is only a weight-layout adapter; MoE execution must "
+            "go through the true-on-policy SGLang fused MoE path."
         )
 
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights,
-            topk_ids=local_topk_ids,
-            router_logits=None,
-        )
-        runner_config = MoeRunnerConfig(
-            # Keep this as the global expert count. SGLang uses num_experts !=
-            # num_local_experts under EP, which selects the filtered activation
-            # kernel path in fused_experts.
-            num_experts=self.config.num_moe_experts,
-            num_local_experts=self.num_local_experts,
-            hidden_size=self.config.hidden_size,
-            intermediate_size_per_partition=self.config.moe_ffn_hidden_size,
-            top_k=topk_weights.shape[-1],
-            params_dtype=self.config.params_dtype,
-            activation="silu",
-            is_gated=True,
-            apply_router_weight_on_input=False,
-            inplace=True,
-            no_combine=False,
-        )
-
-        return fused_experts(
-            hidden_states=flat_hidden_states.contiguous(),
-            w1=self._sglang_w13_weight(),
-            w2=self._sglang_w2_weight(),
-            topk_output=topk_output,
-            moe_runner_config=runner_config,
-        )
-
-    def _local_masked_topk_ids(
-        self,
-        global_topk_ids: torch.Tensor,
-        local_expert_indices: list[int],
-    ) -> torch.Tensor:
-        expert_start = int(local_expert_indices[0])
-        expert_end = expert_start + self.num_local_experts
-        local_ids = global_topk_ids.to(torch.int32) - expert_start
-        local_mask = (global_topk_ids >= expert_start) & (global_topk_ids < expert_end)
-        return torch.where(local_mask, local_ids, torch.full_like(local_ids, -1))
-
-    def _sglang_w13_weight(self) -> torch.Tensor:
+    def sglang_w13_weight(self) -> torch.Tensor:
+        """Return w1 (gate+up projection) in SGLang layout: [E, 2*I, H]."""
         return self._cached_sglang_weight(
             cache_name="_sglang_w13_weight_cache",
             weight=self.weight1,
@@ -118,7 +174,8 @@ class SGLangGroupedMLP(GroupedMLP):
             permute_dims=(0, 2, 1),
         )
 
-    def _sglang_w2_weight(self) -> torch.Tensor:
+    def sglang_w2_weight(self) -> torch.Tensor:
+        """Return w2 (down projection) in SGLang layout: [E, H, I]."""
         return self._cached_sglang_weight(
             cache_name="_sglang_w2_weight_cache",
             weight=self.weight2,
@@ -157,18 +214,3 @@ class SGLangGroupedMLP(GroupedMLP):
             )
             setattr(self, cache_name, cached)
         return cached[1]
-
-    @staticmethod
-    def _ensure_sglang_server_args() -> None:
-        if not HAVE_SGLANG_FUSED_MOE_FORWARD:
-            raise RuntimeError("SGLang server args helpers are not available")
-
-        try:
-            get_global_server_args()
-        except ValueError:
-            set_global_server_args_for_scheduler(
-                SimpleNamespace(
-                    enable_fused_moe_sum_all_reduce=False,
-                    enable_deterministic_inference=True,
-                )
-            )
