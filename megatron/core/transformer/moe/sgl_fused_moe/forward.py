@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.server_args import get_global_server_args, set_global_server_args_for_scheduler
 
@@ -24,7 +24,6 @@ def _ensure_server_args():
             SimpleNamespace(
                 enable_fused_moe_sum_all_reduce=False,
                 enable_deterministic_inference=True,
-                rl_on_policy_target="fsdp_tp",
             )
         )
 

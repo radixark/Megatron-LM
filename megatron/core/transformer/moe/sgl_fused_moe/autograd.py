@@ -11,10 +11,12 @@ import os
 
 import torch
 import triton.language as tl
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import silu_and_mul
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
     invoke_fused_moe_kernel,
+)
+from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
-    silu_and_mul,
 )
 
 from .forward import remap_global_to_local_expert_ids, sglang_moe_forward
