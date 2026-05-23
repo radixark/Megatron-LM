@@ -82,6 +82,29 @@ except ImportError:
     HAVE_APEX = False
 
 
+_DENSE_MLP_SHARDED_STATE_DICT_KEYS_MAP = {
+    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
+    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
+    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
+    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
+}
+
+
+def _dense_mlp_sharded_state_dict_keys_map(num_experts: Optional[int]) -> dict[str, str]:
+    if num_experts is not None:
+        return {}
+    return dict(_DENSE_MLP_SHARDED_STATE_DICT_KEYS_MAP)
+
+
+def _local_layer_norm_sharded_state_dict_keys_map(num_experts: Optional[int]) -> dict[str, str]:
+    keys_map = {"input_layernorm.": "self_attention.linear_qkv.layer_norm_"}
+    if num_experts is None:
+        keys_map["pre_mlp_layernorm."] = "mlp.linear_fc1.layer_norm_"
+    return keys_map
+
+
 def get_gpt_layer_with_inference_spec(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
@@ -166,14 +189,7 @@ def get_gpt_layer_with_inference_spec(
                 pre_mlp_layernorm=IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                sharded_state_dict_keys_map={
-                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
-                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
-                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
-                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
-                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
-                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
-                },
+                sharded_state_dict_keys_map=dict(_DENSE_MLP_SHARDED_STATE_DICT_KEYS_MAP),
             ),
         )
 
@@ -308,14 +324,9 @@ def get_gpt_layer_with_transformer_engine_spec(
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
                 post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
-                sharded_state_dict_keys_map={
-                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
-                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
-                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
-                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
-                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
-                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
-                },
+                sharded_state_dict_keys_map=_dense_mlp_sharded_state_dict_keys_map(
+                    num_experts
+                ),
             ),
         )
 
@@ -455,10 +466,9 @@ def get_gpt_layer_local_spec(
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=bias_dropout_add,
-                sharded_state_dict_keys_map={
-                    "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
-                    "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
-                },
+                sharded_state_dict_keys_map=_local_layer_norm_sharded_state_dict_keys_map(
+                    num_experts
+                ),
             ),
         )
 

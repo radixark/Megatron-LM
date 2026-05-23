@@ -28,11 +28,20 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
+from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
+    forward_compacted_true_on_policy_padding,
+    run_direct_sglang_ep_forward,
+    uses_true_on_policy_moe_kernel,
+)
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import (
+        TELinear,
+        set_save_original_input,
+        te_checkpoint,
+    )
 
     HAVE_TE = True
 except ImportError:
@@ -389,10 +398,21 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
+        use_true_on_policy_moe_kernel = uses_true_on_policy_moe_kernel(self)
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors, padding_mask=None):
+            shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
+                    if use_true_on_policy_moe_kernel:
+                        return run_direct_sglang_ep_forward(
+                            self,
+                            hidden_states,
+                            padding_mask,
+                            intermediate_tensors,
+                        )
+
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
@@ -433,7 +453,21 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        if self.moe_layer_recompute:
+        use_compact = (
+            use_true_on_policy_moe_kernel
+            and padding_mask is not None
+            and intermediate_tensors is None
+            and padding_mask.dtype == torch.bool
+            and bool(padding_mask.any().item())
+            and not self.use_shared_expert
+            and not self.config.moe_latent_size
+        )
+
+        if use_compact:
+            outputs = forward_compacted_true_on_policy_padding(
+                hidden_states, padding_mask, custom_forward
+            )
+        elif self.moe_layer_recompute:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
                     custom_forward,
@@ -464,6 +498,4 @@ class MoELayer(BaseMoELayer):
         # If shared_experts_recompute is used, nothing needs to be done because the checkpoint
         # function will save the original input tensors.
         if self.shared_experts is not None and not self.shared_experts_recompute:
-            from megatron.core.extensions.transformer_engine import set_save_original_input
-
             set_save_original_input(self.shared_experts.linear_fc1)
