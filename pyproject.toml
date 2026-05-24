@@ -14,7 +14,13 @@ include-package-data = true
 # explicit PYTHONPATH override. (megatron.training.initialize imports from
 # megatron.legacy at module load, so any narrower include list breaks
 # transitively.)
+#
+# `namespaces = true` is required because `megatron`, `megatron.legacy`, and
+# several sub-packages are namespace packages (no `__init__.py`). Without
+# this, find_packages skips them and the editable install only works via the
+# side-effect that pip adds the project root to sys.path.
 include = ["megatron*"]
+namespaces = true
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
