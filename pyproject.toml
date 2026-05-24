@@ -8,7 +8,15 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["megatron.core", "megatron.core.*"]
+# Expose megatron.training in addition to megatron.core so callers (e.g. the
+# miles training runner) can `pip install -e .` this checkout and import
+# from `megatron.training.*` without an explicit PYTHONPATH override.
+include = [
+    "megatron.core",
+    "megatron.core.*",
+    "megatron.training",
+    "megatron.training.*",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
