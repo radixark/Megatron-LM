@@ -24,7 +24,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
-from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.residual_carrier import (
+    append_sglang_residual_shape_if_needed,
+    is_sglang_residual_pair_output,
+)
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
@@ -42,6 +45,17 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _as_pipeline_tensor_list(tensors):
+    return tensors if isinstance(tensors, list) else [tensors]
+
+
+def _first_pipeline_tensor(tensors):
+    for tensor in _as_pipeline_tensor_list(tensors):
+        if tensor is not None:
+            return tensor
+    raise RuntimeError("Expected at least one pipeline tensor, got only None values.")
 
 
 def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
@@ -169,15 +183,13 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
 
 def deallocate_output_tensors(outputs, deallocate_pipeline_outputs=False):
     """Deallocate one or more pipeline outputs after the send has completed."""
-    if not isinstance(outputs, list):
-        outputs = [outputs]
-    if len(outputs) > 1:
-        # The true-on-policy PP carrier sends [hidden_states, residual].  Mutating
+    if is_sglang_residual_pair_output(outputs):
+        # The true-on-policy PP carrier sends [hidden_states, residual]. Mutating
         # both TensorImpls to scalar placeholders can corrupt backward metadata for
         # the residual path under full activation recompute, producing NaN wgrads
         # from an otherwise zero upstream gradient.
         return
-    for output in outputs:
+    for output in _as_pipeline_tensor_list(outputs):
         deallocate_output_tensor(output, deallocate_pipeline_outputs)
 
 
@@ -217,7 +229,10 @@ def custom_backward_multiple(outputs, grad_outputs):
     """Directly call the C++ autograd engine for multiple pipeline outputs."""
     tensors = []
     grad_tensors = []
+    assert len(outputs) == len(grad_outputs), "outputs and grad_outputs must have the same length."
     for output, grad_output in zip(outputs, grad_outputs):
+        if output is None:
+            continue
         if not output.requires_grad:
             continue
         if grad_output is None:
@@ -322,7 +337,7 @@ def forward_step_calc_loss(
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-        device_tensor = output_tensor[0] if isinstance(output_tensor, list) else output_tensor
+        device_tensor = _first_pipeline_tensor(output_tensor)
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
             config.grad_scale_func(torch.ones(1, device=device_tensor.device))
@@ -339,7 +354,7 @@ def forward_step_calc_loss(
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-        device_tensor = output_tensor[0] if isinstance(output_tensor, list) else output_tensor
+        device_tensor = _first_pipeline_tensor(output_tensor)
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
             config.grad_scale_func(torch.ones(1, device=device_tensor.device))
@@ -517,10 +532,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         if x is not None:
             x.retain_grad()
 
-    if not isinstance(output_tensor, list):
-        output_tensor = [output_tensor]
-    if not isinstance(output_tensor_grad, list):
-        output_tensor_grad = [output_tensor_grad]
+    output_tensor = _as_pipeline_tensor_list(output_tensor)
+    output_tensor_grad = _as_pipeline_tensor_list(output_tensor_grad)
 
     # Backward pass.
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
@@ -2158,12 +2171,12 @@ def get_tensor_shapes(
 
     tensor_shape = (effective_seq_length, micro_batch_size, config.hidden_size)
     tensor_shapes.append(tensor_shape)
-    true_on_policy_policy = resolve_true_on_policy_runtime_policy(config)
-    if (
-        true_on_policy_policy.use_sglang_residual_pair
-        and parallel_state.get_pipeline_model_parallel_world_size() > 1
-    ):
-        tensor_shapes.append(tensor_shape)
+    append_sglang_residual_shape_if_needed(
+        config,
+        tensor_shapes,
+        tensor_shape,
+        pipeline_model_parallel_world_size=parallel_state.get_pipeline_model_parallel_world_size(),
+    )
     return tensor_shapes
 
 

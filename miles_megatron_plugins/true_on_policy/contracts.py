@@ -49,6 +49,7 @@ class MegatronTrueOnPolicyRuntimePolicy:
     deterministic_moe_routing: bool
     moe_topk_tiebreak: Optional[str]
     deterministic_moe_dispatch: bool
+    deterministic_moe_combine: bool
     ep_invariant_moe: bool
 
     def requires_kernel(self, kernel_contract: KernelContract) -> bool:
@@ -78,6 +79,7 @@ DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
     deterministic_moe_routing=False,
     moe_topk_tiebreak=None,
     deterministic_moe_dispatch=False,
+    deterministic_moe_combine=False,
     ep_invariant_moe=False,
 )
 
@@ -121,6 +123,7 @@ class MegatronTrueOnPolicyContract:
             deterministic_moe_routing=is_moe,
             moe_topk_tiebreak="stable_sort" if is_moe else None,
             deterministic_moe_dispatch=is_moe and uses_ep,
+            deterministic_moe_combine=is_moe,
             ep_invariant_moe=is_moe and uses_ep,
         )
 
@@ -163,3 +166,15 @@ def resolve_true_on_policy_runtime_policy(config) -> MegatronTrueOnPolicyRuntime
 
     validate_true_on_policy_contract(contract_name)
     return get_true_on_policy_contract(contract_name).policy_for(config)
+
+
+def deterministic_row_parallel_reduce_enabled(config) -> bool:
+    return resolve_true_on_policy_runtime_policy(config).deterministic_row_parallel_reduce
+
+
+def deterministic_moe_combine_enabled(config) -> bool:
+    return resolve_true_on_policy_runtime_policy(config).deterministic_moe_combine
+
+
+def sglang_residual_pair_enabled(config) -> bool:
+    return resolve_true_on_policy_runtime_policy(config).use_sglang_residual_pair

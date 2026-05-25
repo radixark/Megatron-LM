@@ -130,6 +130,18 @@ def _split_along_first_dim_with_sizes(input_, group, split_sizes):
     return torch.split(input_, split_sizes, dim=0)[rank].contiguous()
 
 
+def _deterministic_reduce_scatter_along_first_dim(
+    input_,
+    group,
+    input_split_sizes=None,
+):
+    """Apply SGLang-style fixed-order TP reduction, then split along sequence dim."""
+    reduced = _tree_all_reduce_sum(input_, group)
+    if input_split_sizes is None:
+        return _split_along_first_dim(reduced, group)
+    return _split_along_first_dim_with_sizes(reduced, group, input_split_sizes)
+
+
 def _gather_along_last_dim(input_, group):
     """Gather tensors and concatinate along the last dimension."""
 
@@ -455,10 +467,7 @@ class _DeterministicReduceScatterToSequenceParallelRegion(torch.autograd.Functio
     @staticmethod
     def symbolic(graph, input_, group, input_split_sizes=None, use_global_buffer=False):
         """Symbolic function for tracing."""
-        reduced = _tree_all_reduce_sum(input_, group)
-        if input_split_sizes is None:
-            return _split_along_first_dim(reduced, group)
-        return _split_along_first_dim_with_sizes(reduced, group, input_split_sizes)
+        return _deterministic_reduce_scatter_along_first_dim(input_, group, input_split_sizes)
 
     @staticmethod
     def forward(ctx, input_, group, input_split_sizes=None, use_global_buffer=False):
@@ -466,10 +475,7 @@ class _DeterministicReduceScatterToSequenceParallelRegion(torch.autograd.Functio
         ctx.group = group
         ctx.input_split_sizes = input_split_sizes
         ctx.use_global_buffer = use_global_buffer
-        reduced = _tree_all_reduce_sum(input_, group)
-        if input_split_sizes is None:
-            return _split_along_first_dim(reduced, group)
-        return _split_along_first_dim_with_sizes(reduced, group, input_split_sizes)
+        return _deterministic_reduce_scatter_along_first_dim(input_, group, input_split_sizes)
 
     @staticmethod
     def backward(ctx, grad_output):

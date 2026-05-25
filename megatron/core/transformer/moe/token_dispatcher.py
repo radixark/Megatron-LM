@@ -36,6 +36,7 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+from miles_megatron_plugins.true_on_policy.contracts import deterministic_moe_combine_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +49,6 @@ logger = logging.getLogger(__name__)
      num_local_tokens: S/TP*B
      num_global_tokens: num_local_tokens*TP*EP
 """
-
-def _deterministic_moe_combine_enabled(config: TransformerConfig) -> bool:
-    from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
-
-    return resolve_true_on_policy_runtime_policy(config).deterministic_moe_combine
 
 
 class MoETokenDispatcher:
@@ -343,7 +339,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             hidden_states = reduce_scatter_to_sequence_parallel_region(
                 hidden_states.to(self.local_probs.dtype),
                 group=self.tp_ep_group,
-                deterministic=_deterministic_moe_combine_enabled(self.config),
+                deterministic=deterministic_moe_combine_enabled(self.config),
             ).to(hidden_states.dtype)
         return hidden_states
 
@@ -787,7 +783,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 hidden_states.to(self.probs.dtype),
                 group=self.tp_group,
                 input_split_sizes=input_split_sizes,
-                deterministic=_deterministic_moe_combine_enabled(self.config),
+                deterministic=deterministic_moe_combine_enabled(self.config),
             ).to(hidden_states.dtype)
 
         return hidden_states
