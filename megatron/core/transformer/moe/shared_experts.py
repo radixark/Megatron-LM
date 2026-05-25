@@ -25,6 +25,9 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_sharded_tensor_for_checkpoint,
 )
+from miles_megatron_plugins.true_on_policy.contracts import (
+    deterministic_row_parallel_reduce_enabled,
+)
 
 
 class SharedExpertMLP(MLP):
@@ -246,14 +249,17 @@ class SharedExpertMLP(MLP):
         """
         assert self.config.moe_shared_expert_overlap
         assert self.cached_fc2_output is not None
+        deterministic_reduce = deterministic_row_parallel_reduce_enabled(self.config)
         with torch.cuda.stream(self.stream):
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output,
+                    deterministic=deterministic_reduce,
                 )
             else:
                 self.cached_output = reduce_from_tensor_model_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output,
+                    deterministic=deterministic_reduce,
                 )
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)

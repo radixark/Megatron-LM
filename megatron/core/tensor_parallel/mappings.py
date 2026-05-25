@@ -114,6 +114,34 @@ def _split_along_first_dim(input_, group):
     return output
 
 
+def _split_along_first_dim_with_sizes(input_, group, split_sizes):
+    """Split the tensor along its first dimension with explicit per-rank sizes."""
+    assert group is not None, "group should not be None"
+
+    world_size = group.size()
+    if world_size == 1:
+        return input_
+
+    assert split_sizes is not None
+    assert len(split_sizes) == world_size
+    assert input_.size(0) == sum(split_sizes)
+
+    rank = group.rank()
+    return torch.split(input_, split_sizes, dim=0)[rank].contiguous()
+
+
+def _deterministic_reduce_scatter_along_first_dim(
+    input_,
+    group,
+    input_split_sizes=None,
+):
+    """Apply SGLang-style fixed-order TP reduction, then split along sequence dim."""
+    reduced = _tree_all_reduce_sum(input_, group)
+    if input_split_sizes is None:
+        return _split_along_first_dim(reduced, group)
+    return _split_along_first_dim_with_sizes(reduced, group, input_split_sizes)
+
+
 def _gather_along_last_dim(input_, group):
     """Gather tensors and concatinate along the last dimension."""
 
@@ -433,6 +461,35 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         )
 
 
+class _DeterministicReduceScatterToSequenceParallelRegion(torch.autograd.Function):
+    """Deterministic TP tree reduction followed by sequence-parallel split."""
+
+    @staticmethod
+    def symbolic(graph, input_, group, input_split_sizes=None, use_global_buffer=False):
+        """Symbolic function for tracing."""
+        return _deterministic_reduce_scatter_along_first_dim(input_, group, input_split_sizes)
+
+    @staticmethod
+    def forward(ctx, input_, group, input_split_sizes=None, use_global_buffer=False):
+        """Forward function."""
+        ctx.group = group
+        ctx.input_split_sizes = input_split_sizes
+        ctx.use_global_buffer = use_global_buffer
+        return _deterministic_reduce_scatter_along_first_dim(input_, group, input_split_sizes)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward function."""
+        input_split_sizes = ctx.input_split_sizes
+        use_global_buffer = ctx.use_global_buffer
+        return (
+            _gather_along_first_dim(grad_output, ctx.group, input_split_sizes, use_global_buffer),
+            None,
+            None,
+            None,
+        )
+
+
 class _AllGatherFromTensorParallelRegion(torch.autograd.Function):
     """Gather the input from model parallel region and concatenate."""
 
@@ -569,10 +626,14 @@ def gather_from_sequence_parallel_region(
 
 
 def reduce_scatter_to_sequence_parallel_region(
-    input_, group=None, input_split_sizes=None, use_global_buffer=False
+    input_, group=None, input_split_sizes=None, use_global_buffer=False, deterministic=False
 ):
     """Wrapper for autograd function: forward: RS, backward AG <fisrt dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
+    if deterministic:
+        return _DeterministicReduceScatterToSequenceParallelRegion.apply(
+            input_, group, input_split_sizes, use_global_buffer
+        )
     return _ReduceScatterToSequenceParallelRegion.apply(
         input_, group, input_split_sizes, use_global_buffer
     )

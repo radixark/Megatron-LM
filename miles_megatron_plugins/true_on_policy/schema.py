@@ -35,7 +35,7 @@ QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema(
     logprob_contract="sglang_prefill",
     sglang_attention_backend="fa3",
     fsdp_attention_implementation="flash_attention_3",
-    disable_megatron_sequence_parallel=True,
+    disable_megatron_sequence_parallel=False,
 )
 
 QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema(
@@ -45,5 +45,5 @@ QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema(
     logprob_contract="sglang_prefill",
     sglang_attention_backend="fa3",
     fsdp_attention_implementation="flash_attention_3",
-    disable_megatron_sequence_parallel=True,
+    disable_megatron_sequence_parallel=False,
 )

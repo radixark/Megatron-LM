@@ -31,6 +31,7 @@ from megatron.core.utils import internal_api
 from miles_megatron_plugins.true_on_policy.moe_layer_ext import (
     forward_compacted_true_on_policy_padding,
     run_direct_sglang_ep_forward,
+    should_compact_true_on_policy_padding,
     uses_true_on_policy_moe_kernel,
 )
 
@@ -391,8 +392,9 @@ class MoELayer(BaseMoELayer):
         """
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
-                "During training, performance may degrade if MoE and tensor parallelism"
-                "are enabled without also enabling sequence parallelism."
+                "Megatron MoE training with attention TP requires sequence parallel. "
+                "TODO: add a true-on-policy path for attention TP without sequence parallel "
+                "if that topology becomes necessary."
             )
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
@@ -405,14 +407,6 @@ class MoELayer(BaseMoELayer):
             shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
-                    if use_true_on_policy_moe_kernel:
-                        return run_direct_sglang_ep_forward(
-                            self,
-                            hidden_states,
-                            padding_mask,
-                            intermediate_tensors,
-                        )
-
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
@@ -453,24 +447,28 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        use_compact = (
-            use_true_on_policy_moe_kernel
-            and padding_mask is not None
-            and intermediate_tensors is None
-            and padding_mask.dtype == torch.bool
-            and bool(padding_mask.any().item())
-            and not self.use_shared_expert
-            and not self.config.moe_latent_size
-        )
+        def true_on_policy_forward(hidden_states, intermediate_tensors, padding_mask=None):
+            if "route" not in self.fwd_execution_map:
+                return custom_forward(hidden_states, intermediate_tensors, padding_mask)
+            return run_direct_sglang_ep_forward(
+                self,
+                hidden_states,
+                padding_mask,
+                intermediate_tensors,
+            )
+
+        forward_impl = true_on_policy_forward if use_true_on_policy_moe_kernel else custom_forward
+
+        use_compact = should_compact_true_on_policy_padding(self, padding_mask, intermediate_tensors)
 
         if use_compact:
             outputs = forward_compacted_true_on_policy_padding(
-                hidden_states, padding_mask, custom_forward
+                hidden_states, padding_mask, forward_impl
             )
         elif self.moe_layer_recompute:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
-                    custom_forward,
+                    forward_impl,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
@@ -479,10 +477,10 @@ class MoELayer(BaseMoELayer):
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, padding_mask
+                    forward_impl, False, hidden_states, padding_mask
                 )
         else:
-            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+            outputs = forward_impl(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
 

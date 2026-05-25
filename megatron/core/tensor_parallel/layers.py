@@ -30,7 +30,9 @@ from megatron.core.utils import (
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
-from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.contracts import (
+    deterministic_row_parallel_reduce_enabled,
+)
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -224,6 +226,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.embedding_dim = embedding_dim
         self.reduce_scatter_embeddings = reduce_scatter_embeddings
         self.tp_group = tp_group
+        self.config = config
 
         self.tp_group = get_tensor_model_parallel_group_if_none(self.tp_group)
 
@@ -298,15 +301,22 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0
 
+        deterministic_reduce = deterministic_row_parallel_reduce_enabled(self.config)
         if self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             output_parallel = output_parallel.transpose(0, 1).contiguous()
             output = reduce_scatter_to_sequence_parallel_region(
-                output_parallel, group=self.tp_group
+                output_parallel,
+                group=self.tp_group,
+                deterministic=deterministic_reduce,
             )
         else:
             # Reduce across all the model parallel GPUs.
-            output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+            output = reduce_from_tensor_model_parallel_region(
+                output_parallel,
+                group=self.tp_group,
+                deterministic=deterministic_reduce,
+            )
         return output
 
     def sharded_state_dict(
@@ -1438,20 +1448,21 @@ class RowParallelLinear(torch.nn.Module):
         )
 
         # All-reduce across all the partitions.
+        deterministic_reduce = deterministic_row_parallel_reduce_enabled(self.config)
         if self.explicit_expert_comm:
             assert self.skip_bias_add
             output_ = output_parallel
         elif self.sequence_parallel:
             output_ = reduce_scatter_to_sequence_parallel_region(
-                output_parallel, group=self.tp_group
+                output_parallel,
+                group=self.tp_group,
+                deterministic=deterministic_reduce,
             )
         else:
             output_ = reduce_from_tensor_model_parallel_region(
                 output_parallel,
                 group=self.tp_group,
-                deterministic=resolve_true_on_policy_runtime_policy(
-                    self.config
-                ).deterministic_row_parallel_reduce,
+                deterministic=deterministic_reduce,
             )
         if not self.skip_bias_add:
             output = (output_ + self.bias) if self.bias is not None else output_

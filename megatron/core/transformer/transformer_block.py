@@ -31,6 +31,12 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
 from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.residual_carrier import (
+    attach_sglang_residual,
+    get_sglang_residual,
+    pack_sglang_pipeline_output,
+    unpack_sglang_pipeline_input,
+)
 from miles_megatron_plugins.true_on_policy.sglang_backend import SGLangFinalRMSNorm, SGLangNorm
 from megatron.core.utils import (
     WrappedTensor,
@@ -532,8 +538,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 padding_mask=None,
                 sglang_residual=None,
             ):
-                if use_sglang_residual_pair and sglang_residual is not None:
-                    hidden_states._sglang_residual = sglang_residual
+                if use_sglang_residual_pair:
+                    hidden_states = attach_sglang_residual(hidden_states, sglang_residual)
 
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -567,7 +573,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             padding_mask=padding_mask,
                         )
                 if use_sglang_residual_pair:
-                    return hidden_states, context, getattr(hidden_states, "_sglang_residual", None)
+                    return hidden_states, context, get_sglang_residual(hidden_states)
                 return hidden_states, context
 
             return custom_forward
@@ -634,9 +640,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     *checkpoint_args,
                 )
 
-        sglang_residual = (
-            getattr(hidden_states, "_sglang_residual", None) if use_sglang_residual_pair else None
-        )
+        sglang_residual = get_sglang_residual(hidden_states) if use_sglang_residual_pair else None
         if self.config.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
@@ -694,8 +698,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         else:
             raise ValueError("Invalid activation recompute method.")
 
-        if use_sglang_residual_pair and sglang_residual is not None:
-            hidden_states._sglang_residual = sglang_residual
+        if use_sglang_residual_pair:
+            hidden_states = attach_sglang_residual(hidden_states, sglang_residual)
         return hidden_states
 
     def set_input_tensor(self, input_tensor: Tensor):
@@ -706,7 +710,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         model's forward_step_func won't have it. This function is thus
         used by internal code to bypass the input provided by the
         forward_step_func"""
-        self.input_tensor = input_tensor
+        self.input_tensor, self._sglang_input_residual = unpack_sglang_pipeline_input(
+            input_tensor, owner=type(self).__name__
+        )
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """
@@ -816,6 +822,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
+            sglang_input_residual = getattr(self, "_sglang_input_residual", None)
+        else:
+            sglang_input_residual = None
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -833,6 +842,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+        if true_on_policy_policy.use_sglang_residual_pair:
+            hidden_states = attach_sglang_residual(hidden_states, sglang_input_residual)
+        if hasattr(self, "_sglang_input_residual"):
+            del self._sglang_input_residual
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -920,7 +934,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.final_layernorm is not None:
             true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
             sglang_residual = (
-                getattr(hidden_states, "_sglang_residual", None)
+                get_sglang_residual(hidden_states)
                 if true_on_policy_policy.use_sglang_residual_pair
                 else None
             )
@@ -947,6 +961,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # on the computational graph and will lead to unexpected errors in pipeline schedules.
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
+
+        if not self.post_process:
+            return pack_sglang_pipeline_output(self.config, hidden_states)
 
         return hidden_states
 

@@ -28,6 +28,10 @@ from miles_megatron_plugins.true_on_policy.debug import (
     register_activation_grad_debug,
     register_norm_grad_debug as _register_norm_grad_debug,
 )
+from miles_megatron_plugins.true_on_policy.residual_carrier import (
+    attach_sglang_residual,
+    get_sglang_residual,
+)
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
@@ -599,7 +603,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # pair across layer boundaries to match SGLang's LayerCommunicator flow.
         true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
         sglang_carried_residual = (
-            getattr(hidden_states, "_sglang_residual", None)
+            get_sglang_residual(hidden_states)
             if true_on_policy_policy.use_sglang_residual_pair
             else None
         )
@@ -939,7 +943,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
         if true_on_policy_policy.use_sglang_residual_pair:
-            output._sglang_residual = residual
+            output = attach_sglang_residual(output, residual)
 
         return output
 

@@ -39,6 +39,10 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.residual_carrier import (
+    pack_sglang_pipeline_input,
+    unpack_sglang_pipeline_input,
+)
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
@@ -343,13 +347,10 @@ class GPTModel(LanguageModule):
         Args:
             input_tensor (Tensor): Sets the input tensor for the model.
         """
-        # This is usually handled in schedules.py but some inference code still
-        # gives us non-lists or None
-        if not isinstance(input_tensor, list):
-            input_tensor = [input_tensor]
-
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
-        self.decoder.set_input_tensor(input_tensor[0])
+        hidden_states, residual = unpack_sglang_pipeline_input(
+            input_tensor, owner=type(self).__name__
+        )
+        self.decoder.set_input_tensor(pack_sglang_pipeline_input(hidden_states, residual))
 
     def _preprocess(
         self,

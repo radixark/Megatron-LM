@@ -33,7 +33,21 @@ from miles_megatron_plugins.true_on_policy.sglang_backend import (
     is_sglang_rope_enabled,
     resolve_true_on_policy_runtime_policy,
 )
-from miles_megatron_plugins.true_on_policy.contracts import get_true_on_policy_contract
+from miles_megatron_plugins.true_on_policy.contracts import (
+    deterministic_moe_combine_enabled,
+    deterministic_row_parallel_reduce_enabled,
+    get_true_on_policy_contract,
+    sglang_residual_pair_enabled,
+)
+from miles_megatron_plugins.true_on_policy.residual_carrier import (
+    append_sglang_residual_shape_if_needed,
+    attach_sglang_residual,
+    get_sglang_residual,
+    is_sglang_residual_pair_output,
+    pack_sglang_pipeline_input,
+    pack_sglang_pipeline_output,
+    unpack_sglang_pipeline_input,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_layer_specs,
     get_gpt_layer_local_spec,
@@ -209,6 +223,7 @@ def test_contract_object_owns_megatron_runtime_policy_values():
     assert policy.use_sglang_final_norm
     assert policy.use_sglang_residual_pair
     assert not policy.use_ulysses_cp_recompute_fallback
+    assert not policy.deterministic_moe_combine
 
 
 def test_qwen3_moe_contract_splits_tp_cp_and_ep_policy_values():
@@ -235,6 +250,60 @@ def test_qwen3_moe_contract_splits_tp_cp_and_ep_policy_values():
     assert policy.moe_topk_tiebreak == "stable_sort"
     assert policy.ep_invariant_moe
     assert policy.deterministic_moe_dispatch
+    assert policy.deterministic_moe_combine
+
+
+def test_contract_policy_helpers_expose_common_runtime_switches():
+    dense_config = _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1)
+    moe_config = _make_config(
+        expert_model_parallel_size=2,
+        num_moe_experts=8,
+        true_on_policy_contract=QWEN3_MOE_TRUE_ON_POLICY_V1,
+    )
+    default_config = _make_config()
+
+    assert deterministic_row_parallel_reduce_enabled(dense_config)
+    assert sglang_residual_pair_enabled(dense_config)
+    assert not deterministic_moe_combine_enabled(dense_config)
+    assert deterministic_moe_combine_enabled(moe_config)
+    assert not deterministic_row_parallel_reduce_enabled(default_config)
+    assert not sglang_residual_pair_enabled(default_config)
+
+
+def test_sglang_residual_carrier_roundtrip_and_shape_policy():
+    config = _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1)
+    hidden_states = torch.randn(2, 1, 4)
+    residual = torch.randn(2, 1, 4)
+
+    attach_sglang_residual(hidden_states, residual)
+    assert get_sglang_residual(hidden_states) is residual
+
+    output = pack_sglang_pipeline_output(config, hidden_states)
+    assert output[0] is hidden_states
+    assert output[1] is residual
+    assert is_sglang_residual_pair_output(output)
+
+    unpacked_hidden_states, unpacked_residual = unpack_sglang_pipeline_input(output)
+    assert unpacked_hidden_states is hidden_states
+    assert unpacked_residual is residual
+
+    decoder_input = pack_sglang_pipeline_input(hidden_states, residual)
+    assert decoder_input[0] is hidden_states
+    assert decoder_input[1] is residual
+    assert is_sglang_residual_pair_output(decoder_input)
+
+    tensor_shapes = [(2, 1, 4)]
+    append_sglang_residual_shape_if_needed(
+        config,
+        tensor_shapes,
+        tensor_shapes[0],
+        pipeline_model_parallel_world_size=2,
+    )
+    assert tensor_shapes == [(2, 1, 4), (2, 1, 4)]
+
+    attach_sglang_residual(hidden_states, None)
+    assert get_sglang_residual(hidden_states) is None
+    assert pack_sglang_pipeline_output(config, hidden_states) is hidden_states
 
 
 def test_true_on_policy_moe_local_spec_keeps_pre_mlp_layernorm_checkpoint_key():
@@ -687,14 +756,15 @@ def test_sglang_norm_rmsnorm_accepts_residual_pair():
     residual = torch.randn(2, 3, 4, dtype=torch.bfloat16)
 
     actual, actual_residual = norm(x, residual)
-    x_float = x.float() + residual.float()
+    rounded_residual = (x.float() + residual.float()).to(x.dtype)
+    x_float = rounded_residual.float()
     expected = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + norm.eps)
     expected = norm.weight.float() * expected
 
     assert actual.dtype == torch.float32
-    assert actual_residual.dtype == torch.float32
+    assert actual_residual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(actual_residual, x_float)
+    torch.testing.assert_close(actual_residual, rounded_residual)
 
 
 def test_sglang_qk_rmsnorm_matches_source_truth_dtype_boundary():

@@ -46,6 +46,30 @@ def uses_true_on_policy_moe_kernel(moe_layer) -> bool:
     return policy.enabled and policy.requires_kernel(QWEN3_MOE_SGLANG_MATH)
 
 
+def _under_sp_or_attn_tp(moe_layer) -> bool:
+    return moe_layer.config.sequence_parallel or moe_layer.attn_tp_group.size() > 1
+
+
+def should_compact_true_on_policy_padding(
+    moe_layer,
+    padding_mask: Optional[torch.Tensor],
+    intermediate_tensors,
+) -> bool:
+    if padding_mask is None or intermediate_tensors is not None:
+        return False
+    if _under_sp_or_attn_tp(moe_layer):
+        # Under SP / attention-TP, compaction can make all-padding local shards
+        # skip MoE collectives while peer ranks still enter EP communication.
+        return False
+    if moe_layer.use_shared_expert or moe_layer.config.moe_latent_size:
+        return False
+    return (
+        uses_true_on_policy_moe_kernel(moe_layer)
+        and padding_mask.dtype == torch.bool
+        and bool(padding_mask.any().item())
+    )
+
+
 def forward_compacted_true_on_policy_padding(
     hidden_states: torch.Tensor,
     padding_mask: torch.Tensor,
@@ -78,7 +102,6 @@ def run_direct_sglang_ep_forward(
     assert uses_true_on_policy_moe_kernel(moe_layer)
     assert isinstance(moe_layer.experts, SGLangGroupedMLP)
     assert moe_layer.token_dispatcher.ep_size > 1
-    assert not (padding_mask is not None and bool(padding_mask.any().item()))
 
     output = _forward_sglang_ep(moe_layer, hidden_states)
     assert output is not None, "Router config not supported for true-on-policy MoE"
