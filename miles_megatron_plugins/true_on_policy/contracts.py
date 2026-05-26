@@ -5,11 +5,14 @@ from typing import Optional
 
 from .schema import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
+    QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA,
+    KernelContract,
     TrueOnPolicyContractName,
     TrueOnPolicyContractSchema,
 )
 
 QWEN3_DENSE_TRUE_ON_POLICY_V1 = QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA.name
+QWEN3_MOE_TRUE_ON_POLICY_V1 = QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA.name
 
 
 def _cp_comm_type_uses_a2a(cp_comm_type) -> bool:
@@ -26,6 +29,7 @@ class MegatronTrueOnPolicyRuntimePolicy:
 
     contract_name: Optional[str]
     enabled: bool
+    required_kernel_contracts: tuple[KernelContract, ...]
     use_sglang_backend: bool
     batch_invariant_mode: bool
     disable_rope_fusion: bool
@@ -42,11 +46,19 @@ class MegatronTrueOnPolicyRuntimePolicy:
     use_sglang_final_norm: bool
     use_sglang_residual_pair: bool
     use_ulysses_cp_recompute_fallback: bool
+    deterministic_moe_routing: bool
+    moe_topk_tiebreak: Optional[str]
+    deterministic_moe_dispatch: bool
+    ep_invariant_moe: bool
+
+    def requires_kernel(self, kernel_contract: KernelContract) -> bool:
+        return kernel_contract in self.required_kernel_contracts
 
 
 DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
     contract_name=None,
     enabled=False,
+    required_kernel_contracts=(),
     use_sglang_backend=False,
     batch_invariant_mode=False,
     disable_rope_fusion=False,
@@ -63,6 +75,10 @@ DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
     use_sglang_final_norm=False,
     use_sglang_residual_pair=False,
     use_ulysses_cp_recompute_fallback=False,
+    deterministic_moe_routing=False,
+    moe_topk_tiebreak=None,
+    deterministic_moe_dispatch=False,
+    ep_invariant_moe=False,
 )
 
 
@@ -80,9 +96,12 @@ class MegatronTrueOnPolicyContract:
         uses_ulysses_cp = getattr(
             config, "context_parallel_size", 1
         ) > 1 and _cp_comm_type_uses_a2a(getattr(config, "cp_comm_type", None))
+        uses_ep = getattr(config, "expert_model_parallel_size", 1) > 1
+        is_moe = self.schema.model_family == "qwen3_moe"
         return MegatronTrueOnPolicyRuntimePolicy(
             contract_name=self.name,
             enabled=True,
+            required_kernel_contracts=self.schema.required_kernel_contracts,
             use_sglang_backend=True,
             batch_invariant_mode=getattr(config, "batch_invariant_mode", False),
             disable_rope_fusion=True,
@@ -99,6 +118,10 @@ class MegatronTrueOnPolicyContract:
             use_sglang_final_norm=True,
             use_sglang_residual_pair=True,
             use_ulysses_cp_recompute_fallback=uses_ulysses_cp,
+            deterministic_moe_routing=is_moe,
+            moe_topk_tiebreak="stable_sort" if is_moe else None,
+            deterministic_moe_dispatch=is_moe and uses_ep,
+            ep_invariant_moe=is_moe and uses_ep,
         )
 
 
@@ -106,8 +129,14 @@ QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT = MegatronTrueOnPolicyContract(
     schema=QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA
 )
 
+QWEN3_MOE_TRUE_ON_POLICY_CONTRACT = MegatronTrueOnPolicyContract(
+    schema=QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA
+)
 
-_CONTRACT_BY_NAME = {QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT}
+_CONTRACT_BY_NAME = {
+    QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT,
+    QWEN3_MOE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_MOE_TRUE_ON_POLICY_CONTRACT,
+}
 
 
 def get_true_on_policy_contract(contract_name: str) -> MegatronTrueOnPolicyContract:
