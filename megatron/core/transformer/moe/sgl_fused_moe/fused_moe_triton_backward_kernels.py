@@ -262,3 +262,135 @@ def fused_moe_backward_weight_kernel(
         )
         grad_weight_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
         tl.atomic_add(grad_weight_ptrs, grad_w_contribution.to(compute_type), mask=grad_weight_mask)
+
+
+@triton.jit
+def fused_moe_backward_topk_weights_kernel(
+    # Pointers to matrices
+    grad_output_ptr,
+    input_ptr,
+    weight_ptr,
+    grad_topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    # Strides
+    stride_gom,
+    stride_gon,
+    stride_im,
+    stride_ik,
+    stride_we,
+    stride_wn,
+    stride_wk,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """
+    Backward kernel for computing grad_topk_weights.
+
+    Forward: output = topk_weights * (input @ weight.T)
+    Backward: grad_topk_weights = sum(grad_output * (input @ weight.T))
+
+    This kernel computes the gradient of topk_weights by computing the dot product
+    of grad_output with the forward output before weight multiplication.
+    """
+    # Map program id to token block
+    pid = tl.program_id(axis=0)
+
+    # Check bounds
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
+    # Only process if this block is valid
+    if pid * BLOCK_SIZE_M < num_tokens_post_padded:
+        # Load token information
+        offs_token_id = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+        offs_token = tl.load(
+            sorted_token_ids_ptr + offs_token_id,
+            mask=offs_token_id < num_tokens_post_padded,
+            other=num_valid_tokens,
+        )
+        offs_token = offs_token.to(tl.int64)
+        token_mask = (offs_token_id < num_tokens_post_padded) & (offs_token < num_valid_tokens)
+
+        # Clamp offs_token to valid range for safe pointer arithmetic
+        offs_token_clamped = tl.where(token_mask, offs_token, 0)
+
+        # Get expert ID for this block
+        off_experts = tl.load(expert_ids_ptr + pid).to(tl.int64)
+
+        # Only process if expert is valid
+        if off_experts != -1:
+            # Initialize offsets
+            offs_n = tl.arange(0, BLOCK_SIZE_N)
+            offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+            # Accumulator for grad_topk_weights
+            accumulator = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+
+            # Iterate over N and K dimensions to compute forward output and gradient
+            for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+                # Current N offset
+                curr_offs_n = n * BLOCK_SIZE_N + offs_n
+
+                # Load grad_output block: (M, N)
+                grad_output_ptrs = grad_output_ptr + (
+                    offs_token_clamped[:, None] * stride_gom + curr_offs_n[None, :] * stride_gon
+                )
+                grad_out = tl.load(
+                    grad_output_ptrs,
+                    mask=token_mask[:, None] & (curr_offs_n[None, :] < N),
+                    other=0.0,
+                )
+
+                # Compute forward output for this N block: input @ weight[:, n, :].T
+                forward_output_n = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+                for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+                    # Current K offset
+                    curr_offs_k = k * BLOCK_SIZE_K + offs_k
+
+                    # Load input block: (M, K)
+                    input_ptrs = input_ptr + (
+                        (offs_token_clamped[:, None] // top_k) * stride_im
+                        + curr_offs_k[None, :] * stride_ik
+                    )
+                    inp = tl.load(
+                        input_ptrs, mask=token_mask[:, None] & (curr_offs_k[None, :] < K), other=0.0
+                    )
+
+                    # Load weight block: (N, K)
+                    weight_ptrs = (
+                        weight_ptr
+                        + off_experts * stride_we
+                        + curr_offs_n[:, None] * stride_wn
+                        + curr_offs_k[None, :] * stride_wk
+                    )
+                    w = tl.load(
+                        weight_ptrs,
+                        mask=(curr_offs_n[:, None] < N) & (curr_offs_k[None, :] < K),
+                        other=0.0,
+                    )
+
+                    # Accumulate forward output: input @ weight.T
+                    # inp: (M, K), w.T: (K, N) -> (M, N)
+                    forward_output_n += tl.dot(inp.to(compute_type), w.to(compute_type).T)
+
+                # Compute contribution to grad_topk_weights: sum(grad_out * forward_output)
+                # Sum over N dimension
+                accumulator += tl.sum(grad_out * forward_output_n, axis=1)
+
+            # Write back grad_topk_weights using atomic add with clamped token indices
+            tl.atomic_add(
+                grad_topk_weights_ptr + offs_token_clamped,
+                accumulator.to(compute_type),
+                mask=token_mask,
+            )
