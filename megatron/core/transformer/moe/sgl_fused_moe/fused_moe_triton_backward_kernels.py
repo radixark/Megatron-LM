@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from typing import Any
+
+import torch
 import triton
 import triton.language as tl
 
@@ -394,3 +397,153 @@ def fused_moe_backward_topk_weights_kernel(
                 accumulator.to(compute_type),
                 mask=token_mask,
             )
+
+
+def invoke_fused_moe_backward_kernel(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    grad_input: torch.Tensor,
+    grad_weight: torch.Tensor,
+    grad_topk_weights: torch.Tensor | None,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    compute_type: tl.dtype,
+) -> None:
+    """
+    Invoke the fused MOE backward kernels to compute gradients.
+
+    Args:
+        grad_output: Output gradient, shaped either flattened or as token/top-k rows.
+        input: Input tensor, shape (num_tokens, K)
+        weight: Weight tensor, shape (E, N, K)
+        grad_input: Output gradient for input, shape (num_tokens, K)
+        grad_weight: Output gradient for weight, shape (E, N, K)
+        grad_topk_weights: Output gradient for topk_weights, or None.
+        topk_weights: Top-K routing weights, shape (num_tokens, topk)
+        topk_ids: Top-K expert IDs, shape (num_tokens, topk)
+        sorted_token_ids: Sorted token IDs
+        expert_ids: Expert IDs for each block
+        num_tokens_post_padded: Number of tokens after padding
+        mul_routed_weight: Whether to multiply by routing weights
+        top_k: Number of experts per token
+        config: Kernel configuration
+        compute_type: Computation data type
+    """
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+
+    # Flatten grad_output if needed
+    # Before: (num_tokens, topk, hidden_size)
+    # After: (num_tokens * topk, hidden_size)
+    if grad_output.ndim == 3:
+        grad_output = grad_output.reshape(-1, grad_output.shape[-1])
+
+    E, N, K = weight.shape
+
+    # Compute grad_input.
+    def grid_input(META):
+        return (
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+    fused_moe_backward_input_kernel[grid_input](
+        grad_output,
+        weight,
+        grad_input,
+        grad_topk_weights if grad_topk_weights is not None else grad_input,  # dummy pointer
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        sorted_token_ids.shape[0],
+        grad_output.shape[0],
+        grad_output.stride(0),
+        grad_output.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        weight.stride(2),
+        grad_input.stride(0),
+        grad_input.stride(1),
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        **config,
+    )
+
+    # Compute grad_weight.
+    # Initialize grad_weight to zero
+    grad_weight.zero_()
+
+    # Use same grid configuration as the forward kernel.
+    def grid_weight(META):
+        return (
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+    fused_moe_backward_weight_kernel[grid_weight](
+        grad_output,
+        input,
+        grad_weight,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        sorted_token_ids.shape[0],
+        grad_output.shape[0],
+        grad_output.stride(0),
+        grad_output.stride(1),
+        input.stride(0),
+        input.stride(1),
+        grad_weight.stride(0),
+        grad_weight.stride(1),
+        grad_weight.stride(2),
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        **config,
+    )
+
+    # Compute grad_topk_weights if needed.
+    if mul_routed_weight and grad_topk_weights is not None:
+
+        def grid_topk(META):
+            return (triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]),)
+
+        fused_moe_backward_topk_weights_kernel[grid_topk](
+            grad_output,
+            input,
+            weight,
+            grad_topk_weights.view(-1),
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            N,
+            K,
+            sorted_token_ids.shape[0],
+            grad_output.shape[0],
+            grad_output.stride(0),
+            grad_output.stride(1),
+            input.stride(0),
+            input.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            weight.stride(2),
+            top_k=top_k,
+            compute_type=compute_type,
+            BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+            BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+            BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
+        )
