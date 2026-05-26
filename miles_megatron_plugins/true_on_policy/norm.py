@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -7,6 +8,75 @@ import torch.nn.functional as F
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from .contracts import resolve_true_on_policy_runtime_policy
+
+
+_FUSED_RMSNORM_ENV = "SGLANG_TRUE_ON_POLICY_FUSED_RMSNORM"
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _should_use_fused_rms_norm(*tensors: Optional[torch.Tensor]) -> bool:
+    return _env_flag_enabled(_FUSED_RMSNORM_ENV) and any(
+        tensor is not None and tensor.is_cuda for tensor in tensors
+    )
+
+
+def _needs_native_grad(*tensors: Optional[torch.Tensor]) -> bool:
+    return torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in tensors
+    )
+
+
+def _with_native_grad(
+    exact: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    native: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(exact, tuple):
+        exact_output, exact_residual = exact
+        native_output, native_residual = native
+        return (
+            exact_output.detach() + (native_output - native_output.detach()),
+            exact_residual.detach() + (native_residual - native_residual.detach()),
+        )
+    return exact.detach() + (native - native.detach())
+
+
+def _maybe_true_on_policy_fused_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    residual: Optional[torch.Tensor] = None,
+    post_residual_addition: Optional[torch.Tensor] = None,
+    cast_x_before_out_mul: bool = True,
+    norm_cast_dtype: torch.dtype,
+    weight_cast_dtype: torch.dtype,
+    output_dtype: Optional[torch.dtype] = None,
+    residual_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+    if not _should_use_fused_rms_norm(x, weight, residual, post_residual_addition):
+        return None
+
+    try:
+        from sglang.srt.batch_invariant_ops import true_on_policy_rms_norm
+    except Exception:
+        return None
+
+    output = true_on_policy_rms_norm(
+        x,
+        weight,
+        eps,
+        residual=residual,
+        post_residual_addition=post_residual_addition,
+        cast_x_before_out_mul=cast_x_before_out_mul,
+        norm_cast_dtype=norm_cast_dtype,
+        weight_cast_dtype=weight_cast_dtype,
+        output_dtype=output_dtype,
+        residual_dtype=residual_dtype,
+    )
+    return output
 
 
 class SGLangNorm(torch.nn.Module):
@@ -84,13 +154,43 @@ class SGLangNorm(torch.nn.Module):
             weight = self.weight + 1 if self.zero_centered_gamma else self.weight
             return F.layer_norm(x, self.hidden_size, weight, self.bias, self.eps)
 
+        fused = None
+        if residual is None:
+            fused = _maybe_true_on_policy_fused_rms_norm(
+                x,
+                self.weight.float(),
+                self.eps,
+                residual=residual,
+                post_residual_addition=post_residual_addition,
+                cast_x_before_out_mul=self.cast_x_before_out_mul,
+                norm_cast_dtype=self.override_orig_dtype or x.dtype,
+                weight_cast_dtype=torch.float32,
+                residual_dtype=x.dtype,
+            )
+        if fused is not None:
+            if not _needs_native_grad(x, self.weight, residual, post_residual_addition):
+                return fused
+            return _with_native_grad(
+                fused,
+                self._forward_rmsnorm_native(x, residual, post_residual_addition),
+            )
+
+        return self._forward_rmsnorm_native(x, residual, post_residual_addition)
+
+    def _forward_rmsnorm_native(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = self.override_orig_dtype or x.dtype
         x_float = x.float()
         if residual is not None:
             x_float = x_float + residual.float()
             if post_residual_addition is not None:
                 x_float = x_float + post_residual_addition.float()
-            residual = x_float.to(orig_dtype)
+            residual = x_float.to(x.dtype)
+            x_float = residual.float()
 
         output = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
         if self.cast_x_before_out_mul:
@@ -133,6 +233,22 @@ class SGLangQKRMSNorm(torch.nn.Module):
         if not x.is_contiguous():
             x = x.contiguous()
 
+        fused = _maybe_true_on_policy_fused_rms_norm(
+            x,
+            self.weight.float(),
+            self.eps,
+            cast_x_before_out_mul=self.cast_x_before_out_mul,
+            norm_cast_dtype=x.dtype,
+            weight_cast_dtype=torch.float32,
+        )
+        if fused is not None:
+            if not _needs_native_grad(x, self.weight):
+                return fused
+            return _with_native_grad(fused, self._forward_native(x))
+
+        return self._forward_native(x)
+
+    def _forward_native(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
         x_float = x.to(torch.float32)
         x_float = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
@@ -158,13 +274,13 @@ class SGLangFinalRMSNorm(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        del config
         del persist_layer_norm
         del zero_centered_gamma
         del normalization
 
         self.hidden_size = (hidden_size,)
         self.eps = eps
+        self.source_truth_orig_dtype = getattr(config, "params_dtype", None)
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
 
     def forward(
@@ -176,7 +292,15 @@ class SGLangFinalRMSNorm(torch.nn.Module):
         if not x.is_contiguous():
             x = x.contiguous()
 
-        orig_dtype = x.dtype
+        return self._forward_native(x, residual, post_residual_addition)
+
+    def _forward_native(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        orig_dtype = self.source_truth_orig_dtype or x.dtype
         if residual is not None:
             x = x + residual
             if post_residual_addition is not None:
@@ -185,7 +309,7 @@ class SGLangFinalRMSNorm(torch.nn.Module):
 
         x_float = x.to(torch.float32)
         x_float = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        output = self.weight * x_float.to(orig_dtype)
+        output = self.weight.to(orig_dtype) * x_float.to(orig_dtype)
 
         if residual is not None:
             return output, residual
