@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Iterable, List, Optional
 
 import torch
@@ -30,6 +31,29 @@ def _fixed_tree_sum_tensors(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
     return partials[0]
 
 
+def _sglang_tp_inv_matmul_forward(
+    input_2d: torch.Tensor, weight_t: torch.Tensor, bias: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    if input_2d.shape[-1] % _ROW_LINEAR_INV_BLOCK_K != 0:
+        return None
+    try:
+        import sglang.srt.tp_invariant_ops  # noqa: F401
+    except Exception:
+        return None
+
+    try:
+        with torch.no_grad():
+            return torch.ops.tp_inv_ops.matmul_tp_inv(input_2d, weight_t, bias)
+    except Exception:
+        return None
+
+
+def _with_native_grad(exact: Optional[torch.Tensor], native: torch.Tensor) -> torch.Tensor:
+    if exact is None:
+        return native
+    return exact + (native - native.detach())
+
+
 def _safe_group_size(group: Optional[torch.distributed.ProcessGroup]) -> int:
     if group is not None:
         return group.size()
@@ -42,6 +66,15 @@ def _safe_group_size(group: Optional[torch.distributed.ProcessGroup]) -> int:
 
 
 def _safe_tensor_context_parallel_size() -> int:
+    rollout_tp_size = os.environ.get("MILES_TRUE_ON_POLICY_ROLLOUT_TP_SIZE")
+    if rollout_tp_size:
+        try:
+            parsed = int(rollout_tp_size)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+
     try:
         from megatron.core.parallel_state import get_tensor_and_context_parallel_world_size
 
@@ -94,6 +127,8 @@ def _sglang_row_parallel_matmul(
     output = _fixed_tree_sum_tensors(partials).to(input_.dtype)
     if bias is not None:
         output = output + bias
+    exact = _sglang_tp_inv_matmul_forward(input_2d, weight_t, bias)
+    output = _with_native_grad(exact, output)
     return output.reshape(*input_shape[:-1], weight.shape[0])
 
 
@@ -120,7 +155,13 @@ def _sglang_rollout_partition_row_parallel_matmul(
 
     for start in range(0, input_2d.shape[1], rollout_partition_k):
         end = start + rollout_partition_k
-        partials.append(input_2d[:, start:end] @ weight_t[start:end, :])
+        partials.append(
+            _sglang_row_parallel_matmul(
+                input_2d[:, start:end],
+                weight[:, start:end],
+                bias=None,
+            )
+        )
 
     output = _fixed_tree_sum_tensors(partials).to(input_.dtype)
     if bias is not None:
@@ -164,12 +205,17 @@ def sglang_reference_matmul(
     if bias is not None and bias.dtype != weight.dtype:
         bias = bias.to(weight.dtype)
 
-    if _should_use_sglang_tp_invariant_row_linear(input_, row_parallel, tp_group):
-        return _sglang_row_parallel_matmul(input_, weight, bias)
     if row_parallel:
-        return _sglang_rollout_partition_row_parallel_matmul(
-            input_, weight, bias, tp_group=tp_group
-        )
+        rollout_partition_k = _rollout_row_parallel_partition_k(input_, tp_group)
+        if (
+            0 < rollout_partition_k < input_.shape[-1]
+            and input_.shape[-1] % rollout_partition_k == 0
+        ):
+            return _sglang_rollout_partition_row_parallel_matmul(
+                input_, weight, bias, tp_group=tp_group
+            )
+        if _should_use_sglang_tp_invariant_row_linear(input_, row_parallel, tp_group):
+            return _sglang_row_parallel_matmul(input_, weight, bias)
 
     if weight.requires_grad:
         return linear_with_grad_accumulation_and_async_allreduce(
