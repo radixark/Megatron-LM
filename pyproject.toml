@@ -8,12 +8,19 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = [
-    "megatron.core",
-    "megatron.core.*",
-    "miles_megatron_plugins",
-    "miles_megatron_plugins.*",
-]
+# Expose every `megatron.*` sub-package so callers (e.g. the miles training
+# runner) can `pip install -e .` this checkout and freely import from
+# `megatron.training`, `megatron.legacy`, `megatron.rl`, etc. without an
+# explicit PYTHONPATH override. (megatron.training.initialize imports from
+# megatron.legacy at module load, so any narrower include list breaks
+# transitively.)
+#
+# `namespaces = true` is required because `megatron`, `megatron.legacy`, and
+# several sub-packages are namespace packages (no `__init__.py`). Without
+# this, find_packages skips them and the editable install only works via the
+# side-effect that pip adds the project root to sys.path.
+include = ["megatron*", "miles_megatron_plugins", "miles_megatron_plugins.*"]
+namespaces = true
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
