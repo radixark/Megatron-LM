@@ -23,10 +23,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from .. import parallel_state
 from ..transformer.moe.moe_utils import get_updated_expert_bias
 from ..transformer.transformer_config import TransformerConfig
-from .deterministic_collectives import (
-    deterministic_sum_inplace,
-    is_deterministic_collectives_enabled,
-)
 from ..utils import (
     get_attr_wrapped_model,
     get_model_config,
@@ -123,10 +119,7 @@ def _allreduce_conditional_embedding_grads(
             # All-reduce the gradient on the first VPP rank.
             grads = [param_grad[0] for _, param_grad in grads_dict.items()]
             coalesced = _flatten_dense_tensors(grads)
-            if is_deterministic_collectives_enabled():
-                deterministic_sum_inplace(coalesced, pp_group)
-            else:
-                torch.distributed.all_reduce(coalesced, group=pp_group)
+            torch.distributed.all_reduce(coalesced, group=pp_group)
             for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
                 buf.copy_(synced)
 
@@ -262,10 +255,7 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        if is_deterministic_collectives_enabled():
-            deterministic_sum_inplace(grad, embd_group)
-        else:
-            torch.distributed.all_reduce(grad, group=embd_group)
+        torch.distributed.all_reduce(grad, group=embd_group)
         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
@@ -383,15 +373,7 @@ def _allreduce_non_tensor_model_parallel_grads(
     ):
         if grads:
             coalesced = _flatten_dense_tensors(grads)
-            # deterministic_sum_inplace only covers SUM; the AVG entry keeps the
-            # standard all-reduce.
-            if (
-                is_deterministic_collectives_enabled()
-                and all_reduce_op == torch.distributed.ReduceOp.SUM
-            ):
-                deterministic_sum_inplace(coalesced, tp_group)
-            else:
-                torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)
+            torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)
             for param, buf, synced in zip(
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
@@ -508,10 +490,7 @@ def finalize_model_grads(
         torch.distributed.broadcast(num_tokens, src=last_rank, group=pp_group)
 
         # all-reduce across DP ranks.
-        if is_deterministic_collectives_enabled():
-            deterministic_sum_inplace(num_tokens, dp_cp_group)
-        else:
-            torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+        torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens

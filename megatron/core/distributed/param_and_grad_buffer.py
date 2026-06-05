@@ -27,11 +27,6 @@ from ..fp8_utils import (
     post_all_gather_processing,
 )
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
-from .deterministic_collectives import (
-    deterministic_sum_inplace,
-    is_deterministic_collectives_enabled,
-    log_group_ranks_once,
-)
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
@@ -416,24 +411,6 @@ class _ParamAndGradBucketGroup:
         reduce_op = torch.distributed.ReduceOp.SUM
         if self.ddp_config.average_in_collective:
             reduce_op = torch.distributed.ReduceOp.AVG
-
-        if is_deterministic_collectives_enabled():
-            assert (
-                not self.ddp_config.overlap_grad_reduce
-            ), "deterministic collectives require synchronous grad sync"
-            assert reduce_op == torch.distributed.ReduceOp.SUM
-            assert self.ddp_config.num_distributed_optimizer_instances == 1
-            if self.ddp_config.use_distributed_optimizer:
-                communication_group = self.intra_distributed_optimizer_instance_group
-            else:
-                communication_group = self.data_parallel_group
-            log_group_ranks_once(
-                "deterministic_collectives grad bucket group", communication_group
-            )
-            for bucket in self.buckets:
-                deterministic_sum_inplace(bucket.grad_data, communication_group)
-            self.grad_reduce_handle = None
-            return
 
         # We use the following stream synchronization for the gradient reduction
         # within and across DistOpt instances.
