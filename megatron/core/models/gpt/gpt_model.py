@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from collections import OrderedDict
+from pathlib import Path
 from typing import Dict, Literal, Optional
 
 import torch
@@ -36,11 +38,73 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     is_using_quantization_scales,
 )
+
+
+def apply_true_on_policy_logits_contract(
+    logits: Optional[Tensor], *, vocab_size: Optional[int] = None
+) -> Optional[Tensor]:
+    """Match SGLang's gathered-logits contract before log-softmax."""
+    if logits is None:
+        return None
+    if vocab_size is not None:
+        if logits.shape[-1] < vocab_size:
+            raise RuntimeError(
+                f"true_on_policy_vocab_size={vocab_size} exceeds gathered logits width "
+                f"{logits.shape[-1]}."
+            )
+        logits = logits[..., :vocab_size]
+    return logits
+
+
+_TOP_LM_HEAD_BWD_DUMP_COUNTER = 0
+
+
+def _maybe_dump_lm_head_backward(name: str, tensor: Optional[Tensor]) -> None:
+    dump_dir = os.environ.get("MILES_LM_HEAD_BACKWARD_DEBUG_DIR")
+    if not dump_dir or tensor is None or not tensor.requires_grad:
+        return
+
+    def hook(grad: Tensor) -> Tensor:
+        global _TOP_LM_HEAD_BWD_DUMP_COUNTER
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        finite_mask = torch.isfinite(grad)
+        finite = grad[finite_mask]
+        stats = {
+            "rank": rank,
+            "name": name,
+            "shape": tuple(grad.shape),
+            "dtype": str(grad.dtype),
+            "numel": grad.numel(),
+            "finite": finite_mask.sum().item(),
+            "nan": torch.isnan(grad).sum().item(),
+            "inf": torch.isinf(grad).sum().item(),
+        }
+        if finite.numel() > 0:
+            finite_f = finite.float()
+            stats.update(
+                {
+                    "max_abs_finite": finite_f.abs().max().item(),
+                    "min_finite": finite_f.min().item(),
+                    "max_finite": finite_f.max().item(),
+                }
+            )
+        else:
+            stats.update({"max_abs_finite": None, "min_finite": None, "max_finite": None})
+        counter = _TOP_LM_HEAD_BWD_DUMP_COUNTER
+        _TOP_LM_HEAD_BWD_DUMP_COUNTER += 1
+        path = Path(dump_dir) / f"rank_{rank}_{counter:05d}_{name}.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"stats": stats}, path)
+        print(f"[MILES_LM_HEAD_BACKWARD_DEBUG] {stats} wrote {path}", flush=True)
+        return grad
+
+    tensor.register_hook(hook)
 
 
 class GPTModel(LanguageModule):
@@ -574,6 +638,13 @@ class GPTModel(LanguageModule):
             mtp_kwargs=mtp_kwargs,
         )
 
+    def _apply_true_on_policy_logits_contract(self, logits: Optional[Tensor]) -> Optional[Tensor]:
+        if not resolve_true_on_policy_runtime_policy(self.config).apply_logits_contract:
+            return logits
+        return apply_true_on_policy_logits_contract(
+            logits, vocab_size=self.config.true_on_policy_vocab_size
+        )
+
     def _postprocess(
         self,
         hidden_states,
@@ -630,7 +701,13 @@ class GPTModel(LanguageModule):
         # Skip when mtp_num_layers is None or 0
         if self.config.mtp_num_layers and mtp_kwargs.get('mtp_labels', None) is not None:
             mtp_labels = mtp_kwargs['mtp_labels'].clone()
-            mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params)
+            mtp_labels, _ = roll_tensor(
+                mtp_labels,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
 
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
             hidden_states = hidden_states_list[0]
@@ -639,7 +716,13 @@ class GPTModel(LanguageModule):
                 loss_mask = torch.ones_like(mtp_labels)
             else:
                 # Otherwise, roll the loss_mask to keep up with the mtp_labels
-                loss_mask, _ = roll_tensor(loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed_seq_params)
+                loss_mask, _ = roll_tensor(
+                    loss_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
                 mtp_labels, _ = roll_tensor(
@@ -729,9 +812,12 @@ class GPTModel(LanguageModule):
                 ).unsqueeze(1)
 
         if has_config_logger_enabled(self.config) or labels is None:
+            _maybe_dump_lm_head_backward("lm_head_input_hidden_states", hidden_states)
             logits, _ = self.output_layer(
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
+            logits = self._apply_true_on_policy_logits_contract(logits)
+            _maybe_dump_lm_head_backward("lm_head_output_logits", logits)
         else:
             logits = None
 
@@ -770,7 +856,10 @@ class GPTModel(LanguageModule):
                 **output_layer_kwargs,
             )
         else:
+            _maybe_dump_lm_head_backward("lm_head_input_hidden_states", hidden_states)
             logits, _ = self.output_layer(**output_layer_kwargs)
+            logits = self._apply_true_on_policy_logits_contract(logits)
+            _maybe_dump_lm_head_backward("lm_head_output_logits", logits)
             loss = self.compute_language_model_loss(labels, logits)
 
         return loss

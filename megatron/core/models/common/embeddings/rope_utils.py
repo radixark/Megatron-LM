@@ -119,11 +119,12 @@ def _apply_rotary_pos_emb_bshd(
 
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
-    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
+    orig_dtype = t.dtype
+    cos_ = (torch.cos(freqs) * mscale).float()
+    sin_ = (torch.sin(freqs) * mscale).float()
+    t = (t.float() * cos_) + (_rotate_half(t, rotary_interleaved).float() * sin_)
 
-    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
-    return torch.cat((t, t_pass), dim=-1)
+    return torch.cat((t.to(orig_dtype), t_pass), dim=-1)
 
 
 def _get_thd_freqs_on_this_cp_rank(
@@ -183,6 +184,7 @@ def _apply_rotary_pos_emb_thd(
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    ulysses_cp: bool = False,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -199,9 +201,23 @@ def _apply_rotary_pos_emb_thd(
 
     if cp_group is None:
         raise ValueError("cp_group must be provided for THD format RoPE")
-    cp_size = cp_group.size()
-    cp_rank = cp_group.rank()
-    seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
+    full_seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+    full_token_count = int(full_seqlens.sum().item())
+    local_token_count = t.size(0)
+
+    # Ulysses CP can appear in two layouts before RoPE:
+    # - full-sequence layout, where each rank has all packed tokens and RoPE
+    #   should behave like CP size 1;
+    # - local zigzag sequence-shard layout, used by the SGLang attention path
+    #   before its all-to-all head redistribution. In that case RoPE must use
+    #   the real CP rank/size to select the correct positional slices.
+    if ulysses_cp and local_token_count == full_token_count:
+        cp_size = 1
+        cp_rank = 0
+    else:
+        cp_size = cp_group.size()
+        cp_rank = cp_group.rank()
+    seqlens = (full_seqlens // cp_size).tolist()
 
     # Handle two different frequency tensor formats:
     # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
@@ -254,6 +270,7 @@ def apply_rotary_pos_emb(
     cu_seqlens: Optional[Tensor] = None,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    ulysses_cp: bool = False,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -287,8 +304,16 @@ def apply_rotary_pos_emb(
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
+            full_token_count = int((cu_seqlens[1:] - cu_seqlens[:-1]).sum().item())
+            local_token_count = t.size(0)
+            if ulysses_cp and local_token_count == full_token_count:
+                cp_size = 1
+                cp_rank = 0
+            else:
+                cp_size = cp_group.size()
+                cp_rank = cp_group.rank()
             return fused_apply_rotary_pos_emb_thd(
-                t, cu_seqlens, freqs, cp_size=cp_group.size(), cp_rank=cp_group.rank()
+                t, cu_seqlens, freqs, cp_size=cp_size, cp_rank=cp_rank
             )
     # use unfused implementation
     if cu_seqlens is None:
@@ -308,6 +333,7 @@ def apply_rotary_pos_emb(
             multi_latent_attention=config.multi_latent_attention,
             mscale=mscale,
             cp_group=cp_group,
+            ulysses_cp=ulysses_cp,
         )
 
 

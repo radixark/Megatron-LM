@@ -505,6 +505,12 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
+    true_on_policy_contract: Optional[str] = None
+    """Internal true-on-policy parity contract selected by the launcher."""
+
+    true_on_policy_vocab_size: Optional[int] = None
+    """Optional non-padded vocab size for SGLang-compatible scoring logits."""
+
     use_kitchen_attention: bool = False
     """Use the kitchen extension for attention (instead of TE's attention)."""
 
@@ -930,6 +936,10 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.true_on_policy_contract is not None:
+            from miles_megatron_plugins.true_on_policy.contracts import validate_true_on_policy_contract
+
+            validate_true_on_policy_contract(self.true_on_policy_contract)
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
@@ -2012,7 +2022,11 @@ class TransformerConfig(ModelParallelConfig):
                 f" but got {self.transformer_impl=}."
             )
 
-        if self.fallback_to_eager_attn or self.transformer_impl == "local":
+        uses_true_on_policy_backend = self.true_on_policy_contract is not None
+        local_attention_requires_all_gather_cp = (
+            self.transformer_impl == "local" and not uses_true_on_policy_backend
+        )
+        if self.fallback_to_eager_attn or local_attention_requires_all_gather_cp:
             if self.context_parallel_size > 1 and self.cp_comm_type is not None:
                 all_cp_comm_types_are_all_gather = (
                     all(item == "all_gather" for item in self.cp_comm_type)
@@ -2031,6 +2045,18 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
+            assert self.true_on_policy_contract is None
+
+        if uses_true_on_policy_backend:
+            assert self.transformer_impl == "local", (
+                f"true_on_policy_contract currently requires transformer_impl='local', "
+                f"but got {self.transformer_impl=}."
+            )
+            assert (
+                not self.use_kitchen
+            ), "true_on_policy_contract is not compatible with use_kitchen."
+        if self.true_on_policy_vocab_size is not None:
+            assert self.true_on_policy_vocab_size > 0, "true_on_policy_vocab_size must be > 0."
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (

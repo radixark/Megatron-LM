@@ -30,6 +30,7 @@ from megatron.core.utils import (
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -346,21 +347,31 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
         ctx.tp_group = tp_group
-        output = torch.matmul(input, weight.t())
-        if bias is not None:
-            output = output + bias
-        return output
+        return _linear_forward_with_optional_batch_invariant_matmul(input, weight, bias)
 
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
-        grad_input = grad_output.matmul(weight)
+        grad_input = _linear_dgrad_matmul(grad_output, weight)
+        _maybe_dump_linear_backward_debug(
+            tag="pre_comm",
+            grad_input=grad_input,
+            grad_output=grad_output,
+            weight=weight,
+            allreduce_dgrad=ctx.allreduce_dgrad,
+            sequence_parallel=False,
+        )
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
-            torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+            if _should_allreduce_dgrad_in_fp32(grad_input):
+                grad_input_fp32 = grad_input.float()
+                torch.distributed.all_reduce(grad_input_fp32, group=ctx.tp_group)
+                grad_input = grad_input_fp32.to(grad_input.dtype)
+            else:
+                torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
 
         return grad_input, None, None, None, None
 
@@ -448,6 +459,113 @@ def linear_with_frozen_weight(
     return LinearWithFrozenWeight.apply(*args)
 
 
+def _linear_forward_with_optional_batch_invariant_matmul(
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if input.is_cuda:
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            is_batch_invariant_mode_enabled,
+            matmul_persistent,
+        )
+
+        if is_batch_invariant_mode_enabled():
+            input_shape = input.shape
+            input_2d = input.reshape(-1, input_shape[-1])
+            output_2d = matmul_persistent(input_2d, weight.t(), bias)
+            return output_2d.reshape(*input_shape[:-1], weight.shape[0])
+
+    output = torch.matmul(input, weight.t())
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+def _maybe_dump_linear_backward_debug(
+    *,
+    tag: str,
+    grad_input: torch.Tensor,
+    grad_output: torch.Tensor,
+    weight: torch.Tensor,
+    allreduce_dgrad: bool,
+    sequence_parallel: bool,
+) -> None:
+    debug_dir = os.environ.get("MILES_LINEAR_BACKWARD_DEBUG_DIR")
+    if not debug_dir or torch.isfinite(grad_input).all().item():
+        return
+
+    max_dumps = int(os.environ.get("MILES_LINEAR_BACKWARD_DEBUG_MAX_FILES", "256"))
+    counter = getattr(_maybe_dump_linear_backward_debug, "_counter", 0)
+    if counter >= max_dumps:
+        return
+    _maybe_dump_linear_backward_debug._counter = counter + 1
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = -1
+
+    def _stats(tensor: torch.Tensor):
+        flat = tensor.detach().view(-1)
+        finite = torch.isfinite(flat)
+        stats = {
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "numel": flat.numel(),
+            "finite": int(finite.sum().item()),
+            "nan": int(torch.isnan(flat).sum().item()),
+            "inf": int(torch.isinf(flat).sum().item()),
+        }
+        if stats["finite"] > 0:
+            finite_values = flat[finite].float()
+            stats.update(
+                {
+                    "max_abs_finite": float(finite_values.abs().max().item()),
+                    "min_finite": float(finite_values.min().item()),
+                    "max_finite": float(finite_values.max().item()),
+                }
+            )
+        return stats
+
+    os.makedirs(debug_dir, exist_ok=True)
+    shape_tag = "x".join(str(dim) for dim in weight.shape)
+    path = os.path.join(
+        debug_dir, f"rank_{rank}_call_{counter:05d}_{tag}_weight_{shape_tag}_pid_{os.getpid()}.pt"
+    )
+    torch.save(
+        {
+            "rank": rank,
+            "tag": tag,
+            "allreduce_dgrad": allreduce_dgrad,
+            "sequence_parallel": sequence_parallel,
+            "grad_input": _stats(grad_input),
+            "grad_output": _stats(grad_output),
+            "weight": _stats(weight),
+        },
+        path,
+    )
+    print(f"[MILES_LINEAR_BACKWARD_DEBUG] wrote {path}", flush=True)
+
+
+def _should_allreduce_dgrad_in_fp32(grad_input: torch.Tensor) -> bool:
+    return os.environ.get(
+        "MEGATRON_TRUE_ON_POLICY_DGRAD_ALLREDUCE_FP32"
+    ) == "1" and grad_input.dtype in (torch.float16, torch.bfloat16)
+
+
+def _should_compute_dgrad_in_fp32(grad_output: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        os.environ.get("MEGATRON_TRUE_ON_POLICY_LINEAR_DGRAD_FP32") == "1"
+        and grad_output.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype in (torch.float16, torch.bfloat16)
+    )
+
+
+def _linear_dgrad_matmul(grad_output: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if _should_compute_dgrad_in_fp32(grad_output, weight):
+        return grad_output.float().matmul(weight.float())
+    return grad_output.matmul(weight)
+
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
@@ -493,10 +611,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             total_input = input
 
-        output = torch.matmul(total_input, weight.t())
-        if bias is not None:
-            output = output + bias
-        return output
+        return _linear_forward_with_optional_batch_invariant_matmul(total_input, weight, bias)
 
     @staticmethod
     @custom_bwd
@@ -536,7 +651,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 total_input = all_gather_buffer
             else:
                 total_input = input
-        grad_input = grad_output.matmul(weight)
+        grad_input = _linear_dgrad_matmul(grad_output, weight)
 
         if ctx.sequence_parallel and wgrad_compute:
             # pylint: disable=possibly-used-before-assignment
@@ -549,7 +664,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             # Asynchronous all-reduce
-            handle = torch.distributed.all_reduce(grad_input, group=tp_group, async_op=True)
+            dgrad_allreduce_fp32 = _should_allreduce_dgrad_in_fp32(grad_input)
+            grad_input_comm = grad_input.float() if dgrad_allreduce_fp32 else grad_input
+            handle = torch.distributed.all_reduce(grad_input_comm, group=tp_group, async_op=True)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
 
@@ -630,6 +747,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             handle.wait()
+            if dgrad_allreduce_fp32:
+                grad_input = grad_input_comm.to(grad_input.dtype)
+            _maybe_dump_linear_backward_debug(
+                tag="post_allreduce",
+                grad_input=grad_input,
+                grad_output=grad_output,
+                weight=weight,
+                allreduce_dgrad=ctx.allreduce_dgrad,
+                sequence_parallel=ctx.sequence_parallel,
+            )
 
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 
@@ -804,6 +931,8 @@ class ColumnParallelLinear(torch.nn.Module):
             will be disabled. Defaults to False. This feature is used by Lora Adapter in Nemo to
             delay and fuse reduction along with other gradients for performance optimization.
     """
+
+    backend_name = "local"
 
     def __init__(
         self,
@@ -1137,6 +1266,8 @@ class RowParallelLinear(torch.nn.Module):
 
     """
 
+    backend_name = "local"
+
     def __init__(
         self,
         input_size: int,
@@ -1315,7 +1446,13 @@ class RowParallelLinear(torch.nn.Module):
                 output_parallel, group=self.tp_group
             )
         else:
-            output_ = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
+            output_ = reduce_from_tensor_model_parallel_region(
+                output_parallel,
+                group=self.tp_group,
+                deterministic=resolve_true_on_policy_runtime_policy(
+                    self.config
+                ).deterministic_row_parallel_reduce,
+            )
         if not self.skip_bias_add:
             output = (output_ + self.bias) if self.bias is not None else output_
             output_bias = None
