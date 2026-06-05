@@ -1066,13 +1066,25 @@ def get_updated_expert_bias(
     Returns:
         torch.Tensor: The updated expert bias.
     """
+    # Local import to avoid a circular import with megatron.core.distributed.
+    from megatron.core.distributed.deterministic_collectives import (
+        deterministic_sum_inplace,
+        is_deterministic_collectives_enabled,
+    )
+
     with torch.no_grad():
         # All Reduce Across TPxCPxDP group
-        torch.distributed.all_reduce(
-            tokens_per_expert,
-            # TODO(Hepteract): delete the usage of the global parallel_state.
-            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+        tp_cp_dp_group = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
         )
+        if is_deterministic_collectives_enabled():
+            deterministic_sum_inplace(tokens_per_expert, tp_cp_dp_group)
+        else:
+            torch.distributed.all_reduce(
+                tokens_per_expert,
+                # TODO(Hepteract): delete the usage of the global parallel_state.
+                group=tp_cp_dp_group,
+            )
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate

@@ -42,6 +42,11 @@ except ImportError:
         l2_norm_impl = local_multi_tensor_l2_norm
         multi_tensor_scale_impl = local_multi_tensor_scale
 
+from megatron.core.distributed.deterministic_collectives import (
+    deterministic_sum_inplace,
+    is_deterministic_collectives_enabled,
+)
+
 
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
@@ -124,12 +129,18 @@ def get_grad_norm_fp32(
 
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
+            if is_deterministic_collectives_enabled():
+                deterministic_sum_inplace(total_norm, data_parallel_group)
+            else:
+                torch.distributed.all_reduce(
+                    total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+                )
+        if is_deterministic_collectives_enabled():
+            deterministic_sum_inplace(total_norm, grad_stats_parallel_group)
+        else:
             torch.distributed.all_reduce(
-                total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
             )
-        torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
-        )
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
     return total_norm
