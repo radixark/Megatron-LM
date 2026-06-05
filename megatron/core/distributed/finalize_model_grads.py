@@ -383,6 +383,8 @@ def _allreduce_non_tensor_model_parallel_grads(
     ):
         if grads:
             coalesced = _flatten_dense_tensors(grads)
+            # deterministic_sum_inplace only covers SUM; the AVG entry keeps the
+            # standard all-reduce.
             if (
                 is_deterministic_collectives_enabled()
                 and all_reduce_op == torch.distributed.ReduceOp.SUM

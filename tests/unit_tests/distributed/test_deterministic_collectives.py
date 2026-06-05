@@ -84,19 +84,43 @@ def test_chunking_matches_single_shot(monkeypatch):
 def test_non_power_of_two_falls_back_to_ascending_fold():
     """Non-power-of-two world sizes use the ascending-rank sequential fold."""
     partials = [torch.randn(4, dtype=torch.float32) for _ in range(3)]
+    expected = _manual_ascending_sum(partials)
 
-    actual = deterministic_collectives._fold_gathered_sum(partials)
+    # fold_gathered_sum may reuse the first buffer as its accumulator.
+    actual = deterministic_collectives.fold_gathered_sum([p.clone() for p in partials])
 
-    torch.testing.assert_close(actual, _manual_ascending_sum(partials))
+    torch.testing.assert_close(actual, expected)
 
 
 def test_power_of_two_uses_tree_fold():
     """Power-of-two world sizes use the fixed pairwise tree fold."""
     partials = [torch.randn(4, dtype=torch.float32) for _ in range(4)]
+    expected = _manual_tree_sum(partials)
 
-    actual = deterministic_collectives._fold_gathered_sum(partials)
+    actual = deterministic_collectives.fold_gathered_sum([p.clone() for p in partials])
 
-    torch.testing.assert_close(actual, _manual_tree_sum(partials))
+    torch.testing.assert_close(actual, expected)
+
+
+def test_with_gather_custom_fn_matches_group_path():
+    """The injectable-gather variant gives the same bits as the process-group path."""
+    world_size = 4
+    partials = [torch.randn(9, dtype=torch.float32) for _ in range(world_size)]
+
+    offset = 0
+
+    def _fake_gather(gathered_list, chunk):
+        nonlocal offset
+        for dst, src in zip(gathered_list, partials):
+            dst.copy_(src[offset : offset + chunk.numel()])
+        offset += chunk.numel()
+
+    tensor = partials[0].clone()
+    deterministic_collectives.deterministic_sum_inplace_with_gather(
+        tensor, world_size=world_size, all_gather_fn=_fake_gather, chunk_numel=4
+    )
+
+    torch.testing.assert_close(tensor, _manual_tree_sum(partials))
 
 
 def test_world_size_one_is_noop(monkeypatch):
