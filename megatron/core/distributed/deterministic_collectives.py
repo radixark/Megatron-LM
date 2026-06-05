@@ -9,13 +9,26 @@ is the only arithmetic order, making the result independent of the NCCL version,
 topology, or padding. Never enable in production: it is slow.
 """
 
-from typing import Callable, List
+import logging
+from typing import Callable, List, Set
 
 import torch
 
 from megatron.core.tensor_parallel.mappings import _is_power_of_two, _tree_reduce_sum_from_gathered
 
+logger = logging.getLogger(__name__)
+
 _DETERMINISTIC_COLLECTIVES: bool = False
+
+_LOGGED_GROUP_RANKS_TAGS: Set[str] = set()
+
+
+def log_group_ranks_once(tag: str, group: torch.distributed.ProcessGroup) -> None:
+    """Log ``tag`` plus the group's member ranks at INFO level exactly once per tag."""
+    if tag in _LOGGED_GROUP_RANKS_TAGS:
+        return
+    _LOGGED_GROUP_RANKS_TAGS.add(tag)
+    logger.info("%s ranks=%s", tag, torch.distributed.get_process_group_ranks(group))
 
 
 def enable_deterministic_collectives() -> None:
@@ -57,7 +70,16 @@ def deterministic_sum_inplace_with_gather(
     ``all_gather_fn(gathered_list, chunk)`` must fill ``gathered_list`` with every
     rank's ``chunk``; the local fold then defines the (fixed) summation order.
     """
-    assert tensor.is_contiguous(), "deterministic sum requires a contiguous tensor"
+    if not tensor.is_contiguous():
+        work = tensor.contiguous()
+        deterministic_sum_inplace_with_gather(
+            work,
+            world_size=world_size,
+            all_gather_fn=all_gather_fn,
+            chunk_numel=chunk_numel,
+        )
+        tensor.copy_(work)
+        return
 
     if world_size == 1:
         return

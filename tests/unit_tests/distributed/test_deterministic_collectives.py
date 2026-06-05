@@ -18,9 +18,13 @@ class _FakeGroup:
 
 
 def _patch_all_gather(monkeypatch, partials):
+    offset = 0
+
     def _fake_all_gather(output_list, input_, group=None):
+        nonlocal offset
         for dst, src in zip(output_list, partials):
-            dst.copy_(src)
+            dst.copy_(src[offset : offset + input_.numel()])
+        offset += input_.numel()
 
     monkeypatch.setattr(torch.distributed, "all_gather", _fake_all_gather)
 
@@ -135,10 +139,25 @@ def test_world_size_one_is_noop(monkeypatch):
     assert torch.equal(tensor, expected)
 
 
-def test_requires_contiguous_input():
-    """A non-contiguous tensor is rejected by an assertion."""
-    base = torch.randn(4, 4, dtype=torch.float32)
-    non_contiguous = base.t()
+def test_non_contiguous_input_is_copied_and_summed():
+    """A non-contiguous tensor is folded via a contiguous copy and gets the correct sum."""
+    world_size = 4
+    partials = [torch.randn(4, 4, dtype=torch.float32).t() for _ in range(world_size)]
+    expected = _manual_tree_sum([p.contiguous().view(-1) for p in partials]).view(4, 4)
 
-    with pytest.raises(AssertionError, match="contiguous"):
-        deterministic_collectives.deterministic_sum_inplace(non_contiguous, _FakeGroup(2))
+    offset = 0
+
+    def _fake_gather(gathered_list, chunk):
+        nonlocal offset
+        flats = [p.contiguous().view(-1) for p in partials]
+        for dst, src in zip(gathered_list, flats):
+            dst.copy_(src[offset : offset + chunk.numel()])
+        offset += chunk.numel()
+
+    tensor = partials[0].clone()
+    assert not tensor.is_contiguous()
+    deterministic_collectives.deterministic_sum_inplace_with_gather(
+        tensor, world_size=world_size, all_gather_fn=_fake_gather, chunk_numel=4
+    )
+
+    torch.testing.assert_close(tensor, expected)

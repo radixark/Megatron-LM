@@ -30,6 +30,7 @@ from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .deterministic_collectives import (
     deterministic_sum_inplace,
     is_deterministic_collectives_enabled,
+    log_group_ranks_once,
 )
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
@@ -426,6 +427,9 @@ class _ParamAndGradBucketGroup:
                 communication_group = self.intra_distributed_optimizer_instance_group
             else:
                 communication_group = self.data_parallel_group
+            log_group_ranks_once(
+                "deterministic_collectives grad bucket group", communication_group
+            )
             for bucket in self.buckets:
                 deterministic_sum_inplace(bucket.grad_data, communication_group)
             self.grad_reduce_handle = None
