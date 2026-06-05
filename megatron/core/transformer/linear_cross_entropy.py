@@ -6,6 +6,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
 
 class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
@@ -25,11 +26,20 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
         ignore_index: int = -100,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Run either the plain ColumnParallelLinear or fused linear+cross-entropy."""
+        weight = weight if weight is not None else self.weight
+        policy = resolve_true_on_policy_runtime_policy(self.config)
+        if (
+            policy.cast_lm_head_input_to_weight_dtype
+            and weight is not None
+            and input_.dtype != weight.dtype
+        ):
+            input_ = input_.to(weight.dtype)
+
         if output_cross_entropy_loss:
             assert labels is not None, "labels cannot be None when outputting cross-entropy loss."
             return self._compute_linear_and_cross_entropy_loss(
                 hidden=input_,
-                weight=weight if weight is not None else self.weight,
+                weight=weight,
                 labels=labels,
                 reduction=reduction,
                 ignore_index=ignore_index,

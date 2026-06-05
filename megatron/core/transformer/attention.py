@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -17,6 +18,18 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+
+try:
+    from miles_megatron_plugins.true_on_policy.sglang_backend import (
+        is_sglang_rope_enabled,
+        sglang_apply_rotary_pos_emb_with_freqs,
+    )
+
+    HAVE_SGLANG_ROPE = True
+except ImportError:
+    HAVE_SGLANG_ROPE = False
+    is_sglang_rope_enabled = lambda: False
+    sglang_apply_rotary_pos_emb_with_freqs = None
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_data_parallel_group,
@@ -34,6 +47,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -115,6 +129,67 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+def _register_attention_grad_debug(tensor: Tensor, *, layer_number: int, name: str) -> None:
+    debug_dir = os.environ.get("MILES_ACTIVATION_GRAD_DEBUG_DIR")
+    if not debug_dir or not torch.is_tensor(tensor) or not tensor.requires_grad:
+        return
+
+    debug_key = f"attention:{layer_number}:{name}"
+
+    def _hook(grad: Tensor) -> Tensor:
+        if torch.isfinite(grad).all().item():
+            return grad
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        seen = getattr(_register_attention_grad_debug, "_seen", set())
+        seen_key = (rank, debug_key)
+        if seen_key in seen:
+            return grad
+        seen.add(seen_key)
+        _register_attention_grad_debug._seen = seen
+
+        flat = grad.detach().view(-1)
+        finite = torch.isfinite(flat)
+        stats = {
+            "rank": rank,
+            "layer_number": layer_number,
+            "module": "attention",
+            "name": name,
+            "shape": tuple(grad.shape),
+            "dtype": str(grad.dtype),
+            "numel": flat.numel(),
+            "finite": int(finite.sum().item()),
+            "nan": int(torch.isnan(flat).sum().item()),
+            "inf": int(torch.isinf(flat).sum().item()),
+        }
+        if stats["finite"] > 0:
+            finite_values = flat[finite].float()
+            stats.update(
+                {
+                    "max_abs_finite": float(finite_values.abs().max().item()),
+                    "min_finite": float(finite_values.min().item()),
+                    "max_finite": float(finite_values.max().item()),
+                }
+            )
+
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(
+            debug_dir, f"rank_{rank}_layer_{layer_number}_attention_{name}_pid_{os.getpid()}.pt"
+        )
+        torch.save(stats, path)
+        print(f"[MILES_ACTIVATION_GRAD_DEBUG] {stats} wrote {path}", flush=True)
+        return grad
+
+    tensor.register_hook(_hook)
+
+
+def _sglang_cast_dense_tensor_math_input(tensor: Tensor) -> Tensor:
+    """Match SGLang true-on-policy dense tensor math dtype boundaries."""
+    if tensor.dtype == torch.bfloat16:
+        return tensor
+    return tensor.to(torch.bfloat16)
 
 
 class LinearQkv(Protocol):
@@ -221,6 +296,13 @@ class SelfAttentionSubmodules:
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     k_layernorm: Union[ModuleSpec, type] = None
+
+
+def _is_ulysses_cp(config: TransformerConfig) -> bool:
+    cp_comm_type = getattr(config, "cp_comm_type", None)
+    if isinstance(cp_comm_type, list):
+        cp_comm_type = cp_comm_type[0] if cp_comm_type else None
+    return config.context_parallel_size > 1 and cp_comm_type == "a2a"
 
 
 @dataclass
@@ -1095,30 +1177,58 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
 
             if split_qkv:
+                ulysses_cp = _is_ulysses_cp(self.config)
                 if q_pos_emb is not None:
-                    # TODO VIJAY: simplify
-                    if inference_context is None or inference_context.is_static_batching():
-                        query = apply_rotary_pos_emb(
-                            query,
-                            q_pos_emb,
+                    use_sglang_rope = (
+                        HAVE_SGLANG_ROPE and is_sglang_rope_enabled() and packed_seq_params is None
+                    )
+                    sglang_rope_applied = False
+                    if use_sglang_rope and sglang_apply_rotary_pos_emb_with_freqs is not None:
+                        q_freqs, _ = (
+                            q_pos_emb if isinstance(q_pos_emb, tuple) else (q_pos_emb, q_pos_emb)
+                        )
+                        query = sglang_apply_rotary_pos_emb_with_freqs(
+                            query, q_freqs, self.config, layer_number=self.layer_number
+                        )
+                        sglang_rope_applied = True
+                    if not sglang_rope_applied:
+                        if inference_context is None or inference_context.is_static_batching():
+                            query = apply_rotary_pos_emb(
+                                query,
+                                q_pos_emb,
+                                config=self.config,
+                                cu_seqlens=cu_seqlens_q,
+                                mscale=_yarn_get_concentration_factor_from_config(self.config),
+                                cp_group=self.pg_collection.cp,
+                                ulysses_cp=ulysses_cp,
+                            )
+                        else:
+                            query = inference_context.apply_rotary_emb_query(
+                                query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
+                            )
+                if k_pos_emb is not None:
+                    use_sglang_rope = (
+                        HAVE_SGLANG_ROPE and is_sglang_rope_enabled() and packed_seq_params is None
+                    )
+                    sglang_rope_applied = False
+                    if use_sglang_rope and sglang_apply_rotary_pos_emb_with_freqs is not None:
+                        _, k_freqs = (
+                            k_pos_emb if isinstance(k_pos_emb, tuple) else (k_pos_emb, k_pos_emb)
+                        )
+                        key = sglang_apply_rotary_pos_emb_with_freqs(
+                            key, k_freqs, self.config, layer_number=self.layer_number
+                        )
+                        sglang_rope_applied = True
+                    if not sglang_rope_applied:
+                        key = apply_rotary_pos_emb(
+                            key,
+                            k_pos_emb,
                             config=self.config,
-                            cu_seqlens=cu_seqlens_q,
+                            cu_seqlens=cu_seqlens_kv,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=self.pg_collection.cp,
+                            ulysses_cp=ulysses_cp,
                         )
-                    else:
-                        query = inference_context.apply_rotary_emb_query(
-                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
-                        )
-                if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key,
-                        k_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=_yarn_get_concentration_factor_from_config(self.config),
-                        cp_group=self.pg_collection.cp,
-                    )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
                     mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
@@ -1129,6 +1239,16 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
+
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+        if true_on_policy_policy.cast_qk_after_rope_to_dense_math_dtype:
+            # SGLang Qwen3 casts Q/K after QK RMSNorm and RoPE, before attention.
+            query = _sglang_cast_dense_tensor_math_input(query)
+            key = _sglang_cast_dense_tensor_math_input(key)
+        if split_qkv:
+            _register_attention_grad_debug(query, layer_number=self.layer_number, name="query")
+            _register_attention_grad_debug(key, layer_number=self.layer_number, name="key")
+            _register_attention_grad_debug(value, layer_number=self.layer_number, name="value")
 
         # ==================================
         # core attention computation
@@ -1197,6 +1317,9 @@ class Attention(MegatronModule, ABC):
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        _register_attention_grad_debug(
+            core_attn_out, layer_number=self.layer_number, name="core_attn_out"
+        )
         nvtx_range_pop(suffix="core_attention")
 
         # Output gate
@@ -1211,6 +1334,9 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="linear_proj")
         with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
+        _register_attention_grad_debug(
+            output, layer_number=self.layer_number, name="linear_proj_output"
+        )
         if self.offload_attn_proj:
             output = off_interface.group_commit(
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
@@ -1389,6 +1515,10 @@ class SelfAttention(Attention):
         If `output_gate` is True, then also derives `gate` tensor.
         If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
         """
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+        if true_on_policy_policy.cast_attention_input_to_dense_math_dtype:
+            hidden_states = _sglang_cast_dense_tensor_math_input(hidden_states)
+
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
