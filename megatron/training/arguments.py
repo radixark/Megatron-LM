@@ -1634,6 +1634,8 @@ def _add_network_size_args(parser):
         "barrier_with_L1_time",
         # args uses same var with a different name
         "num_moe_experts",
+        # defined in _add_tokenizer_args, required by topk router
+        "vocab_size",
         "fp8_param",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
@@ -2779,6 +2781,12 @@ def _add_mla_args(parser):
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
+    group.add_argument('--original-max-position-embeddings', type=int, default=4096,
+                       help="Original maximum position embeddings for the original model, used by yarn.")
+    group.add_argument('--beta-fast', type=float, default=32,
+                       help="Beta fast for YaRN RoPE.")
+    group.add_argument('--beta-slow', type=float, default=1,
+                       help="Beta slow for YaRN RoPE.")
 
     return parser
 

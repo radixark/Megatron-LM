@@ -281,7 +281,7 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
     """
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
+            if config.moe_router_enable_expert_bias and getattr(module, 'expert_bias', None) is not None:
                 module.local_tokens_per_expert.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
@@ -473,7 +473,7 @@ def finalize_model_grads(
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 
-    if config.moe_router_enable_expert_bias:
+    if config.moe_router_enable_expert_bias and not config.freeze_e_score_correction_bias:
         _update_router_expert_bias(model, config)
 
     reset_model_temporary_tensors(config, model)

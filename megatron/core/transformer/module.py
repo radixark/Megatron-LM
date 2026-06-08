@@ -430,6 +430,13 @@ class Float16Module(MegatronModule):
         self.vp_stage = getattr(module, 'vp_stage', None)
         self.pg_collection = getattr(module, 'pg_collection', None)
 
+        # Snapshot FP32 params marked with _keep_fp32 before precision conversion
+        fp32_params = {}
+        for name, param in module.named_parameters():
+            if getattr(param, '_keep_fp32', False):
+                assert param.dtype == torch.float32
+                fp32_params[name] = param.data.clone()
+
         if self.fp16:
             self.add_module('module', module.half())
 
@@ -444,6 +451,11 @@ class Float16Module(MegatronModule):
 
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
+
+        # Restore FP32 params after precision conversion
+        for name, param in self.module.named_parameters():
+            if name in fp32_params:
+                param.data = fp32_params[name]
 
         self.float16_convertor = float16_convertor
 
