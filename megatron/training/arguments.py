@@ -946,14 +946,6 @@ def validate_args(args, defaults={}):
                 "which depends on which parallelization you want to prioritize.",
                 args.rank,
             )
-        elif os.environ.get('MILES_EXPERIMENTAL_FT_TRAINER') == "1":
-            # The fault-tolerant (indep_dp) trainer requires CUDA_DEVICE_MAX_CONNECTIONS != 1.
-            # With a single hardware queue (==1) the concurrent intra-cell communicators
-            # (TP/CP/EP/expert-TP) of a freshly respawned cell serialize and deadlock during the
-            # first MoE+CP forward on rejoin; multiple connections let them progress independently.
-            assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
-                "The fault-tolerant trainer requires CUDA_DEVICE_MAX_CONNECTIONS to be unset or > 1 " \
-                "(it must not be 1)"
         else:
             assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
                 "Using tensor model parallelism or context parallelism require setting the environment variable " \
