@@ -214,7 +214,13 @@ class TopKRouter(Router):
             self.ga_steps = None
 
         from miles.utils.replay_base import routing_replay_manager
-        routing_replay_manager.register_to_module(self, "routing_replay")
+
+        # MTP routers must not register a replay slot: rollout routing replay
+        # only records the main decoder's MoE layers, so an MTP slot would
+        # desync the slot/fill pairing and pop empty (mirrors the GPT path's
+        # "not applicable for MTP modules" registration skip).
+        if not self.is_mtp_layer:
+            routing_replay_manager.register_to_module(self, "routing_replay")
 
     def _init_routing_mode(self, layer_number):
         assert not self._routing_mode_initialized
