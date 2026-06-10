@@ -168,6 +168,7 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         layer_number=i + 1,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                     )
                 else:
                     assert False, "unexpected layer_type"
