@@ -39,6 +39,7 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
         pg_collection=pg_collection,
+        vp_stage=vp_stage,
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):

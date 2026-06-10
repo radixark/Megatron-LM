@@ -213,7 +213,7 @@ def set_current_microbatch(model, microbatch_id):
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
-                layer.transformer_layer.current_microbatch = microbatch_id
+                layer.mtp_model_layer.current_microbatch = microbatch_id
 
 
 def forward_step_calc_loss(
