@@ -54,6 +54,19 @@ class TransformerConfig(ModelParallelConfig):
     by using D sequential modules to predict D additional tokens.
     """
 
+    mtp_loss_type: str = 'ce'
+    """Loss used to train the MTP draft head: 'ce' (cross-entropy, default) or 'tv'
+    (total-variation distillation to the main model's next-token distribution,
+    1 - sum_v min(softmax(p_main), softmax(q_draft))). TV is the direct objective for
+    rejection-sampling acceptance rate (accept_rate = 1 - d_TV); CE only bounds it via
+    Pinsker. 'tv' requires tensor-model-parallel size 1 (full vocab per rank).
+    """
+
+    mtp_tv_chunk: int = 0
+    """For mtp_loss_type='tv': chunk size along the sequence dim for the vocab-sum,
+    to cap peak/backward memory (each chunk is gradient-checkpointed). 0 = no chunking.
+    """
+
     mtp_loss_scaling_factor: Optional[float] = 0.1
     """Weighting factor of Multi-Token Prediction (MTP) loss.
     We compute the average of the MTP losses across all depths, 
