@@ -20,8 +20,8 @@ def _patched_initialize_state(self, param, state_name, zero_buffer, store_param_
     """Patched _initialize_state: allocate on CPU for low-memory resume."""
     from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
     try:
-        from transformer_engine.pytorch.tensor import QuantizedTensor  # TE >= 2.x
-    except ImportError:  # older TE layout
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+    except ImportError:
         from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     import transformer_engine_torch as tex
 
