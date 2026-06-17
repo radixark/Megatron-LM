@@ -122,7 +122,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
                         gpu_param.data.copy_(param.data, non_blocking=True)
-                self._d2h_stream.record_event().wait(torch.cuda.current_stream())
+                self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
 
@@ -370,15 +370,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            fp32_param = self.param_to_fp32_param[param]
-            fp32_param.data.copy_(v["master_param"])
+            inner_param = self.param_to_inner_param.get(param, param)
+            if inner_param is param:
+                continue
+            # Do the device/dtype conversion inside copy_ so the destination
+            # tensor owns the synchronization. Creating an intermediate
+            # non_blocking CPU tensor can race with the following CPU copy.
+            inner_param.data.copy_(v["master_param"].detach(), non_blocking=False)
 
     def update_fp32_param_by_new_param(self):
         """
-        Update the fp32 parameters by the new parameters.
+        Refresh optimizer-side parameter copies after model weights are loaded
+        or otherwise changed outside the optimizer.
         """
-        for param, fp32_param in self.param_to_fp32_param.items():
-            fp32_param.data.copy_(param)
+        for param, inner_param in self.param_to_inner_param.items():
+            if inner_param is param:
+                continue
+            # Blocking direct D2H copy is required here. 
+            inner_param.data.copy_(param.detach(), non_blocking=False)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
