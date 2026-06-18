@@ -397,19 +397,19 @@ class MultiTokenPredictionLayerSubmodules:
             embedding normalization to be applied.
         eh_proj (Union[ModuleSpec, type]): Specification or instance of the
             linear projection to be applied.
-        transformer_layer (Union[ModuleSpec, type]): Specification
+        mtp_model_layer (Union[ModuleSpec, type]): Specification
             or instance of the transformer block to be applied.
     """
 
     enorm: Union[ModuleSpec, type] = None
     hnorm: Union[ModuleSpec, type] = None
     eh_proj: Union[ModuleSpec, type] = None
-    transformer_layer: Union[ModuleSpec, type] = None
+    mtp_model_layer: Union[ModuleSpec, type] = None
     layer_norm: Union[ModuleSpec, type] = None
 
 
 def get_mtp_layer_spec(
-    transformer_layer_spec: ModuleSpec, use_transformer_engine: bool
+    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -417,13 +417,13 @@ def get_mtp_layer_spec(
         ModuleSpec: Module specification with TE modules
     """
     return get_mtp_layer_spec_for_backend(
-        transformer_layer_spec,
+        mtp_model_layer_spec,
         backend=TESpecProvider() if use_transformer_engine else LocalSpecProvider(),
     )
 
 
 def get_mtp_layer_spec_for_backend(
-    transformer_layer_spec: ModuleSpec, backend: BackendSpecProvider
+    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -438,7 +438,7 @@ def get_mtp_layer_spec_for_backend(
             enorm=layer_norm_impl,
             hnorm=layer_norm_impl,
             eh_proj=column_parallel_linear_impl,
-            transformer_layer=transformer_layer_spec,
+            mtp_model_layer=mtp_model_layer_spec,
             layer_norm=layer_norm_impl,
         ),
     )
@@ -622,7 +622,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
 
-        self_attention_spec = self.submodules.transformer_layer.submodules.self_attention
+        self_attention_spec = self.submodules.mtp_model_layer.submodules.self_attention
         attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
         assert attn_mask_type in SUPPORTED_ATTN_MASK, (
             f"Multi-Token Prediction (MTP) is not jet supported with "
@@ -664,14 +664,14 @@ class MultiTokenPredictionLayer(MegatronModule):
         diff_transformer_layer_offset = self.config.num_layers - get_transformer_layer_offset(
             self.config, vp_stage
         )
-        self.transformer_layer = build_module(
-            self.submodules.transformer_layer,
+        self.mtp_model_layer = build_module(
+            self.submodules.mtp_model_layer,
             config=self.config,
             vp_stage=vp_stage,
             layer_number=self.layer_number + diff_transformer_layer_offset,
         )
-        if hasattr(self.transformer_layer.mlp, 'set_is_mtp'):
-            self.transformer_layer.mlp.set_is_mtp()
+        if hasattr(self.mtp_model_layer.mlp, 'set_is_mtp'):
+            self.mtp_model_layer.mlp.set_is_mtp()
 
         self.final_layernorm = build_module(
             self.submodules.layer_norm,
@@ -793,7 +793,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is
             # True so that the fp8 weight caching can be triggered correctly.
             with transformer_layer_fp8_context:
-                hidden_states, _ = self.transformer_layer(
+                hidden_states, _ = self.mtp_model_layer(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     context=context,
