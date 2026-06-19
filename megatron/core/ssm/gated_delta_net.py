@@ -295,9 +295,10 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
-        if packed_seq_params is not None:
-            # TODO: support packed sequence
-            raise NotImplementedError("GDN does not support packed sequence for now.")
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            # GDN ignores the bshd PackedSeqParams Megatron passes uniformly; only genuine
+            # THD packing is unsupported (TODO: port THD support from upstream PR #2645).
+            raise NotImplementedError("GDN does not support THD packed sequence for now.")
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
