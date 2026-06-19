@@ -1512,6 +1512,71 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         return x_out
 
+    class _FakeMXFP4QuantizationSTE(torch.autograd.Function):
+        """Straight-through MXFP4 (E2M1, 1x``group_size`` UE8M0 pow-2) weight fake-quant.
+
+        Snaps each ``1 x group_size`` group of the weight onto the MXFP4 grid
+        (the 8 E2M1 magnitudes scaled by a per-group power-of-two factor) and
+        dequantizes back to ``x.dtype``. TE then casts this grid-snapped weight to
+        blockwise FP8 (128x128); because FP4->FP8 is lossless under the per-block
+        scale-ratio bound, the FP8 weight TE produces equals the MXFP4 weight, so
+        the existing blockwise FP8 GEMM is reused unchanged. Backward is identity
+        (STE), so gradients flow straight to the high-precision (bf16/fp32) master.
+
+        This mirrors ``_FakeInt4QuantizationSTE``; it keeps TE responsible for the
+        FP8 weight cast (it does NOT hand TE a pre-quantized Float8BlockwiseQTensor).
+        """
+
+        # E2M1 representable magnitudes (sign handled separately).
+        _E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+        @staticmethod
+        def forward(ctx, x, group_size):
+            m, n = x.shape
+            block_m, block_n = 1, group_size
+
+            m_padded = ceil_div(m, block_m) * block_m
+            n_padded = ceil_div(n, block_n) * block_n
+
+            x_padded = torch.zeros((m_padded, n_padded), dtype=x.dtype, device=x.device)
+            x_padded[:m, :n] = x
+
+            x_view = x_padded.view(
+                m_padded // block_m, block_m, n_padded // block_n, block_n
+            )
+
+            fp4_max = 6.0
+            # Per-group amax -> power-of-two (UE8M0) scale: 2^ceil(log2(amax / fp4_max)).
+            x_max = x_view.abs().float().amax(dim=(1, 3), keepdim=True)
+            x_max = x_max.clamp(min=fp4_max * 2 ** -126)  # guard all-zero groups
+            x_scale = torch.exp2(torch.ceil(torch.log2(x_max / fp4_max)))
+
+            # Round to the nearest E2M1 grid point (nearest, ties via bucketize midpoints).
+            grid = torch.tensor(
+                _FakeMXFP4QuantizationSTE._E2M1_GRID, dtype=torch.float32, device=x.device
+            )
+            mids = (grid[1:] + grid[:-1]) / 2.0
+            x_div = (x_view.float() / x_scale).clamp(-fp4_max, fp4_max)
+            x_q = torch.sign(x_div) * grid[torch.bucketize(x_div.abs(), mids)]
+
+            x_dequant_view = x_q * x_scale
+            x_dequant_full = x_dequant_view.view_as(x_padded)
+            x_out = x_dequant_full[:m, :n].contiguous().to(x.dtype)
+
+            return x_out
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            return grad_output, None
+
+    def fake_mxfp4_quantization_ste(x, group_size):
+        x_out = _FakeMXFP4QuantizationSTE.apply(x, group_size)
+
+        if hasattr(x, 'main_grad'):
+            x_out.main_grad = x.main_grad
+
+        return x_out
+
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
         Wrapper for the Transformer-Engine's `GroupedLinear` layer.
@@ -1736,6 +1801,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
                 weight_tensors = [
                     fake_int4_quantization_ste(w, group_size)
+                    for w in weight_tensors
+                ]
+            elif os.getenv("USE_MXFP4_QAT", "0") == "1":
+                # MXFP4 weight QAT: snap weights onto the E2M1 grid (1x32 UE8M0 groups)
+                # before TE's blockwise FP8 cast. FP4->FP8 is lossless, so this reuses
+                # the existing FP8 GEMM; backward is STE to the bf16/fp32 master.
+                group_size = int(os.getenv("MXFP4_QAT_GROUP_SIZE", "32"))
+
+                weight_tensors = [
+                    fake_mxfp4_quantization_ste(w, group_size)
                     for w in weight_tensors
                 ]
 
