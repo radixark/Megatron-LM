@@ -1512,70 +1512,99 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         return x_out
 
-    class _FakeMXFP4QuantizationSTE(torch.autograd.Function):
-        """Straight-through MXFP4 (E2M1, 1x``group_size`` UE8M0 pow-2) weight fake-quant.
+    def _mxfp4_to_blockwise_fp8_qtensor(w):
+        """bf16 weight -> MXFP4 (E2M1, 1x32 UE8M0) -> blockwise FP8 (E4M3, 128x128), entirely via
+        deepseek-ai/TileKernels, wrapped as a TE ``Float8BlockwiseQTensor`` so the TE GEMM consumes
+        it directly: TE does NOT re-quantize the weight (it only quantizes the activation).
 
-        Snaps each ``1 x group_size`` group of the weight onto the MXFP4 grid
-        (the 8 E2M1 magnitudes scaled by a per-group power-of-two factor) and
-        dequantizes back to ``x.dtype``. TE then casts this grid-snapped weight to
-        blockwise FP8 (128x128); because FP4->FP8 is lossless under the per-block
-        scale-ratio bound, the FP8 weight TE produces equals the MXFP4 weight, so
-        the existing blockwise FP8 GEMM is reused unchanged. Backward is identity
-        (STE), so gradients flow straight to the high-precision (bf16/fp32) master.
+            per_block_cast('e2m1', 1x32)  ->  per_block_cast_lossless((1x32)->(128x128), 'e4m3')
 
-        This mirrors ``_FakeInt4QuantizationSTE``; it keeps TE responsible for the
-        FP8 weight cast (it does NOT hand TE a pre-quantized Float8BlockwiseQTensor).
+        FP4->FP8 is lossless under the per-128x128-block scale-ratio bound that
+        ``per_block_cast_lossless`` device-asserts. The columnwise rep (needed by wgrad/dgrad) is
+        produced by quantizing ``w.T`` — for 128x128 square blocks it equals the transpose.
+
+        NOTE (needs Blackwell verification): the exact ``Float8BlockwiseQTensor`` scale_inv GEMM
+        layout/padding and constructor kwargs are TE-version specific. Run once with
+        ``MXFP4_QAT_VERIFY=1`` to assert TE's dequant of this tensor matches TileKernels' dequant
+        before trusting it (a wrong layout would otherwise silently corrupt training).
         """
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
+            Float8BlockQuantizer,
+            Float8BlockwiseQTensor,
+        )
 
-        # E2M1 representable magnitudes (sign handled separately).
-        _E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+        try:
+            from tile_kernels.quant import cast_back, per_block_cast, per_block_cast_lossless
+        except ImportError as e:
+            raise ImportError(
+                "USE_MXFP4_QAT weight path needs deepseek-ai/TileKernels "
+                "(tile_kernels.quant.per_block_cast / per_block_cast_lossless)."
+            ) from e
 
+        assert w.dim() == 2, f"MXFP4 weight QAT expects 2D expert weights, got {tuple(w.shape)}"
+
+        def _to_fp8(mat):
+            # bf16 -> E2M1 (1x32 pow2) -> E4M3 (128x128 pow2); fp32 scale_inv (use_packed_ue8m0=False).
+            fp4 = per_block_cast(mat, "e2m1", (1, 32), round_sf=True, use_packed_ue8m0=False)
+            return per_block_cast_lossless(
+                fp4, "e4m3", x_block_size=(1, 32), out_block_size=(128, 128),
+                round_sf=True, use_packed_ue8m0=False,
+            )
+
+        rowwise_fp8, rowwise_sf = _to_fp8(w.contiguous())
+        colwise_fp8, colwise_sf = _to_fp8(w.t().contiguous())  # 128x128 columnwise == transpose
+
+        quantizer = Float8BlockQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            rowwise=True,
+            columnwise=True,
+            force_pow_2_scales=True,
+            block_scaling_dim=2,  # 128x128 weight blocks
+        )
+
+        qtensor = Float8BlockwiseQTensor(
+            shape=w.shape,
+            dtype=w.dtype,
+            rowwise_data=rowwise_fp8.view(torch.uint8),
+            rowwise_scale_inv=rowwise_sf,
+            columnwise_data=colwise_fp8.view(torch.uint8),
+            columnwise_scale_inv=colwise_sf,
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            quantizer=quantizer,
+            is_2D_scaled=True,
+        )
+
+        if os.getenv("MXFP4_QAT_VERIFY", "0") == "1":
+            # Surface a layout/scale mismatch loudly instead of silently corrupting training:
+            # TE's dequant of our QTensor must match TileKernels' dequant of the same (fp8, scale).
+            te_dq = qtensor.dequantize(dtype=torch.float32)
+            tk_dq = cast_back((rowwise_fp8, rowwise_sf), "fp32", (128, 128))
+            if not torch.allclose(te_dq, tk_dq, atol=0.0, rtol=0.0):
+                max_err = (te_dq.float() - tk_dq.float()).abs().max().item()
+                raise RuntimeError(
+                    "MXFP4_QAT Float8BlockwiseQTensor layout mismatch vs TileKernels dequant "
+                    f"(max_abs_err={max_err}). The scale_inv GEMM layout/padding or constructor "
+                    "kwargs likely differ from TE's Float8BlockScaling; fix before training."
+                )
+
+        return qtensor
+
+    class _MXFP4WeightToFp8STE(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, x, group_size):
-            m, n = x.shape
-            block_m, block_n = 1, group_size
-
-            m_padded = ceil_div(m, block_m) * block_m
-            n_padded = ceil_div(n, block_n) * block_n
-
-            x_padded = torch.zeros((m_padded, n_padded), dtype=x.dtype, device=x.device)
-            x_padded[:m, :n] = x
-
-            x_view = x_padded.view(
-                m_padded // block_m, block_m, n_padded // block_n, block_n
-            )
-
-            fp4_max = 6.0
-            # Per-group amax -> power-of-two (UE8M0) scale: 2^ceil(log2(amax / fp4_max)).
-            x_max = x_view.abs().float().amax(dim=(1, 3), keepdim=True)
-            x_max = x_max.clamp(min=fp4_max * 2 ** -126)  # guard all-zero groups
-            x_scale = torch.exp2(torch.ceil(torch.log2(x_max / fp4_max)))
-
-            # Round to the nearest E2M1 grid point (nearest, ties via bucketize midpoints).
-            grid = torch.tensor(
-                _FakeMXFP4QuantizationSTE._E2M1_GRID, dtype=torch.float32, device=x.device
-            )
-            mids = (grid[1:] + grid[:-1]) / 2.0
-            x_div = (x_view.float() / x_scale).clamp(-fp4_max, fp4_max)
-            x_q = torch.sign(x_div) * grid[torch.bucketize(x_div.abs(), mids)]
-
-            x_dequant_view = x_q * x_scale
-            x_dequant_full = x_dequant_view.view_as(x_padded)
-            x_out = x_dequant_full[:m, :n].contiguous().to(x.dtype)
-
-            return x_out
+        def forward(ctx, w):
+            return _mxfp4_to_blockwise_fp8_qtensor(w)
 
         @staticmethod
         def backward(ctx, grad_output):
-            return grad_output, None
+            # Straight-through: grad flows unchanged to the bf16/fp32 master weight.
+            return grad_output
 
-    def fake_mxfp4_quantization_ste(x, group_size):
-        x_out = _FakeMXFP4QuantizationSTE.apply(x, group_size)
-
-        if hasattr(x, 'main_grad'):
-            x_out.main_grad = x.main_grad
-
-        return x_out
+    def mxfp4_weight_to_fp8_qtensor(w):
+        out = _MXFP4WeightToFp8STE.apply(w)
+        if hasattr(w, "main_grad"):
+            out.main_grad = w.main_grad
+        return out
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
@@ -1804,13 +1833,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     for w in weight_tensors
                 ]
             elif os.getenv("USE_MXFP4_QAT", "0") == "1":
-                # MXFP4 weight QAT: snap weights onto the E2M1 grid (1x32 UE8M0 groups)
-                # before TE's blockwise FP8 cast. FP4->FP8 is lossless, so this reuses
-                # the existing FP8 GEMM; backward is STE to the bf16/fp32 master.
-                group_size = int(os.getenv("MXFP4_QAT_GROUP_SIZE", "32"))
-
+                # MXFP4 weight QAT: bf16 -> MXFP4 -> blockwise FP8 entirely via TileKernels, handed
+                # to TE as a Float8BlockwiseQTensor (TE does NOT re-quantize the weight). Backward
+                # is STE to the bf16/fp32 master.
                 weight_tensors = [
-                    fake_mxfp4_quantization_ste(w, group_size)
+                    mxfp4_weight_to_fp8_qtensor(w)
                     for w in weight_tensors
                 ]
 
