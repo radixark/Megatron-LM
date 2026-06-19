@@ -1544,9 +1544,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         assert w.dim() == 2, f"MXFP4 weight QAT expects 2D expert weights, got {tuple(w.shape)}"
 
+        # MXFP4 QAT is Blackwell-only (the run_deepseek_v4 recipe pins
+        # NVTE_FP8_BLOCK_SCALING_FP32_SCALES=0), which for TE's Float8BlockScaling means
+        # power_2_scale=True with FP32 scale CONTAINERS (not packed E8M0 — that is the separate
+        # MXFP8 recipe). So we match it with pow-2 values stored as fp32:
+        #   bf16 -> E2M1: 1x32 UE8M0 (pow-2) micro-scale.
+        #   E2M1 -> E4M3: 128x128 pow-2 scale, stored fp32 (use_packed_ue8m0=False).
         def _to_fp8(mat):
-            # bf16 -> E2M1 (1x32 pow2) -> E4M3 (128x128 pow2); fp32 scale_inv (use_packed_ue8m0=False).
-            fp4 = per_block_cast(mat, "e2m1", (1, 32), round_sf=True, use_packed_ue8m0=False)
+            fp4 = per_block_cast(mat, "e2m1", (1, 32), round_sf=True, use_packed_ue8m0=True)
             return per_block_cast_lossless(
                 fp4, "e4m3", x_block_size=(1, 32), out_block_size=(128, 128),
                 round_sf=True, use_packed_ue8m0=False,
@@ -1559,7 +1564,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             fp8_dtype=tex.DType.kFloat8E4M3,
             rowwise=True,
             columnwise=True,
-            force_pow_2_scales=True,
+            force_pow_2_scales=True,  # env=0 -> power_2_scale=True (pow-2 values, fp32 container)
             block_scaling_dim=2,  # 128x128 weight blocks
         )
 
@@ -1577,14 +1582,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         if os.getenv("MXFP4_QAT_VERIFY", "0") == "1":
             # Surface a layout/scale mismatch loudly instead of silently corrupting training:
-            # TE's dequant of our QTensor must match TileKernels' dequant of the same (fp8, scale).
+            # TE's dequant of our QTensor must equal the MXFP4-grid weight (FP4->FP8 is lossless).
+            # The reference uses an fp32-scale round-trip so it is independent of the FP8 scale packing.
+            ref_fp4 = per_block_cast(w.contiguous(), "e2m1", (1, 32), round_sf=True, use_packed_ue8m0=False)
+            ref = cast_back(ref_fp4, "fp32", (1, 32))
             te_dq = qtensor.dequantize(dtype=torch.float32)
-            tk_dq = cast_back((rowwise_fp8, rowwise_sf), "fp32", (128, 128))
-            if not torch.allclose(te_dq, tk_dq, atol=0.0, rtol=0.0):
-                max_err = (te_dq.float() - tk_dq.float()).abs().max().item()
+            if not torch.allclose(te_dq, ref, atol=0.0, rtol=0.0):
+                max_err = (te_dq.float() - ref.float()).abs().max().item()
                 raise RuntimeError(
-                    "MXFP4_QAT Float8BlockwiseQTensor layout mismatch vs TileKernels dequant "
-                    f"(max_abs_err={max_err}). The scale_inv GEMM layout/padding or constructor "
+                    "MXFP4_QAT Float8BlockwiseQTensor mismatch vs the MXFP4-grid weight "
+                    f"(max_abs_err={max_err}). The scale_inv GEMM layout/dtype/padding or constructor "
                     "kwargs likely differ from TE's Float8BlockScaling; fix before training."
                 )
 
