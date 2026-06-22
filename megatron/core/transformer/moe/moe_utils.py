@@ -691,6 +691,7 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
+    is_mtp: bool = False,
     dense_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
@@ -787,15 +788,26 @@ def topk_routing_with_score_function(
             # Sorting top-k turned off during inference
             return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
 
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
-        # Default behavior if no replay is active
+    # miles rollout routing replay (R3): replays sglang rollout routing in the training
+    # engine. This is miles' own mechanism and must take precedence — it is the active
+    # path during miles training. MTP layers bypass R3. NVIDIA's inference-time
+    # router_replay (megatron's own generation) is a separate pipeline used only when
+    # the miles manager is not active, so it can never shadow R3.
+    from miles.utils.replay_base import routing_replay_manager
 
-        if router_replay is None:
-            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-        else:
+    if not is_mtp:
+        _miles_topk = routing_replay_manager.get_topk_fn(_compute_topk, return_probs=True)
+    else:
+        _miles_topk = _compute_topk
+
+    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+        if not is_mtp and routing_replay_manager.enabled:
+            return _miles_topk(scores, topk, num_groups, group_topk)
+        if router_replay is not None:
             return router_replay.get_replay_topk(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
+        return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 
     # Precision notes:
     # - Logits are converted to fp32 for score functions.
