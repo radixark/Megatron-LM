@@ -1657,6 +1657,8 @@ def wrap_model_chunks_with_ddp(
     pg_collection=None,
     bucket_sizes=None,
     disable_bucketing_per_chunk=None,
+    disable_grad_buffers_cpu_backup=False,
+    disable_param_buffers_cpu_backup=False,
 ):
     """Wrap each model chunk in DDP, pre-computing per-chunk param layouts as needed.
 
@@ -1747,6 +1749,10 @@ def wrap_model_chunks_with_ddp(
             chunk_kwargs["pg_collection"] = pg_collection
         if layout is not None:
             chunk_kwargs["full_param_layout"] = layout
+        # miles TMS no-cpu-backup flags are DDP-specific (consumed by _ParamAndGradBuffer).
+        if DP is DDP:
+            chunk_kwargs["disable_grad_buffers_cpu_backup"] = disable_grad_buffers_cpu_backup
+            chunk_kwargs["disable_param_buffers_cpu_backup"] = disable_param_buffers_cpu_backup
         wrapped.append(
             DP(
                 config=config,
@@ -1951,6 +1957,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
+                disable_grad_buffers_cpu_backup=getattr(
+                    args, 'disable_grad_buffers_cpu_backup', False
+                ),
+                disable_param_buffers_cpu_backup=getattr(
+                    args, 'disable_param_buffers_cpu_backup', False
+                ),
             )
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
