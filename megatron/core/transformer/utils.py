@@ -79,6 +79,12 @@ def erf_gelu(x):
 @torch.no_grad()
 def cat_with_oom_fallback(sub_state_dict):
     """Merge sharded tensor pieces, falling back to CPU if device-side cat OOMs."""
+    # miles --low-memory-resume: merge on CPU proactively to keep peak GPU memory low
+    # during distributed-optimizer checkpoint load (avoids the device cat allocation).
+    from megatron.training import get_args
+
+    if get_args().low_memory_resume:
+        return torch.cat([t.cpu() for t in sub_state_dict])
     try:
         return torch.cat(sub_state_dict)
     except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
