@@ -381,6 +381,10 @@ def _replace_sharded_keys_with_state_dict_keys(
     """Inverse of _replace_state_dict_keys_with_sharded_keys."""
     recovered_sd = {}
     for k, tensors in state_dict.items():
+        if isinstance(tensors, io.BytesIO):
+            # TE FP8 _extra_state arrives as a bare io.BytesIO, so len(tensors) raises.
+            # An empty uint8 tensor makes TE.set_extra_state skip restoring FP8 state.
+            tensors = [torch.empty(0, dtype=torch.uint8)]
         assert len(tensors) == len(rename_mapping[k])
         for ten, recovered_k in zip(tensors, rename_mapping[k]):
             recovered_sd[recovered_k] = ten
