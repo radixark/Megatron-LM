@@ -264,6 +264,13 @@ class TopKRouter(Router):
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
 
+        # miles rollout routing replay (R3): register this router so the miles
+        # routing_replay_manager can record/replay sglang rollout routing during
+        # training. No-op (early return) unless miles enables the manager.
+        from miles.utils.replay_base import routing_replay_manager
+
+        routing_replay_manager.register_to_module(self, "routing_replay")
+
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.
@@ -818,6 +825,7 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                is_mtp=self.is_mtp_layer,
             )
 
         # Apply token dropping to probs and routing_map.
@@ -1014,6 +1022,7 @@ class InferenceTopKRouter(TopKRouter):
             expert_bias=self.expert_bias,
             fused=self.config.moe_router_fusion,
             router_replay=self.router_replay,
+            is_mtp=self.is_mtp_layer,
             dense_output=True,
         )
         return probs.squeeze(1), top_indices.squeeze(1)
