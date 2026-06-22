@@ -195,6 +195,8 @@ def get_gpt_layer_with_transformer_engine_submodules(
     mla_down_proj_fusion: bool = False,
     dense_grouped_gemm: bool = False,
     use_grouped_gemm_for_dense_mlp: bool = False,
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -289,9 +291,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
                 sharded_state_dict_keys_map=(
                     {
                         "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
@@ -320,10 +324,12 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
             self_attention_hyper_connection=hc_module,
             pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
             mlp_hyper_connection=hc_module,
         )
     else:
@@ -345,10 +351,12 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
             self_attention_hyper_connection=hc_module,
             pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
             mlp_hyper_connection=hc_module,
             sharded_state_dict_keys_map={
                 "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
