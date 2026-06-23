@@ -305,10 +305,25 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
-        None
-    )
-    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
+    experimental_attention_variant: Optional[
+        Literal['gated_delta_net', 'dsa', 'dsv4_hybrid', 'dsv4']
+    ] = None
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, dsv4_hybrid, and
+    dsv4 (miles' custom DeepSeek-V4 sparse-attention path; see bump_docs/02-deepseek-v4.md)."""
+
+    dsv4_mode: bool = False
+    """Set automatically when experimental_attention_variant == 'dsv4'. Gates miles' DeepSeek-V4
+    manifold hyper-connection (mHC) 4-stream residual hooks in transformer_block/layer/p2p."""
+
+    dsv4_hc_mult: Optional[int] = None
+    """miles dsv4 manifold hyper-connection (mHC) stream multiplier (number of HC residual streams).
+    Kept distinct from native num_residual_streams: dsv4 mHC is miles' own module (precision-branched)."""
+
+    dsv4_hc_sinkhorn_iters: int = 20
+    """Number of Sinkhorn iterations for miles dsv4 mHC doubly-stochastic normalization."""
+
+    dsv4_hc_eps: float = 1e-6
+    """Epsilon for miles dsv4 mHC Sinkhorn normalization."""
 
     ####################
     # DSA
@@ -1497,6 +1512,11 @@ class TransformerConfig(ModelParallelConfig):
             )
         elif self.experimental_attention_variant == "dsa":
             pass
+        elif self.experimental_attention_variant == "dsv4":
+            # miles' custom DeepSeek-V4 sparse-attention path (BSHD + full CP + tilelang kernels +
+            # miles' mHC). Unlike dsv4_hybrid it supports TP>1 / CP>1, so no TP==1 / CP==1 asserts.
+            self.dsv4_mode = True
+            assert self.multi_latent_attention, "dsv4 requires multi_latent_attention."
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"

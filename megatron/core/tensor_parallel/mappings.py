@@ -19,8 +19,14 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def _reduce(input_, group):
-    """All-reduce the input tensor across model parallel group."""
+def _reduce(input_, group, fp32=False):
+    """All-reduce the input tensor across model parallel group.
+
+    Args:
+        input_: Input tensor.
+        group: Process group for all-reduce.
+        fp32: If True, cast to FP32 before all-reduce, then cast back.
+    """
     assert group is not None, "group should not be None"
 
     # Bypass the function if we are using only 1 GPU.
@@ -28,7 +34,13 @@ def _reduce(input_, group):
         return input_
 
     # All-reduce.
-    torch.distributed.all_reduce(input_.contiguous(), group=group)
+    if fp32:
+        orig_dtype = input_.dtype
+        input_fp32 = input_.float().contiguous()
+        torch.distributed.all_reduce(input_fp32, group=group)
+        input_.copy_(input_fp32.to(orig_dtype))
+    else:
+        torch.distributed.all_reduce(input_.contiguous(), group=group)
 
     return input_
 
@@ -198,20 +210,21 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
     """Pass the input to the model parallel region."""
 
     @staticmethod
-    def symbolic(graph, input_, group):
+    def symbolic(graph, input_, group, all_reduce_grad_fp32=False):
         """Symbolic function for tracing."""
         return input_
 
     @staticmethod
-    def forward(ctx, input_, group):
+    def forward(ctx, input_, group, all_reduce_grad_fp32=False):
         """Forward function."""
         ctx.group = group
+        ctx.all_reduce_grad_fp32 = all_reduce_grad_fp32
         return input_
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
-        return _reduce(grad_output, ctx.group), None
+        return _reduce(grad_output, ctx.group, fp32=ctx.all_reduce_grad_fp32), None, None
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
@@ -485,10 +498,16 @@ class _AllToAll(torch.autograd.Function):
 # -----------------
 
 
-def copy_to_tensor_model_parallel_region(input_, group=None):
-    """Wrapper for autograd function: forward: copy, backward allreduce"""
+def copy_to_tensor_model_parallel_region(input_, group=None, all_reduce_grad_fp32=False):
+    """Wrapper for autograd function: forward: copy, backward allreduce
+
+    Args:
+        input_: Input tensor.
+        group: Process group for all-reduce. If None, uses default TP group.
+        all_reduce_grad_fp32: If True, cast gradients to FP32 before all-reduce, then cast back.
+    """
     group = get_tensor_model_parallel_group_if_none(group)
-    return _CopyToModelParallelRegion.apply(input_, group)
+    return _CopyToModelParallelRegion.apply(input_, group, all_reduce_grad_fp32)
 
 
 def reduce_from_tensor_model_parallel_region(input_, group=None):

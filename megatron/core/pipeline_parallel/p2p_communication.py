@@ -202,17 +202,19 @@ class P2PCommunicator:
             (recv_prev_shape, recv_next_shape)
         """
         config = self.config
+        # miles dsv4 mHC carries a 4-D residual [s, b, hc, d] across pipeline stages.
+        num_dims = 4 if config.dsv4_mode else 3
         recv_prev_shape_tensor = None
         recv_next_shape_tensor = None
         send_prev_shape_tensor = None
         send_next_shape_tensor = None
         if recv_prev:
             recv_prev_shape_tensor = torch.empty(
-                (3,), device=torch.cuda.current_device(), dtype=torch.int64
+                (num_dims,), device=torch.cuda.current_device(), dtype=torch.int64
             )
         if recv_next:
             recv_next_shape_tensor = torch.empty(
-                (3,), device=torch.cuda.current_device(), dtype=torch.int64
+                (num_dims,), device=torch.cuda.current_device(), dtype=torch.int64
             )
         if tensor_send_prev is not None:
             send_prev_shape_tensor = torch.tensor(
@@ -262,11 +264,11 @@ class P2PCommunicator:
             # should take this out once the bug with batch_isend_irecv is resolved.
             torch.cuda.synchronize()
 
-        recv_prev_shape = [0, 0, 0]
+        recv_prev_shape = [0] * num_dims
         if recv_prev_shape_tensor is not None:
             recv_prev_shape = recv_prev_shape_tensor.tolist()
 
-        recv_next_shape = [0, 0, 0]
+        recv_next_shape = [0] * num_dims
         if recv_next_shape_tensor is not None:
             recv_next_shape = recv_next_shape_tensor.tolist()
 

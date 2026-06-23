@@ -1247,7 +1247,11 @@ def forward_backward_pipelining_with_interleaving(
         # Note: This is a simplified approach - proper VPP support may need more complex logic
         hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
-    tensor_shape = [seq_length, micro_batch_size, hidden_dim]
+    if config.dsv4_mode:
+        # miles dsv4 mHC carries a 4-D residual [s, b, hc, d] across pipeline stages.
+        tensor_shape = [seq_length, micro_batch_size, config.dsv4_hc_mult, config.hidden_size]
+    else:
+        tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -2236,7 +2240,13 @@ def get_tensor_shapes(
         if use_nstream:
             hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
+    if config.dsv4_mode:
+        # miles dsv4 mHC carries a 4-D residual [s, b, hc, d] across pipeline stages.
+        tensor_shapes.append(
+            (effective_seq_length, micro_batch_size, config.dsv4_hc_mult, config.hidden_size)
+        )
+    else:
+        tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes
 
 

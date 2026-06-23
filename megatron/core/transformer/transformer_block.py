@@ -404,6 +404,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
+        # DeepSeek V4 (miles) Hyper-Connection — miles' own mHC module, distinct from dev's native
+        # enable_hyper_connections path. Gated on dsv4_mode (mutually exclusive with the native path).
+        if self.config.dsv4_mode:
+            from miles_plugins.models.deepseek_v4.ops.hyper_connection import (
+                DeepSeekV4HyperConnectionUtil,
+                HCHeadParams,
+            )
+
+            self.hc_util = DeepSeekV4HyperConnectionUtil(self.config)
+            if self.has_final_layernorm_in_this_stage():
+                self.hc_head_params = HCHeadParams(self.config)
+
         if self.config.inference_fuse_tp_communication:
             self._setup_fused_tp_communication()
 
@@ -824,6 +836,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states, self.num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
 
+        # miles dsv4 mHC expand: [s, b, d] -> [s, b, hc, d]
+        if self.config.dsv4_mode and self.pre_process:
+            hidden_states = self.hc_util.block_expand(hidden_states)
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -963,6 +979,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 self.hc_head_scale,
                 self.config.num_residual_streams,
                 self.config.layernorm_epsilon,
+            )
+
+        # miles dsv4 mHC head: [s, b, hc, d] -> [s, b, d]
+        if self.config.dsv4_mode and self.post_process and hasattr(self, 'hc_head_params'):
+            hidden_states = self.hc_util.block_head(
+                hidden_states,
+                self.hc_head_params.hc_head_fn,
+                self.hc_head_params.hc_head_scale,
+                self.hc_head_params.hc_head_base,
             )
 
         # Final layer norm.

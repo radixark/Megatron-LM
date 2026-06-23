@@ -403,6 +403,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
+        # DeepSeek V4 Hyper-Connection per-layer parameters
+        if self.config.dsv4_mode:
+            hc_mult = self.config.dsv4_hc_mult
+            hc_dim = hc_mult * self.config.hidden_size
+            mix_size = (2 + hc_mult) * hc_mult
+            self.hc_attn_fn = torch.nn.Parameter(torch.empty(mix_size, hc_dim, dtype=torch.float32))
+            self.hc_attn_base = torch.nn.Parameter(torch.empty(mix_size, dtype=torch.float32))
+            self.hc_attn_scale = torch.nn.Parameter(torch.empty(3, dtype=torch.float32))
+            self.hc_ffn_fn = torch.nn.Parameter(torch.empty(mix_size, hc_dim, dtype=torch.float32))
+            self.hc_ffn_base = torch.nn.Parameter(torch.empty(mix_size, dtype=torch.float32))
+            self.hc_ffn_scale = torch.nn.Parameter(torch.empty(3, dtype=torch.float32))
+            for p in [
+                self.hc_attn_fn,
+                self.hc_attn_base,
+                self.hc_attn_scale,
+                self.hc_ffn_fn,
+                self.hc_ffn_base,
+                self.hc_ffn_scale,
+            ]:
+                p._keep_fp32 = True
+
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
             config=self.config,
@@ -739,6 +760,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        # HC pre for attention sublayer. layer_pre runs on the RAW hidden_states
+        # (the 4-stream residual) and returns a contracted hidden_states that then
+        # feeds input_layernorm. The raw hidden_states is captured as the residual.
+        if self.config.dsv4_mode:
+            from miles_plugins.models.deepseek_v4.ops.hyper_connection import (
+                DeepSeekV4HyperConnectionUtil,
+            )
+
+            hc_util = DeepSeekV4HyperConnectionUtil(self.config)
+            dsv4_attn_residual = hidden_states
+            hidden_states, hc_attn_post, hc_attn_comb = hc_util.layer_pre(
+                hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+
         # Optional Input Layer norm
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         if self.recompute_input_layernorm:
@@ -759,6 +794,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     f"got {len(input_layernorm_output)}"
                 )
             input_layernorm_output, residual = input_layernorm_output
+        elif self.config.dsv4_mode:
+            # DSV4: the residual is the raw 4-stream hidden_states captured before HC pre.
+            residual = dsv4_attn_residual
         else:
             residual = hidden_states
 
@@ -795,23 +833,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias[0]
             )
 
-        attention_output, attention_output_bias = attention_output_with_bias
-        attention_output = self.post_self_attn_layernorm(attention_output)
-        attention_output_with_bias = (attention_output, attention_output_bias)
-
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # self attention module.
-            hidden_states = attention_output_with_bias[0]
+        if self.config.dsv4_mode:
+            # DSV4: skip post_self_attn_layernorm + bda; residual connection is
+            # handled by HC layer_post.
+            hidden_states = hc_util.layer_post(
+                attention_output_with_bias, residual, hc_attn_post, hc_attn_comb
+            )
         else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                    attention_output_with_bias, residual, self.hidden_dropout
-                )
+            attention_output, attention_output_bias = attention_output_with_bias
+            attention_output = self.post_self_attn_layernorm(attention_output)
+            attention_output_with_bias = (attention_output, attention_output_bias)
+
+            if using_fused_tp_inference_kernel:
+                # In inference optimized transformer layer, there is no bias and dropout
+                # The remaining residual add is already handled inside the
+                # self attention module.
+                hidden_states = attention_output_with_bias[0]
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.self_attn_bda(
+                        self.training, self.config.bias_dropout_fusion
+                    )(attention_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
@@ -909,6 +954,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm + MLP/MoE and return the raw output before BDA."""
+        # HC pre for MLP sublayer. layer_pre runs on the RAW hidden_states (the
+        # 4-stream residual) and returns a contracted hidden_states that then feeds
+        # pre_mlp_layernorm. The raw hidden_states is captured as the residual, and
+        # the post/comb mixes are stashed on self for _forward_post_mlp (the MLP is
+        # split across _forward_mlp_output_with_bias and _forward_post_mlp in dev).
+        if self.config.dsv4_mode:
+            from miles_plugins.models.deepseek_v4.ops.hyper_connection import (
+                DeepSeekV4HyperConnectionUtil,
+            )
+
+            hc_util = DeepSeekV4HyperConnectionUtil(self.config)
+            dsv4_ffn_residual = hidden_states
+            hidden_states, hc_ffn_post, hc_ffn_comb = hc_util.layer_pre(
+                hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            )
+            self._dsv4_hc_ffn_post = hc_ffn_post
+            self._dsv4_hc_ffn_comb = hc_ffn_comb
+
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
         if isinstance(pre_mlp_layernorm_output, tuple):
@@ -919,6 +982,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     f"got {len(pre_mlp_layernorm_output)}"
                 )
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+        elif self.config.dsv4_mode:
+            # DSV4: the residual is the raw 4-stream hidden_states captured before HC pre.
+            residual = dsv4_ffn_residual
         else:
             # Residual connection.
             residual = hidden_states
@@ -1091,7 +1157,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
-        if using_fused_tp_inference_kernel:
+        if self.config.dsv4_mode:
+            # DSV4: skip bias_dropout_add; residual connection is handled by HC
+            # layer_post. The post/comb mixes were stashed by _forward_mlp_output_with_bias.
+            from miles_plugins.models.deepseek_v4.ops.hyper_connection import (
+                DeepSeekV4HyperConnectionUtil,
+            )
+
+            hc_util = DeepSeekV4HyperConnectionUtil(self.config)
+            hc_ffn_post = self._dsv4_hc_ffn_post
+            hc_ffn_comb = self._dsv4_hc_ffn_comb
+            del self._dsv4_hc_ffn_post
+            del self._dsv4_hc_ffn_comb
+            hidden_states = hc_util.layer_post(
+                mlp_output_with_bias, residual, hc_ffn_post, hc_ffn_comb
+            )
+        elif using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
             # MLP module.

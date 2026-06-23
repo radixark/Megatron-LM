@@ -400,8 +400,8 @@ class MultiLatentAttention(Attention):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 extra_kwargs = {}
-                if self.config.experimental_attention_variant == "dsa":
-                    # For dsa we need to pass in the original hidden states and the compressed
+                if self.config.experimental_attention_variant in ("dsa", "dsv4"):
+                    # For dsa/dsv4 we need to pass in the original hidden states and the compressed
                     # query representation.
                     extra_kwargs["x"] = hidden_states
                     extra_kwargs["qr"] = q_compressed
