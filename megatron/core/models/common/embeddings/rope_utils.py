@@ -217,6 +217,7 @@ def _apply_rotary_pos_emb_thd(
     cp_group: torch.distributed.ProcessGroup = None,
     multi_latent_attention: Optional[bool] = None,
     max_seqlen: Optional[int] = None,
+    ulysses_cp: bool = False,
 ) -> Tensor:
     """Apply RoPE for `thd` format using pure CUDA ops (CUDA Graph compatible).
 
@@ -255,6 +256,14 @@ def _apply_rotary_pos_emb_thd(
     # local tokens to packed sequences.
     cu_seqlens_i64 = cu_seqlens.to(torch.int64)
     global_seq_lens = cu_seqlens_i64[1:] - cu_seqlens_i64[:-1]
+    # Ulysses CP can present the full packed sequence on every rank (e.g. the
+    # SGLang attention path before its all-to-all head redistribution). In that
+    # full-sequence layout RoPE must behave like CP size 1; the local zigzag
+    # sequence-shard layout instead uses the real CP rank/size. The guard short-
+    # circuits on `ulysses_cp` so the default path stays sync-free / dev-identical.
+    if ulysses_cp and total_tokens == int(global_seq_lens.sum().item()):
+        cp_size = 1
+        cp_rank = 0
     local_seq_lens = global_seq_lens // cp_size if cp_size > 1 else global_seq_lens
     local_cu_seqlens = torch.zeros_like(cu_seqlens_i64)
     local_cu_seqlens[1:] = torch.cumsum(local_seq_lens, dim=0)
@@ -321,6 +330,7 @@ def apply_rotary_pos_emb(
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
     max_seqlen: Optional[int] = None,
+    ulysses_cp: bool = False,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -366,12 +376,20 @@ def apply_rotary_pos_emb(
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
+            full_token_count = int((cu_seqlens[1:] - cu_seqlens[:-1]).sum().item())
+            local_token_count = t.size(0)
+            if ulysses_cp and local_token_count == full_token_count:
+                cp_size = 1
+                cp_rank = 0
+            else:
+                cp_size = cp_group.size()
+                cp_rank = cp_group.rank()
             return fused_apply_rotary_pos_emb_thd(
                 t,
                 cu_seqlens,
                 freqs,
-                cp_size=cp_group.size(),
-                cp_rank=cp_group.rank(),
+                cp_size=cp_size,
+                cp_rank=cp_rank,
                 interleaved=config.rotary_interleaved,
             )
     # use unfused implementation
@@ -397,6 +415,7 @@ def apply_rotary_pos_emb(
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,
+            ulysses_cp=ulysses_cp,
         )
 
 

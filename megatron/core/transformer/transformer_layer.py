@@ -35,6 +35,11 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, copy_signature
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.debug import (
+    register_activation_grad_debug,
+    register_norm_grad_debug as _register_norm_grad_debug,
+)
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
@@ -760,9 +765,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # HC pre for attention sublayer. layer_pre runs on the RAW hidden_states
-        # (the 4-stream residual) and returns a contracted hidden_states that then
-        # feeds input_layernorm. The raw hidden_states is captured as the residual.
+        # HC pre for attention sublayer (DSv4 mHC). layer_pre runs on the RAW hidden_states
+        # (the 4-stream residual) and returns a contracted hidden_states that feeds input_layernorm;
+        # the raw hidden_states is captured as the residual (used by layer_post below).
         if self.config.dsv4_mode:
             from miles_plugins.models.deepseek_v4.ops.hyper_connection import (
                 DeepSeekV4HyperConnectionUtil,
@@ -774,17 +779,48 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
 
+        # true-on-policy: the SGLang path carries (MLP output, residual) as a pair across layer
+        # boundaries to match SGLang's LayerCommunicator flow. Off (contract is None) -> None.
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
+        sglang_carried_residual = (
+            getattr(hidden_states, "_sglang_residual", None)
+            if true_on_policy_policy.use_sglang_residual_pair
+            else None
+        )
+
         # Optional Input Layer norm
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
-        if self.recompute_input_layernorm:
+        if sglang_carried_residual is not None:
+            input_layernorm_output, residual = self.input_layernorm(
+                hidden_states, sglang_carried_residual
+            )
+            _register_norm_grad_debug(
+                input_layernorm_output,
+                layer_number=self.layer_number,
+                name="input_layernorm_output",
+            )
+            _register_norm_grad_debug(
+                residual, layer_number=self.layer_number, name="input_layernorm_residual_output"
+            )
+        elif self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     apply_module(self.input_layernorm), hidden_states
                 )
+            _register_norm_grad_debug(
+                input_layernorm_output,
+                layer_number=self.layer_number,
+                name="input_layernorm_output",
+            )
         else:
             with attn_norm_manager as hidden_states:
                 input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+            _register_norm_grad_debug(
+                input_layernorm_output,
+                layer_number=self.layer_number,
+                name="input_layernorm_output",
+            )
 
         if isinstance(input_layernorm_output, tuple):
             if len(input_layernorm_output) != 2:
@@ -794,6 +830,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     f"got {len(input_layernorm_output)}"
                 )
             input_layernorm_output, residual = input_layernorm_output
+        elif sglang_carried_residual is not None:
+            # true-on-policy: residual already produced by the SGLang residual-pair
+            # input_layernorm above; do not overwrite it.
+            pass
         elif self.config.dsv4_mode:
             # DSV4: the residual is the raw 4-stream hidden_states captured before HC pre.
             residual = dsv4_attn_residual
@@ -842,6 +882,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = hc_util.layer_post(
                 attention_output_with_bias, residual, hc_attn_post, hc_attn_comb
             )
+        elif true_on_policy_policy.use_sglang_residual_pair:
+            attention_output, attention_output_bias = attention_output_with_bias
+            if attention_output_bias is not None:
+                attention_output = attention_output + attention_output_bias
+            hidden_states = torch.nn.functional.dropout(
+                attention_output, p=self.hidden_dropout, training=self.training
+            )
+            self._sglang_pre_mlp_residual = residual
         else:
             attention_output, attention_output_bias = attention_output_with_bias
             attention_output = self.post_self_attn_layernorm(attention_output)
@@ -922,6 +970,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "stacks."
             )
         hidden_states, context = self._forward_attention(*args, **kwargs)
+        register_activation_grad_debug(
+            self, hidden_states, layer_number=self.layer_number, name="after_attention"
+        )
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
@@ -929,11 +980,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             input_ids=kwargs.get("input_ids", None),
             packed_seq_params=kwargs.get("packed_seq_params", None),
         )
+        register_activation_grad_debug(
+            self, output, layer_number=self.layer_number, name="layer_output"
+        )
         return output, context
 
-    def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
+    def _forward_pre_mlp_layernorm(self, hidden_states: Tensor, residual: Optional[Tensor] = None):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if self.recompute_pre_mlp_layernorm:
+            if residual is not None:
+                raise AssertionError(
+                    "SGLang residual-pair pre-MLP layernorm is not compatible with "
+                    "selective pre_mlp_layernorm recompute."
+                )
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
@@ -941,7 +1000,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         else:
             with self.mlp_norm_manager as hidden_states:
-                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+                if residual is None:
+                    pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+                    _register_norm_grad_debug(
+                        pre_mlp_layernorm_output,
+                        layer_number=self.layer_number,
+                        name="pre_mlp_layernorm_output",
+                    )
+                else:
+                    pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states, residual)
+                    norm_output, norm_residual = pre_mlp_layernorm_output
+                    _register_norm_grad_debug(
+                        norm_output, layer_number=self.layer_number, name="pre_mlp_layernorm_output"
+                    )
+                    _register_norm_grad_debug(
+                        norm_residual,
+                        layer_number=self.layer_number,
+                        name="pre_mlp_layernorm_residual_output",
+                    )
 
         return pre_mlp_layernorm_output
 
@@ -972,7 +1048,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self._dsv4_hc_ffn_post = hc_ffn_post
             self._dsv4_hc_ffn_comb = hc_ffn_comb
 
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        # true-on-policy: the SGLang path stashed the pre-MLP residual on self during the
+        # attention BDA. When present, feed the (hidden_states, residual) pair through the
+        # residual-pair pre-MLP layernorm; otherwise behave exactly like dev.
+        sglang_carried_residual = getattr(self, "_sglang_pre_mlp_residual", None)
+        if sglang_carried_residual is not None:
+            del self._sglang_pre_mlp_residual
+            pre_mlp_layernorm_output, residual = self._forward_pre_mlp_layernorm(
+                hidden_states, sglang_carried_residual
+            )
+        else:
+            pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
         if isinstance(pre_mlp_layernorm_output, tuple):
             if len(pre_mlp_layernorm_output) != 2:
@@ -982,6 +1068,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     f"got {len(pre_mlp_layernorm_output)}"
                 )
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+        elif sglang_carried_residual is not None:
+            # true-on-policy: residual already produced by the SGLang residual-pair
+            # pre-MLP layernorm above; do not overwrite it.
+            pass
         elif self.config.dsv4_mode:
             # DSV4: the residual is the raw 4-stream hidden_states captured before HC pre.
             residual = dsv4_ffn_residual
@@ -1157,6 +1247,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
+        true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
         if self.config.dsv4_mode:
             # DSV4: skip bias_dropout_add; residual connection is handled by HC
             # layer_post. The post/comb mixes were stashed by _forward_mlp_output_with_bias.
@@ -1177,6 +1268,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
+        elif true_on_policy_policy.use_sglang_residual_pair:
+            mlp_output, mlp_output_bias = mlp_output_with_bias
+            if mlp_output_bias is not None:
+                mlp_output = mlp_output + mlp_output_bias
+            hidden_states = torch.nn.functional.dropout(
+                mlp_output, p=self.hidden_dropout, training=self.training
+            )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
@@ -1200,6 +1298,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+        if true_on_policy_policy.use_sglang_residual_pair:
+            output._sglang_residual = residual
 
         return output
 
