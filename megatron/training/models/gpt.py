@@ -2,7 +2,9 @@
 
 import inspect
 import logging
-from typing import Any, Callable, ClassVar, Literal, override
+from typing import Any, Callable, ClassVar, Literal
+
+from typing_extensions import override  # typing.override is 3.12+; backport for the 3.11 CPU CI
 
 import torch
 
