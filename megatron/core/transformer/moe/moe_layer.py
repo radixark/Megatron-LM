@@ -460,6 +460,13 @@ class MoELayer(BaseMoELayer):
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
+        # Hash routing reads input_ids per token; under sequence parallelism the hidden states
+        # (and thus the router scores) are scattered along the sequence dim, so input_ids must be
+        # scattered to match (miles dsv4). dim=1 is the sequence dim of input_ids ([bsz, seq]).
+        if input_ids is not None and self.config.sequence_parallel:
+            from megatron.core.tensor_parallel.mappings import split_along_nth_dim
+
+            input_ids = split_along_nth_dim(input_ids, dim=1, group=self.tp_group)
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids, packed_seq_params
         )

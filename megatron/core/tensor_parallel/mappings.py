@@ -65,6 +65,27 @@ def _split_along_last_dim(input_, group):
     return output
 
 
+def split_along_nth_dim(input_, dim, group):
+    """Split the tensor along the specified dimension and keep the corresponding
+    slice. Pure function (no autograd). Used to scatter hash-routing input_ids
+    across the sequence dimension under sequence parallelism (miles dsv4)."""
+    assert group is not None, "group should not be None"
+
+    world_size = group.size()
+    if world_size == 1:
+        return input_
+
+    dim_size = input_.size(dim)
+    assert (
+        dim_size % world_size == 0
+    ), f"Dimension {dim} of the tensor (size {dim_size}) should be divisible by world size {world_size}"
+    local_dim_size = dim_size // world_size
+    rank = group.rank()
+    dim_offset = rank * local_dim_size
+
+    return input_.narrow(dim, dim_offset, local_dim_size).contiguous()
+
+
 def _split_along_first_dim(input_, group):
     """Split the tensor along its first dimension and keep the
     corresponding slice."""
