@@ -35,11 +35,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, copy_signature
-from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
-from miles_megatron_plugins.true_on_policy.debug import (
-    register_activation_grad_debug,
-    register_norm_grad_debug as _register_norm_grad_debug,
-)
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
@@ -49,6 +44,13 @@ from megatron.core.utils import (
     make_viewless_tensor,
     nvtx_range_pop,
     nvtx_range_push,
+)
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from miles_megatron_plugins.true_on_policy.debug import (
+    register_activation_grad_debug,
+)
+from miles_megatron_plugins.true_on_policy.debug import (
+    register_norm_grad_debug as _register_norm_grad_debug,
 )
 
 if TYPE_CHECKING:

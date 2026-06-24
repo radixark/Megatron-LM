@@ -10,6 +10,30 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
+from megatron.core.tensor_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    linear_with_grad_accumulation_and_async_allreduce,
+)
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.attention import _sglang_cast_dense_tensor_math_input
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    matmul_persistent,
+    set_batch_invariant_mode,
+)
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
+from megatron.core.transformer.multi_token_prediction import get_mtp_layer_spec_for_backend
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
+from megatron.core.transformer.transformer_block import _get_block_submodules
+from miles_megatron_plugins.true_on_policy.contracts import get_true_on_policy_contract
+from miles_megatron_plugins.true_on_policy.matmul import (
+    _sglang_row_parallel_matmul,
+    sglang_reference_matmul,
+)
 from miles_megatron_plugins.true_on_policy.sglang_backend import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
     MegatronTrueOnPolicyRuntimePolicy,
@@ -26,24 +50,6 @@ from miles_megatron_plugins.true_on_policy.sglang_backend import (
     is_sglang_rope_enabled,
     resolve_true_on_policy_runtime_policy,
 )
-from miles_megatron_plugins.true_on_policy.contracts import get_true_on_policy_contract
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.tensor_parallel.layers import linear_with_grad_accumulation_and_async_allreduce
-from miles_megatron_plugins.true_on_policy.matmul import _sglang_row_parallel_matmul, sglang_reference_matmul
-from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    matmul_persistent,
-    set_batch_invariant_mode,
-)
-from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.attention import _sglang_cast_dense_tensor_math_input
-from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
-from megatron.core.transformer.multi_token_prediction import get_mtp_layer_spec_for_backend
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.transformer_block import _get_block_submodules
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -111,12 +117,13 @@ def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
         bias_dropout,
         cp_layout,
         linear,
+        matmul,
         norm,
         provider,
         rope,
         runtime,
+        sglang_backend,
     )
-    from miles_megatron_plugins.true_on_policy import matmul, sglang_backend
 
     assert legacy_backend.SGLangNorm is sglang_backend.SGLangNorm
     assert legacy_backend.SGLangRowParallelLinear is sglang_backend.SGLangRowParallelLinear
