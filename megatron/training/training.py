@@ -221,8 +221,11 @@ except ImportError:
 try:
     from torch_memory_saver import torch_memory_saver
 
-    torch_memory_saver.hook_mode = "torch"
-    HAVE_TORCH_MEMORY_SAVER = True
+    # Setting the global hook_mode here clobbers the LD_PRELOAD hook mode miles uses
+    # for CUDA-IPC weight transfer; the only consumer below (idle-weight offload) is
+    # unused by miles. Mirrors megatron/core/inference/contexts/dynamic_context.py.
+    # torch_memory_saver.hook_mode = "torch"
+    HAVE_TORCH_MEMORY_SAVER = False
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
