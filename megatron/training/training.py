@@ -228,8 +228,15 @@ from megatron.training.utils import is_hybrid_model
 
 try:
     from torch_memory_saver import torch_memory_saver
-    torch_memory_saver.hook_mode = "torch"
-    HAVE_TORCH_MEMORY_SAVER = True
+
+    # Do NOT set torch_memory_saver.hook_mode = "torch" here: it is a global that
+    # clobbers miles' LD_PRELOAD hook mode used for CUDA-IPC weight transfer between
+    # megatron and sglang (colocate weight sync). miles uses sglang for inference and
+    # its own torch_memory_saver region for colocate, so megatron's idle-weight-offload
+    # path (the only consumer of HAVE_TORCH_MEMORY_SAVER below) is unused here.
+    # Mirrors the fix in megatron/core/inference/contexts/dynamic_context.py (#11).
+    # torch_memory_saver.hook_mode = "torch"
+    HAVE_TORCH_MEMORY_SAVER = False
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
