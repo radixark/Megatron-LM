@@ -54,10 +54,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import cat_with_oom_fallback
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -70,6 +69,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
@@ -94,7 +94,9 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            _flash_attn_forward,
+        )
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -1437,6 +1439,7 @@ class Attention(MegatronModule, ABC):
                                 cu_seqlens=cu_seqlens_q,
                                 mscale=_yarn_get_concentration_factor_from_config(self.config),
                                 cp_group=self.pg_collection.cp,
+                                max_seqlen=rope_max_seqlen_q,
                                 ulysses_cp=ulysses_cp,
                             )
                         else:
@@ -1464,22 +1467,9 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_kv,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=self.pg_collection.cp,
-                            max_seqlen=rope_max_seqlen_q,
+                            max_seqlen=rope_max_seqlen_kv,
+                            ulysses_cp=ulysses_cp,
                         )
-                    else:
-                        query = inference_context.apply_rotary_emb_query(
-                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
-                        )
-                if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key,
-                        k_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=_yarn_get_concentration_factor_from_config(self.config),
-                        cp_group=self.pg_collection.cp,
-                        max_seqlen=rope_max_seqlen_kv,
-                    )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
                     mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
