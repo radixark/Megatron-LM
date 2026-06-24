@@ -914,6 +914,12 @@ def validate_args(args, defaults={}):
                 )
                 args.mtp_num_layers = inferred_mtp_num_layers
 
+    # Normalize the legacy --use-rotary-position-embeddings flag before the MTP
+    # validation below (which inspects position_embedding_type). The canonical
+    # normalization also runs later in this function, so this stays idempotent.
+    if args.use_rotary_position_embeddings:
+        args.position_embedding_type = 'rope'
+
     # MTP validation
     if args.mtp_num_layers:
         assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
