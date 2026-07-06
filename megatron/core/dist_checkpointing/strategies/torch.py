@@ -626,6 +626,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         super().__init__(backend, version)
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
+        self.staging_max_buckets = 0
 
         # Cached SavePlans to skip plan in `save_state_dict_async_plan`
         # cached outcome of `SavePlan.prepare_global_plan`,
@@ -670,6 +671,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
+            staging_max_buckets=self.staging_max_buckets,
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
