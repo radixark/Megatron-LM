@@ -129,6 +129,8 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
+    if getattr(source, '_is_witness_param', False):
+        destination._is_witness_param = True
 
 
 class MegatronOptimizer(ABC):
@@ -343,7 +345,8 @@ class MegatronOptimizer(ABC):
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
                 param, getattr(self, 'tp_group', None)
             )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            is_not_witness = not getattr(param, "_is_witness_param", False)
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_witness:
                 grads_for_norm.append(grad)
         return grads_for_norm
 

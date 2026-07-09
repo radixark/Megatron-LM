@@ -557,6 +557,7 @@ class GPTModel(LanguageModule):
         padding_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Tensor]] = None,
         output_processor_context: Optional[Any] = None,
+        witness_ids: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -608,6 +609,12 @@ class GPTModel(LanguageModule):
         if self.config.moe_n_hash_layers > 0 and input_ids is not None:
             decoder_extra_block_kwargs['input_ids'] = input_ids
 
+        if witness_ids is not None and hasattr(self, "local_head_witness"):
+            if decoder_input is not None:
+                decoder_input = self.local_head_witness(witness_ids, decoder_input)
+            else:
+                self.decoder.input_tensor = self.local_head_witness(witness_ids, self.decoder.input_tensor)
+
         # Run decoder.
         decoder_output = self.decoder(
             hidden_states=decoder_input,
@@ -629,6 +636,9 @@ class GPTModel(LanguageModule):
         else:
             hidden_states = decoder_output
             mhc_multistream = None
+
+        if witness_ids is not None and hasattr(self, "local_tail_witness"):
+            hidden_states = self.local_tail_witness(witness_ids, hidden_states)
 
         return self._postprocess(
             hidden_states=hidden_states,

@@ -464,6 +464,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         copy_optimizer_param_metadata(shard_main_param, model_param)
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
+                        assert not getattr(model_param, '_is_witness_param', False), (
+                            "Witness params are not supported with precision-aware optimizer. "
+                            "_is_witness_param flag cannot be propagated to FusedAdam-held params."
+                        )
                         shard_main_param = None
 
                     # Store handle to main_param.
