@@ -13,7 +13,11 @@ _ROW_LINEAR_INV_BLOCK_K = 128
 
 
 def _fixed_tree_sum_tensors(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
-    """Sum tensors in the same fixed pairwise order as SGLang."""
+    """Sum tensors with a fixed pairwise binary tree.
+
+    Matches SGLang's `tree_all_reduce_sum`, which reduces across a power-of-two
+    number of TP ranks.
+    """
     partials = list(tensors)
     if not partials:
         raise ValueError("at least one tensor is required")
@@ -28,6 +32,46 @@ def _fixed_tree_sum_tensors(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
         partials = next_partials
 
     return partials[0]
+
+
+def _sglang_first_level_block(num_partials: int) -> int:
+    """FIRST_LEVEL_BLOCK as derived by SGLang's `_matmul_tp_persistent_impl`.
+
+    The kernel halves the k-tile count while it stays even and above two, so the
+    first accumulator level spans `num_partials / 2**(LEVEL_K - 1)` tiles and the
+    remaining levels are binary. When `num_partials` is a power of two this
+    degenerates to 2, i.e. a plain binary tree.
+    """
+    first_level_block = num_partials
+    while first_level_block > 2 and first_level_block % 2 == 0:
+        first_level_block //= 2
+    return first_level_block
+
+
+def _sglang_kernel_order_sum(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
+    """Sum k-tile partials in SGLang's `matmul_tp_inv` accumulation order.
+
+    SGLang accumulates FIRST_LEVEL_BLOCK partials sequentially into one register
+    accumulator before carrying into the binary levels above it. A plain binary
+    tree over all partials is only equivalent when FIRST_LEVEL_BLOCK == 2, so it
+    diverges bitwise for any k-tile count with an odd factor (e.g. T=38 for
+    Qwen3-4B `down_proj` at TP=2).
+    """
+    partials = list(tensors)
+    if not partials:
+        raise ValueError("at least one tensor is required")
+
+    first_level_block = _sglang_first_level_block(len(partials))
+
+    blocks: List[torch.Tensor] = []
+    for start in range(0, len(partials), first_level_block):
+        group = partials[start : start + first_level_block]
+        accumulator = group[0]
+        for partial in group[1:]:
+            accumulator = accumulator + partial
+        blocks.append(accumulator)
+
+    return _fixed_tree_sum_tensors(blocks)
 
 
 def _safe_group_size(group: Optional[torch.distributed.ProcessGroup]) -> int:
@@ -78,8 +122,8 @@ def _sglang_row_parallel_matmul(
     """SGLang's row-linear TP-invariant matmul contract.
 
     SGLang chunks the K dimension into 128-wide products, casts each product to
-    the input dtype, then combines those partials with a fixed binary tree.
-    Mirroring that order is required before the TP tree all-reduce can be
+    the input dtype, then combines those partials in its kernel's accumulation
+    order. Mirroring that order is required before the TP tree all-reduce can be
     bitwise identical.
     """
     input_shape = input_.shape
@@ -91,7 +135,7 @@ def _sglang_row_parallel_matmul(
         end = min(start + _ROW_LINEAR_INV_BLOCK_K, input_2d.shape[1])
         partials.append(input_2d[:, start:end] @ weight_t[start:end, :])
 
-    output = _fixed_tree_sum_tensors(partials).to(input_.dtype)
+    output = _sglang_kernel_order_sum(partials).to(input_.dtype)
     if bias is not None:
         output = output + bias
     return output.reshape(*input_shape[:-1], weight.shape[0])
