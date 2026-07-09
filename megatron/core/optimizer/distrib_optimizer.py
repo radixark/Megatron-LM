@@ -407,8 +407,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
                         if hasattr(model_param, 'shared'):
                             shard_main_param.shared = model_param.shared
+                        if getattr(model_param, '_is_witness_param', False):
+                            shard_main_param._is_witness_param = True
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
+                        assert not getattr(model_param, '_is_witness_param', False), (
+                            "Witness params are not supported with precision-aware optimizer. "
+                            "_is_witness_param flag cannot be propagated to FusedAdam-held params."
+                        )
                         shard_main_param = None
 
                     # Store handle to main_param.
@@ -431,6 +437,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                     if hasattr(model_param, 'shared'):
                         shard_model_param.shared = model_param.shared
+                    if getattr(model_param, '_is_witness_param', False):
+                        shard_model_param._is_witness_param = True
 
                 else:
                     raise TypeError(

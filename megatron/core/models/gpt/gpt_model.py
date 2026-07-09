@@ -553,6 +553,7 @@ class GPTModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         mtp_kwargs: Optional[dict] = {},
+        witness_ids: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -592,6 +593,12 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        if witness_ids is not None and hasattr(self, "local_head_witness"):
+            if decoder_input is not None:
+                decoder_input = self.local_head_witness(witness_ids, decoder_input)
+            else:
+                self.decoder.input_tensor = self.local_head_witness(witness_ids, self.decoder.input_tensor)
+
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
@@ -607,6 +614,9 @@ class GPTModel(LanguageModule):
             input_ids=input_ids,
             **(extra_block_kwargs or {}),
         )
+
+        if witness_ids is not None and hasattr(self, "local_tail_witness"):
+            hidden_states = self.local_tail_witness(witness_ids, hidden_states)
 
         return self._postprocess(
             hidden_states=hidden_states,
