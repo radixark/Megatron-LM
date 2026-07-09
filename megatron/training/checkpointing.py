@@ -478,7 +478,9 @@ def _iter_nvme_state_stores(optimizer):
 def _nvme_state_checkpoint_dir(checkpoint_name, store):
     rank = torch.distributed.get_rank()
     instance = store.dist_opt.distributed_optimizer_instance_id
-    return os.path.join(checkpoint_name, "nvme_opt_state", f"rank{rank:04d}_opt{instance}")
+    return os.path.join(
+        checkpoint_name, "nvme_opt_state", f"rank{rank:04d}_opt{instance}_{store.uid}"
+    )
 
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,

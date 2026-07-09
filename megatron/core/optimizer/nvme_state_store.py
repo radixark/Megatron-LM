@@ -44,8 +44,16 @@ class _BucketSpec:
 class NVMeOptimizerStateStore:
     """Owns residency and I/O of one DistributedOptimizer's state."""
 
+    # ChainedOptimizer members (dense/expert) can share
+    # distributed_optimizer_instance_id, so a per-process counter keeps their
+    # store directories distinct. Construction order is deterministic, which
+    # also keeps checkpoint directory names stable across runs.
+    _next_uid = 0
+
     def __init__(self, distrib_optimizer: "DistributedOptimizer", dir_root: str, chunk_mb: int):
         self.dist_opt = distrib_optimizer
+        self.uid = NVMeOptimizerStateStore._next_uid
+        NVMeOptimizerStateStore._next_uid += 1
         config = distrib_optimizer.config
 
         assert not config.use_precision_aware_optimizer, (
@@ -63,7 +71,7 @@ class NVMeOptimizerStateStore:
 
         rank = torch.distributed.get_rank()
         instance = distrib_optimizer.distributed_optimizer_instance_id
-        self.dir = os.path.join(dir_root, f"rank{rank}", f"opt{instance}")
+        self.dir = os.path.join(dir_root, f"rank{rank}", f"opt{instance}_{self.uid}")
         shutil.rmtree(self.dir, ignore_errors=True)
         os.makedirs(self.dir, exist_ok=True)
         atexit.register(shutil.rmtree, self.dir, ignore_errors=True)
