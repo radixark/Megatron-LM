@@ -468,6 +468,19 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
                  f"from iteration {iteration:7d}")
 
 
+def _iter_nvme_state_stores(optimizer):
+    for opt in getattr(optimizer, "chained_optimizers", None) or [optimizer]:
+        store = getattr(opt, "_nvme_state_store", None)
+        if store is not None:
+            yield store
+
+
+def _nvme_state_checkpoint_dir(checkpoint_name, store):
+    rank = torch.distributed.get_rank()
+    instance = store.dist_opt.distributed_optimizer_instance_id
+    return os.path.join(checkpoint_name, "nvme_opt_state", f"rank{rank:04d}_opt{instance}")
+
+
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
                     train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
@@ -569,6 +582,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         ensure_directory_exists(optim_checkpoint_name)
         if not optimizer.is_stub_optimizer:
             optimizer.save_state_dict_to_file(optim_checkpoint_name)
+
+    # NVMe-streamed optimizer state (--optimizer-state-nvme-dir): the flat
+    # bucket files on node-local scratch are the state; copy them per rank.
+    if not args.no_save_optim and optimizer is not None:
+        for store in _iter_nvme_state_stores(optimizer):
+            store.save_to(_nvme_state_checkpoint_dir(checkpoint_name, store))
 
     async_save_request = None
     if args.async_save:
@@ -1828,6 +1847,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.reload_model_params(state_dict=state_dict)
             else:
                 optimizer.reload_model_params()
+
+    # NVMe-streamed optimizer state: restore the bucket files after
+    # reload_model_params so the checkpointed fp32 main wins over the
+    # bf16-recast refresh.
+    if optimizer is not None and not release and not args.finetune and not args.no_load_optim:
+        for store in _iter_nvme_state_stores(optimizer):
+            nvme_dir = _nvme_state_checkpoint_dir(checkpoint_name, store)
+            if os.path.isdir(nvme_dir):
+                store.load_from(nvme_dir)
+            else:
+                print_rank_0(f"  no NVMe optimizer state at {nvme_dir}; starting fresh")
 
     # rerun state
     if not ignore_rerun_state:

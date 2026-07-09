@@ -667,10 +667,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         checkpoint file by calling 'save_parameter_state()'.
         """
         if self._nvme_state_store is not None:
-            raise RuntimeError(
-                "Checkpointing optimizer state is not supported with "
-                "--optimizer-state-nvme-dir yet (state lives on NVMe)."
-            )
+            return {"nvme_state_store": True}
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
@@ -756,6 +753,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
+        if self._nvme_state_store is not None:
+            return
+
         if self.ddp_config.use_megatron_fsdp:
             if "param_to_group_meta" in state_dict:
                 state_dict["param_groups"] = self._param2group_meta_to_param_groups(
@@ -1263,10 +1263,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
         if self._nvme_state_store is not None:
-            raise RuntimeError(
-                "Checkpointing optimizer state is not supported with "
-                "--optimizer-state-nvme-dir yet (state lives on NVMe)."
-            )
+            return {}
         if sharding_type is not None:
             log_single_rank(
                 logger,

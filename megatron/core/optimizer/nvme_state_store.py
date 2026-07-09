@@ -1,4 +1,5 @@
 import atexit
+import json
 import logging
 import os
 import shutil
@@ -129,6 +130,52 @@ class NVMeOptimizerStateStore:
             spec.adam = Adam(groups, adam_w_mode=self.dist_opt.config.decoupled_weight_decay)
 
     # ------------------------------------------------------------------ step
+
+    @torch.no_grad()
+    def save_to(self, dirpath: str) -> None:
+        os.makedirs(dirpath, exist_ok=True)
+        manifest = {
+            "buckets": [
+                {
+                    "numel": spec.numel,
+                    "entry_numels": [main.numel() for _, main, _ in spec.entries],
+                    "steps": [g.get("step", 0) for g in spec.adam.param_groups],
+                    "file": os.path.basename(spec.path),
+                }
+                for spec in self.specs
+            ]
+        }
+        for spec in self.specs:
+            shutil.copyfile(spec.path, os.path.join(dirpath, os.path.basename(spec.path)))
+        with open(os.path.join(dirpath, "manifest.json"), "w") as f:
+            json.dump(manifest, f)
+        logger.info(f"NVMe optimizer state saved: {len(self.specs)} buckets -> {dirpath}")
+
+    @torch.no_grad()
+    def load_from(self, dirpath: str) -> None:
+        with open(os.path.join(dirpath, "manifest.json")) as f:
+            manifest = json.load(f)
+        assert len(manifest["buckets"]) == len(self.specs), (
+            f"NVMe state layout mismatch: checkpoint has {len(manifest['buckets'])} buckets, "
+            f"current topology builds {len(self.specs)} (same-topology resume only)"
+        )
+        for spec, meta in zip(self.specs, manifest["buckets"]):
+            assert meta["numel"] == spec.numel
+            assert meta["entry_numels"] == [main.numel() for _, main, _ in spec.entries]
+            shutil.copyfile(os.path.join(dirpath, meta["file"]), spec.path)
+            for group, step in zip(spec.adam.param_groups, meta["steps"]):
+                if step:
+                    group["step"] = step
+            for _, main, _ in spec.entries:
+                state = spec.adam.state.setdefault(main, {})
+                for key in _MOMENT_KEYS:
+                    if key not in state:
+                        t = torch.empty_like(main)
+                        t.untyped_storage().resize_(0)
+                        state[key] = t
+            spec.main_on_disk = True
+            spec.moments_on_disk = True
+        logger.info(f"NVMe optimizer state loaded: {len(self.specs)} buckets <- {dirpath}")
 
     @torch.no_grad()
     def refresh_main_from_model_params(self, copy_fn) -> None:
