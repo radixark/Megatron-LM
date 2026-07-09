@@ -76,6 +76,12 @@ class NVMeOptimizerStateStore:
             spec.fd = os.open(spec.path, os.O_RDWR | os.O_CREAT, 0o600)
             os.posix_fallocate(spec.fd, 0, 3 * spec.numel * 4)
 
+        for spec in self.specs:
+            for tensor, offset in self._segment(spec, "main"):
+                self._stream(spec.fd, offset, tensor, to_disk=True)
+                self._release(tensor)
+            spec.main_on_disk = True
+
         total_gb = sum(3 * s.numel * 4 for s in self.specs) / 1024**3
         logger.info(
             f"NVMe optimizer state store: {len(self.specs)} buckets, "
@@ -92,9 +98,21 @@ class NVMeOptimizerStateStore:
                 assert main_param is not None and main_param.dtype == torch.float32
                 key = self.dist_opt.model_param_gbuf_map[model_param]
                 by_bucket.setdefault(key, []).append((model_param, main_param, group_idx))
+        limit = 200_000_000
+        chunked = []
+        for _, entries in sorted(by_bucket.items(), key=lambda kv: kv[0]):
+            cur, cur_numel = [], 0
+            for entry in entries:
+                cur.append(entry)
+                cur_numel += entry[1].numel()
+                if cur_numel >= limit:
+                    chunked.append(cur)
+                    cur, cur_numel = [], 0
+            if cur:
+                chunked.append(cur)
         return [
             _BucketSpec(i, os.path.join(self.dir, f"bucket{i:05d}.bin"), entries)
-            for i, (_, entries) in enumerate(sorted(by_bucket.items(), key=lambda kv: kv[0]))
+            for i, entries in enumerate(chunked)
         ]
 
     def _build_bucket_optimizers(self) -> None:
@@ -111,6 +129,18 @@ class NVMeOptimizerStateStore:
             spec.adam = Adam(groups, adam_w_mode=self.dist_opt.config.decoupled_weight_decay)
 
     # ------------------------------------------------------------------ step
+
+    @torch.no_grad()
+    def refresh_main_from_model_params(self, copy_fn) -> None:
+        for spec in self.specs:
+            for tensor, _ in self._segment(spec, "main"):
+                self._materialize(tensor)
+        copy_fn()
+        for spec in self.specs:
+            for tensor, offset in self._segment(spec, "main"):
+                self._stream(spec.fd, offset, tensor, to_disk=True)
+                self._release(tensor)
+            spec.main_on_disk = True
 
     @torch.no_grad()
     def step(self) -> bool:

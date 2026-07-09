@@ -2591,6 +2591,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return model_param_to_state_dict_param_map
 
     def _copy_model_params_to_main_params(self, state_dict=None):
+        if self._nvme_state_store is not None:
+            self._nvme_state_store.refresh_main_from_model_params(
+                lambda: self._copy_model_params_to_main_params_impl(state_dict)
+            )
+            return
+        self._copy_model_params_to_main_params_impl(state_dict)
+
+    @torch.no_grad()
+    def _copy_model_params_to_main_params_impl(self, state_dict=None):
         """
         Copy model params to main params.
 
