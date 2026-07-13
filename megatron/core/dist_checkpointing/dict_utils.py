@@ -233,8 +233,16 @@ def _is_optimizer_param_state_key(key: Tuple) -> bool:
 def merge(x1: Union[dict, list], x2: Union[dict, list], key: Tuple[Union[str, int], ...] = ()):
     """Merges dicts and lists recursively.
 
-    For optimizer param_state paths, allows x1 to be longer than x2
-    (dp_reshardable padding entries are truncated).
+    For optimizer ``param_state`` lists, the two sides can legitimately differ in length: the
+    distributed optimizer's per-parameter ``param_state`` list is written into the (rank-0-only)
+    *common* state, but its length is a per-rank quantity — the equal-byte DP slice of a bucket
+    contains a different number of parameters on each rank when parameter sizes are uneven (e.g. a
+    large MoE grouped-expert weight vs. tiny norms). So the saved list (x1) reflects only one rank
+    and can be longer *or* shorter than this rank's loaded list (x2). x2 carries this rank's correct
+    per-parameter moments (resharded by byte offset), so it is authoritative:
+      - x1 longer  -> trailing entries are dp_reshardable padding; drop them.
+      - x1 shorter -> adopt x2's structure; ``step`` is uniform across params, so carry it forward.
+    (Real size changes are still guarded by the ``per_bucket_numel_unpadded`` assert on load.)
     """
     if isinstance(x1, dict) and isinstance(x2, dict):
         for k, v2 in x2.items():
@@ -246,6 +254,16 @@ def merge(x1: Union[dict, list], x2: Union[dict, list], key: Tuple[Union[str, in
         if len(x1) != len(x2):
             if _is_optimizer_param_state_key(key) and len(x1) > len(x2):
                 del x1[len(x2):]
+            elif _is_optimizer_param_state_key(key):
+                saved_step = next(
+                    (e["step"] for e in x1 if isinstance(e, dict) and "step" in e), None
+                )
+                x1[:] = x2
+                if saved_step is not None:
+                    for e in x1:
+                        if isinstance(e, dict) and "step" in e:
+                            e["step"] = saved_step
+                return x1
             else:
                 raise ValueError(
                     f"Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, "
