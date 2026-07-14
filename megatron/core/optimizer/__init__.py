@@ -319,6 +319,10 @@ def _get_megatron_optimizer_based_on_param_groups(
             if config.optimizer == 'adam':
                 gpu_optimizer_cls = Adam
                 cpu_optimizer_cls = CPUAdam
+                if config.main_params_dtype != torch.float32:
+                    # HybridDeviceOptimizer owns the main-parameter copy. Native AdamW
+                    # keeps the GPU slice's states in that same configured dtype.
+                    gpu_optimizer_cls = CPUAdam
                 optimizer_defaults = dict(
                     lr=config.lr,
                     weight_decay=config.weight_decay,
@@ -341,7 +345,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                 overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
                 pin_cpu_grads=config.pin_cpu_grads,
                 pin_cpu_params=config.pin_cpu_params,
-                param_update_in_fp32=True,
+                main_params_dtype=config.main_params_dtype,
+                exp_avg_dtype=config.exp_avg_dtype,
+                exp_avg_sq_dtype=config.exp_avg_sq_dtype,
                 **optimizer_defaults,
             )
             init_state_fn = None

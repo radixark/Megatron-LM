@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
 from collections import defaultdict
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -49,11 +49,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         cpu_optimizer_cls=None,
         gpu_optimizer_cls=None,
         param_update_in_fp32: bool = False,
+        main_params_dtype: Optional[torch.dtype] = None,
+        exp_avg_dtype: Optional[torch.dtype] = None,
+        exp_avg_sq_dtype: Optional[torch.dtype] = None,
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
         **kwargs,
     ):
+        configured_dtypes = (main_params_dtype, exp_avg_dtype, exp_avg_sq_dtype)
+        if any(dtype is not None for dtype in configured_dtypes):
+            assert (
+                all(dtype is not None for dtype in configured_dtypes)
+                and len(set(configured_dtypes)) == 1
+            ), "main_params_dtype, exp_avg_dtype, and exp_avg_sq_dtype must use the same dtype"
+            assert not param_update_in_fp32 or main_params_dtype == torch.float32, (
+                "param_update_in_fp32=True conflicts with a non-FP32 " "main_params_dtype"
+            )
+
         super(HybridDeviceOptimizer, self).__init__(
             params,
             defaults={
@@ -61,6 +74,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 "cpu_optimizer_cls": cpu_optimizer_cls,
                 "gpu_optimizer_cls": gpu_optimizer_cls,
                 "param_update_in_fp32": param_update_in_fp32,
+                "main_params_dtype": main_params_dtype,
+                "exp_avg_dtype": exp_avg_dtype,
+                "exp_avg_sq_dtype": exp_avg_sq_dtype,
                 "pin_cpu_grads": pin_cpu_grads,
                 "pin_cpu_params": pin_cpu_params,
                 "overlap_cpu_optimizer_d2h_h2d": overlap_cpu_optimizer_d2h_h2d,
@@ -75,25 +91,25 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.pin_cpu_params = pin_cpu_params
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
+        self.main_params_dtype = (
+            torch.float32
+            if param_update_in_fp32 and main_params_dtype is None
+            else main_params_dtype
+        )
+        self.exp_avg_dtype = exp_avg_dtype
+        self.exp_avg_sq_dtype = exp_avg_sq_dtype
+        self.use_main_param_copy = self.main_params_dtype is not None
         self.sub_optimizer_kwargs = kwargs
 
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
 
     def _set_sub_optimizer_grads(self):
-        if self.param_update_in_fp32:
-            for param in self.param_to_fp32_param:
-                if param in self.gpu_params_map_cpu_copy:
-                    # Skip if the param is offloaded to CPU, it should be handled
-                    # in the following part.
-                    continue
-                fp32_param = self.param_to_fp32_param[param]
-                grad = getattr(param, "decoupled_grad", param.grad)
-                if grad is not None:
-                    fp32_param.grad = grad.to(fp32_param.dtype)
-                    fp32_param.requires_grad = True
-                else:
-                    fp32_param.requires_grad = False
+        if self.gpu_optimizer is not None:
+            for inner_param in _param_generator(self.gpu_optimizer):
+                orig_param = self.inner_param_to_orig_param[inner_param]
+                grad = getattr(orig_param, "decoupled_grad", orig_param.grad)
+                inner_param.grad = None if grad is None else grad.to(inner_param.dtype)
 
         # Sync the grads from GPU to CPU.
         for optimizer in self.cpu_optimizers:
@@ -126,8 +142,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
             return param_copy_back_gpu_hook
 
-        def fp32_param_copy_back_gpu_hook_closure():
-            def fp32_param_copy_back_gpu_hook(optimizer, args, kwargs):
+        def main_param_copy_back_gpu_hook_closure():
+            def main_param_copy_back_gpu_hook(optimizer, args, kwargs):
                 for group in self.param_groups:
                     for param in group["params"]:
                         if param in self.gpu_params_map_cpu_copy:
@@ -135,17 +151,17 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                             # copied back in the previous hook.
                             continue
 
-                        if param in self.param_to_fp32_param:
-                            fp32_param = self.param_to_fp32_param[param]
-                            param.data.copy_(fp32_param.data)
+                        if param in self.param_to_main_param:
+                            main_param = self.param_to_main_param[param]
+                            param.data.copy_(main_param.data)
 
-            return fp32_param_copy_back_gpu_hook
+            return main_param_copy_back_gpu_hook
 
         for optimizer in self.sub_optimizers:
             if optimizer is not self.gpu_optimizer:
                 optimizer.register_step_post_hook(param_copy_back_gpu_hook_closure())
-            elif self.param_update_in_fp32:
-                optimizer.register_step_post_hook(fp32_param_copy_back_gpu_hook_closure())
+            elif self.use_main_param_copy:
+                optimizer.register_step_post_hook(main_param_copy_back_gpu_hook_closure())
 
     def step(self, closure=None):
         """
@@ -184,21 +200,27 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.gpu_param_groups,
             self.gpu_params_map_cpu_copy,
             self.cpu_copys_map_gpu_param,
-            self.param_to_fp32_param,
+            self.param_to_main_param,
         ) = self._get_sub_optimizer_param_groups(self.offload_fraction)
         self.param_to_inner_param = {}
         self.inner_param_to_orig_param = {}
         for group in self.param_groups:
             for param in group["params"]:
-                if param in self.param_to_fp32_param:
-                    inner_param = self.param_to_fp32_param[param]
+                if param in self.param_to_main_param:
+                    inner_param = self.param_to_main_param[param]
                 elif param in self.gpu_params_map_cpu_copy:
                     inner_param = self.gpu_params_map_cpu_copy[param]
                 else:
                     inner_param = param
                 self.param_to_inner_param[param] = inner_param
                 self.inner_param_to_orig_param[inner_param] = param
-        self.fp32_param_to_orig_param = {v: k for k, v in self.param_to_fp32_param.items()}
+        self.main_param_to_orig_param = {v: k for k, v in self.param_to_main_param.items()}
+        if self.param_update_in_fp32:
+            self.param_to_fp32_param = self.param_to_main_param
+            self.fp32_param_to_orig_param = self.main_param_to_orig_param
+        else:
+            self.param_to_fp32_param = {}
+            self.fp32_param_to_orig_param = {}
 
         self.cpu_optimizers = []
         if self.overlap_cpu_optimizer_d2h_h2d:
@@ -261,7 +283,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         gpu_param_groups = []
         gpu_params_map_cpu_copy = {}
         cpu_copys_map_gpu_param = {}
-        param_to_fp32_param = {}
+        param_to_main_param = {}
         for group in self.param_groups:
             gpu_group = group.copy()
             cpu_group = group.copy()
@@ -271,12 +293,21 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 orig_param = param
                 cpu_copy = False
                 if offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
+                    cpu_param = torch.empty_like(
+                        param,
+                        dtype=self.main_params_dtype or param.dtype,
+                        device="cpu",
+                        pin_memory=self.pin_cpu_params,
+                    )
+                    cpu_param.copy_(param.detach(), non_blocking=False)
+                    param = cpu_param
                     offload_params_numel += param.numel()
                     cpu_copy = True
-                if self.param_update_in_fp32 and param.dtype != torch.float32:
-                    param = param.detach().clone().float()
-                    param_to_fp32_param[orig_param] = param
+                elif self.use_main_param_copy and param.dtype != self.main_params_dtype:
+                    param = param.detach().to(dtype=self.main_params_dtype, copy=True)
+
+                if self.use_main_param_copy and param is not orig_param:
+                    param_to_main_param[orig_param] = param
 
                 if cpu_copy:
                     gpu_params_map_cpu_copy[orig_param] = param
@@ -296,7 +327,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             gpu_param_groups,
             gpu_params_map_cpu_copy,
             cpu_copys_map_gpu_param,
-            param_to_fp32_param,
+            param_to_main_param,
         )
 
     def _sync_sub_optimizers_state_to_hdo(self):
@@ -316,7 +347,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for param in optimizer.state:
                 orig_param = self.inner_param_to_orig_param[param]
                 new_state[orig_param] = optimizer.state[param]
-                if self.param_update_in_fp32:
+                if self.use_main_param_copy:
                     new_state[orig_param]["master_param"] = param
         self.state = new_state
 
@@ -328,7 +359,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     orig_param = self.inner_param_to_orig_param[param]
                     new_state[param] = self.state[orig_param]
             optimizer.state = new_state
-        self._update_fp32_params_by_new_state()
+        self._update_main_params_by_new_state()
+        if self.use_main_param_copy:
+            for param, state in self.state.items():
+                state["master_param"] = self.param_to_inner_param.get(param, param)
         self._move_new_state_to_right_device()
 
     def _sync_hdo_param_groups_to_sub_optimizers(self):
@@ -361,13 +395,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     if not isinstance(v, torch.Tensor):
                         continue
                     orig_param = self.inner_param_to_orig_param.get(param, param)
-                    if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
+                    if optimizer in self.cpu_optimizers:
                         self.state[orig_param][k] = state[k] = v.to("cpu")
                     else:
                         self.state[orig_param][k] = state[k] = v.to("cuda")
 
-    def _update_fp32_params_by_new_state(self):
-        if not self.param_update_in_fp32:
+    def _update_main_params_by_new_state(self):
+        if not self.use_main_param_copy:
             return
         for param, v in self.state.items():
             inner_param = self.param_to_inner_param.get(param, param)
@@ -378,7 +412,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             # non_blocking CPU tensor can race with the following CPU copy.
             inner_param.data.copy_(v["master_param"].detach(), non_blocking=False)
 
-    def update_fp32_param_by_new_param(self):
+    def update_main_param_by_new_param(self):
         """
         Refresh optimizer-side parameter copies after model weights are loaded
         or otherwise changed outside the optimizer.
@@ -386,56 +420,59 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for param, inner_param in self.param_to_inner_param.items():
             if inner_param is param:
                 continue
-            # Blocking direct D2H copy is required here. 
+            # Blocking direct D2H copy is required here.
             inner_param.data.copy_(param.detach(), non_blocking=False)
+
+    def update_fp32_param_by_new_param(self):
+        """Backward-compatible alias for updating optimizer-side main parameters."""
+        self.update_main_param_by_new_param()
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
             """
-            Pre-load state dictionary hook to prevent loss of precision in
-            mixed-precision training.
+            Replace model parameters with optimizer-side main parameters before loading.
 
             When loading a state dictionary with `torch.load_state_dict`,
             optimizer states are reset and cast from `float32` to `bfloat16`/`float16`,
-            potentially losing precision. This hook replaces parameters with
-            their `float32` copies to mitigate this issue.
+            potentially losing precision. This hook uses the configured main-parameter
+            dtype for that conversion.
 
             Args:
                 state_dict (dict): The state dictionary to be loaded.
 
             Returns:
-                dict: The modified state dictionary with `float32` parameters.
+                dict: The state dictionary prepared for optimizer-side main parameters.
             """
-            if not self.param_update_in_fp32:
+            if not self.use_main_param_copy:
                 return state_dict
 
             new_state = {}
             for param, v in self.state.items():
-                param = self.param_to_fp32_param.get(param, param)
+                param = self.param_to_main_param.get(param, param)
                 new_state[param] = v
             self.state = new_state
 
             for group in self.param_groups:
                 for i, param in enumerate(group["params"]):
-                    group["params"][i] = self.param_to_fp32_param.get(param, param)
+                    group["params"][i] = self.param_to_main_param.get(param, param)
 
             return state_dict
 
         self.register_load_state_dict_pre_hook(pre_load_state_dict_hook)
 
         def post_load_state_dict_hook(self):
-            # 1. Replace the temporarily replaced fp32 parameters back. Please
+            # 1. Replace the temporarily substituted main parameters. Please
             # refer to the documentation in `pre_load_state_dict_hook`.
-            if self.param_update_in_fp32:
+            if self.use_main_param_copy:
                 new_state = {}
                 for param, v in self.state.items():
-                    orig_param = self.fp32_param_to_orig_param.get(param, param)
+                    orig_param = self.main_param_to_orig_param.get(param, param)
                     new_state[orig_param] = v
                 self.state = new_state
 
                 for group in self.param_groups:
                     for i, param in enumerate(group["params"]):
-                        group["params"][i] = self.fp32_param_to_orig_param.get(param, param)
+                        group["params"][i] = self.main_param_to_orig_param.get(param, param)
 
             # 2. After loading state_dict, the parameters may change, and we need to
             # reinitialize the sub-optimizers to regenerate the new parameters and

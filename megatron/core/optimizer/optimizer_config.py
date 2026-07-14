@@ -395,6 +395,10 @@ class OptimizerConfig:
             # --use-precision-aware-optimizer.
             # TODO: Remove this check when apex's FusedAdam is no longer used.
             if self.optimizer_cpu_offload:
+                assert self.main_params_dtype == self.exp_avg_dtype == self.exp_avg_sq_dtype, (
+                    "optimizer CPU offload main_params_dtype, exp_avg_dtype, and "
+                    "exp_avg_sq_dtype must use the same dtype"
+                )
                 return
             try:
                 import inspect
