@@ -6,6 +6,10 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer.transformer_config import TransformerConfig
+# kernels.rms_norm_batch_invariant runs SGLang's exact batch-invariant RMSNorm kernel
+# (bitwise inference parity) wrapped in an autograd.Function with the analytic RMSNorm vjp;
+# the bare kernel is forward-only (no grad_fn), so it must be routed through the seam.
+from . import kernels
 from .contracts import resolve_true_on_policy_runtime_policy
 
 
@@ -92,7 +96,7 @@ class SGLangNorm(torch.nn.Module):
                 x_float = x_float + post_residual_addition.float()
             residual = x_float.to(orig_dtype)
 
-        output = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
+        output = kernels.rms_norm_batch_invariant(x_float, self.eps)
         if self.cast_x_before_out_mul:
             output = self.weight.float() * output.to(orig_dtype)
         else:
@@ -135,7 +139,7 @@ class SGLangQKRMSNorm(torch.nn.Module):
 
         orig_dtype = x.dtype
         x_float = x.to(torch.float32)
-        x_float = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x_float = kernels.rms_norm_batch_invariant(x_float, self.eps)
 
         if self.cast_x_before_out_mul:
             return self.weight.float() * x_float.to(orig_dtype)
@@ -184,7 +188,7 @@ class SGLangFinalRMSNorm(torch.nn.Module):
             residual = x.clone()
 
         x_float = x.to(torch.float32)
-        x_float = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x_float = kernels.rms_norm_batch_invariant(x_float, self.eps)
         output = self.weight * x_float.to(orig_dtype)
 
         if residual is not None:
