@@ -21,9 +21,7 @@ from miles_megatron_plugins.true_on_policy.sglang_backend import (
     SGLangRowParallelLinear,
     SGLangSpecProvider,
     _ensure_batch_invariant_mode_from_config,
-    disable_sglang_rope,
     get_sglang_bias_dropout_add,
-    is_sglang_rope_enabled,
     resolve_true_on_policy_runtime_policy,
 )
 from miles_megatron_plugins.true_on_policy.contracts import get_true_on_policy_contract
@@ -107,21 +105,20 @@ def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
     from megatron.core.extensions import sglang as legacy_backend
     from megatron.core.tensor_parallel import matmul_tp_inv as legacy_matmul
     from miles_megatron_plugins.true_on_policy import (
-        attention_fa3,
         bias_dropout,
         cp_layout,
         linear,
         norm,
         provider,
-        rope,
         runtime,
+        sglang_attention,
     )
     from miles_megatron_plugins.true_on_policy import matmul, sglang_backend
 
     assert legacy_backend.SGLangNorm is sglang_backend.SGLangNorm
     assert legacy_backend.SGLangRowParallelLinear is sglang_backend.SGLangRowParallelLinear
     assert sglang_backend.SGLangColumnParallelLinear is linear.SGLangColumnParallelLinear
-    assert sglang_backend.SGLangCoreAttention is attention_fa3.SGLangCoreAttention
+    assert sglang_backend.SGLangCoreAttention is sglang_attention.SGLangCoreAttention
     assert sglang_backend.SGLangUlyssesCPLayout is cp_layout.SGLangUlyssesCPLayout
     assert sglang_backend.SGLangNorm is norm.SGLangNorm
     assert sglang_backend.SGLangSpecProvider is provider.SGLangSpecProvider
@@ -130,7 +127,6 @@ def test_legacy_sglang_backend_imports_match_true_on_policy_namespace():
         sglang_backend.enable_sglang_batch_invariant_mode
         is runtime.enable_sglang_batch_invariant_mode
     )
-    assert sglang_backend.sglang_apply_rotary_pos_emb is rope.sglang_apply_rotary_pos_emb
     assert (
         sglang_backend.resolve_true_on_policy_runtime_policy
         is resolve_true_on_policy_runtime_policy
@@ -166,7 +162,7 @@ def test_true_on_policy_contract_resolves_megatron_runtime_policy():
     assert policy.batch_invariant_mode
     assert policy.attention_backend == "fa3_varlen"
     assert policy.cp_layout == "ulysses_a2a"
-    assert policy.use_ulysses_cp_recompute_fallback
+    assert policy.use_non_reentrant_recompute
 
 
 def test_contract_object_owns_megatron_runtime_policy_values():
@@ -196,7 +192,9 @@ def test_contract_object_owns_megatron_runtime_policy_values():
     assert policy.apply_logits_contract
     assert policy.use_sglang_final_norm
     assert policy.use_sglang_residual_pair
-    assert not policy.use_ulysses_cp_recompute_fallback
+    # All TOP runs use non-reentrant recompute (reentrant CheckpointFunction NaNs
+    # the TOP kernels), independent of context parallelism.
+    assert policy.use_non_reentrant_recompute
 
 
 def test_qwen3_dense_contract_only_marks_ulysses_a2a_as_cp_layout():
@@ -211,7 +209,8 @@ def test_qwen3_dense_contract_only_marks_ulysses_a2a_as_cp_layout():
     )
 
     assert policy.cp_layout is None
-    assert not policy.use_ulysses_cp_recompute_fallback
+    # Non-reentrant recompute applies to every TOP run, not only Ulysses-a2a CP.
+    assert policy.use_non_reentrant_recompute
 
 
 def test_missing_true_on_policy_contract_uses_default_policy():
@@ -241,14 +240,12 @@ def test_default_backend_selection_is_unchanged():
 
 
 def test_true_on_policy_contract_selects_sglang_backend():
-    disable_sglang_rope()
     config = _make_config(true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1, qk_layernorm=True)
 
     layer_spec = get_gpt_decoder_layer_specs(
         config, use_transformer_engine=False, normalization=config.normalization
     )[0]
 
-    assert is_sglang_rope_enabled()
     assert isinstance(layer_spec.submodules.input_layernorm, ModuleSpec)
     assert layer_spec.submodules.input_layernorm.module is SGLangNorm
     assert layer_spec.submodules.input_layernorm.params["override_orig_dtype"] is torch.float32
@@ -394,7 +391,7 @@ def test_sglang_reference_matmul_matches_sglang_mixed_dtype_contract():
     torch.testing.assert_close(actual, expected)
 
 
-def test_sglang_row_parallel_matmul_uses_fixed_k_block_order():
+def test_sglang_row_parallel_matmul_routes_to_tp_invariant_kernel():
     input_ = torch.randn(2, 3, 256)
     weight = torch.randn(5, 256)
     bias = torch.randn(5)

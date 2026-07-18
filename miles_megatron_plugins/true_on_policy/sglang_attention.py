@@ -30,6 +30,97 @@ except ImportError:
         fa3_varlen_func = None
 
 
+_FI_RAGGED_WRAPPER = None
+
+
+def _get_flashinfer_ragged_wrapper(device):
+    """One shared deterministic ragged-prefill wrapper (Blackwell / flashinfer)."""
+    global _FI_RAGGED_WRAPPER
+    if _FI_RAGGED_WRAPPER is None:
+        from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
+
+        # 1 GiB workspace: the deterministic ragged prefill needs batch_prefill_tmp_v
+        # scratch that scales with heads x head_dim x fixed_split tiles; 256 MiB overflows
+        # at the canonical config (8192 response window, batch 256) -> needs ~406 MiB.
+        ws = torch.empty(1024 * 1024 * 1024, dtype=torch.uint8, device=device)
+        _FI_RAGGED_WRAPPER = BatchPrefillWithRaggedKVCacheWrapper(ws, kv_layout="NHD")
+    return _FI_RAGGED_WRAPPER
+
+
+class _FlashinferRaggedAttn(torch.autograd.Function):
+    """Deterministic flashinfer ragged prefill. Forward = flashinfer (matches sglang
+    inference bitwise). flashinfer's run is forward-only, so backward is the fused
+    mem-efficient attention backward dispatched per packed segment (needn't bit-match
+    inference)."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_q, cu_k, num_q_heads, num_kv_heads, head_dim, scale):
+        w = _get_flashinfer_ragged_wrapper(q.device)
+        # Match sglang's call exactly: plan WITHOUT sm_scale, apply sm_scale at forward-time
+        # via .forward (sglang uses fast_prefill_plan (no sm_scale) + .forward(..., sm_scale=...)).
+        w.plan(
+            cu_q, cu_k, num_q_heads, num_kv_heads, head_dim,
+            causal=True,
+            q_data_type=q.dtype, kv_data_type=k.dtype, fixed_split_size=4096,
+        )
+        out = w.forward(q, k, v, causal=True, sm_scale=scale, logits_soft_cap=0.0)
+        ctx.save_for_backward(q, k, v, cu_q)
+        ctx.num_q_heads, ctx.num_kv_heads, ctx.scale = num_q_heads, num_kv_heads, scale
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        # Fused mem-efficient attention backward, dispatched DIRECTLY per packed segment.
+        # Two deliberate properties:
+        #   * O(L) memory: each segment uses is_causal=True with NO dense [L, L] mask
+        #     tensor, so the fused backend tiles the attention (never materializes the
+        #     score matrix). Peak memory is O(max segment length), not O(seq_len^2) --
+        #     essential for long single segments (a full-length sample) and long context.
+        #   * NO torch.autograd.grad: dispatching aten's fused backward kernel directly is
+        #     reentrant-safe, unlike a recompute-then-autograd.grad, which nests a second
+        #     autograd traversal inside the Function.backward. Same rule as the norm and
+        #     row-linear backwards.
+        # Flashinfer is forward-only and FA3/flash-attn varlen is Hopper-only, so on
+        # Blackwell the portable fused varlen backward is aten's mem-efficient kernel run
+        # per segment with is_causal (the packed sequence's segments are single samples).
+        q, k, v, cu_q = ctx.saved_tensors
+        H, HKV, scale = ctx.num_q_heads, ctx.num_kv_heads, ctx.scale
+        rep = H // HKV
+        head_dim = q.shape[-1]
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+        cu = cu_q.long()
+        eff_attn = torch.ops.aten._scaled_dot_product_efficient_attention
+        eff_attn_bwd = torch.ops.aten._scaled_dot_product_efficient_attention_backward
+        for i in range(cu.numel() - 1):
+            s, e = int(cu[i]), int(cu[i + 1])
+            seg_len = e - s
+            if seg_len == 0:
+                continue
+            # [1, H, L, D]; expand GQA kv heads to the query-head count for the dense kernel.
+            qs = q[s:e].transpose(0, 1).unsqueeze(0)
+            ks = (k[s:e].repeat_interleave(rep, dim=1) if rep > 1 else k[s:e]).transpose(0, 1).unsqueeze(0)
+            vs = (v[s:e].repeat_interleave(rep, dim=1) if rep > 1 else v[s:e]).transpose(0, 1).unsqueeze(0)
+            gos = grad_out[s:e].transpose(0, 1).unsqueeze(0)
+            # is_causal=True, attn_bias=None -> no O(L^2) mask; compute_log_sumexp=True for the bwd.
+            out, lse, philox_seed, philox_offset = eff_attn(qs, ks, vs, None, True, 0.0, True, scale=scale)
+            dqi, dki, dvi, _ = eff_attn_bwd(
+                gos, qs, ks, vs, None, out, lse, philox_seed, philox_offset,
+                0.0, [True, True, True, False], True, scale=scale,
+            )
+            dq[s:e] = dqi.squeeze(0).transpose(0, 1)
+            dki = dki.squeeze(0).transpose(0, 1)  # [L, H, D] (expanded query heads)
+            dvi = dvi.squeeze(0).transpose(0, 1)
+            if rep > 1:  # reduce expanded query heads back to the kv-head count (GQA)
+                dk[s:e] = dki.reshape(seg_len, HKV, rep, head_dim).sum(dim=2)
+                dv[s:e] = dvi.reshape(seg_len, HKV, rep, head_dim).sum(dim=2)
+            else:
+                dk[s:e] = dki
+                dv[s:e] = dvi
+        return dq, dk, dv, None, None, None, None, None, None
+
+
 class SGLangFlashAttention(MegatronModule):
     """SGLang-compatible FA3 attention path with packed-sequence support."""
 
@@ -87,6 +178,13 @@ class SGLangFlashAttention(MegatronModule):
         self.attention_dropout = (
             config.attention_dropout if attention_dropout is None else attention_dropout
         )
+        # Attention backend is an explicit flag (TOP_ATTN_BACKEND), NOT a GPU arch-gate:
+        # miles' TrueOnPolicyKernelPolicy sets it to match sglang's --sglang-attention-backend
+        # so both engines agree. "fa3" (Hopper, faster) or "flashinfer" (Blackwell / no-FA3,
+        # and usable on Hopper for e2e parity tests). flashinfer does GQA natively (no KV repeat)
+        # + takes fixed_split_size=4096 to match sglang's deterministic ragged prefill bitwise.
+        # Fallback "fa3" applies only when run standalone without the flag set.
+        self.attention_backend = os.environ.get("TOP_ATTN_BACKEND", "fa3")
 
     def forward(
         self,
@@ -104,13 +202,15 @@ class SGLangFlashAttention(MegatronModule):
         assert (
             attn_mask_type is None or attn_mask_type == AttnMaskType.causal
         ), "Only causal attention is supported for SGLangFlashAttention"
-        if not HAVE_FA3_VARLEN or fa3_varlen_func is None:
+        if self.attention_backend == "fa3" and (not HAVE_FA3_VARLEN or fa3_varlen_func is None):
             raise ImportError("Flash Attention 3 varlen is required for SGLangFlashAttention")
 
         is_packed = packed_seq_params is not None
         input_ndim = query.dim()
         head_dim_idx = -2 if is_packed and input_ndim >= 3 else 2
-        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
+        if self.attention_backend != "flashinfer" and (
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1
+        ):
             repeat_factor = (
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition
             )
@@ -166,39 +266,54 @@ class SGLangFlashAttention(MegatronModule):
             key = self.cp_layout.sequence_to_head_parallel(key, cu_seqlens_k)
             value = self.cp_layout.sequence_to_head_parallel(value, cu_seqlens_k)
 
-        sig = inspect.signature(fa3_varlen_func)
-        fa3_kwargs = {
-            "q": query,
-            "k": key,
-            "v": value,
-            "cu_seqlens_q": cu_seqlens_q,
-            "cu_seqlens_k": cu_seqlens_k,
-            "max_seqlen_q": max_seqlen_q,
-            "max_seqlen_k": max_seqlen_k,
-            "softmax_scale": self.softmax_scale,
-            "causal": True,
-        }
-        if "dropout_p" in sig.parameters:
-            fa3_kwargs["dropout_p"] = self.attention_dropout if self.training else 0.0
-        if "window_size" in sig.parameters:
-            fa3_kwargs["window_size"] = (-1, -1)
-        if "softcap" in sig.parameters:
-            fa3_kwargs["softcap"] = 0.0
-        if "return_attn_probs" in sig.parameters:
-            fa3_kwargs["return_attn_probs"] = False
-        if "return_softmax_lse" in sig.parameters:
-            fa3_kwargs["return_softmax_lse"] = False
-        if "num_splits" in sig.parameters:
-            fa3_kwargs["num_splits"] = 1
-        if (
-            "deterministic" in sig.parameters
-            and os.environ.get("MEGATRON_TRUE_ON_POLICY_FA3_DETERMINISTIC_BWD") == "1"
-        ):
-            fa3_kwargs["deterministic"] = True
+        if self.attention_backend == "flashinfer":
+            # Deterministic ragged prefill matching sglang's flashinfer TOP path (GQA-native,
+            # fixed_split_size=4096); autograd.Function supplies the backward (flashinfer is fwd-only).
+            output = _FlashinferRaggedAttn.apply(
+                query,
+                key,
+                value,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                self.num_attention_heads_per_partition,
+                self.num_query_groups_per_partition,
+                self.hidden_size_per_attention_head,
+                self.softmax_scale,
+            )
+        else:
+            sig = inspect.signature(fa3_varlen_func)
+            fa3_kwargs = {
+                "q": query,
+                "k": key,
+                "v": value,
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_k": cu_seqlens_k,
+                "max_seqlen_q": max_seqlen_q,
+                "max_seqlen_k": max_seqlen_k,
+                "softmax_scale": self.softmax_scale,
+                "causal": True,
+            }
+            if "dropout_p" in sig.parameters:
+                fa3_kwargs["dropout_p"] = self.attention_dropout if self.training else 0.0
+            if "window_size" in sig.parameters:
+                fa3_kwargs["window_size"] = (-1, -1)
+            if "softcap" in sig.parameters:
+                fa3_kwargs["softcap"] = 0.0
+            if "return_attn_probs" in sig.parameters:
+                fa3_kwargs["return_attn_probs"] = False
+            if "return_softmax_lse" in sig.parameters:
+                fa3_kwargs["return_softmax_lse"] = False
+            if "num_splits" in sig.parameters:
+                fa3_kwargs["num_splits"] = 1
+            if (
+                "deterministic" in sig.parameters
+                and os.environ.get("MEGATRON_TRUE_ON_POLICY_FA3_DETERMINISTIC_BWD") == "1"
+            ):
+                fa3_kwargs["deterministic"] = True
 
-        output = fa3_varlen_func(**fa3_kwargs)
-        if isinstance(output, tuple):
-            output = output[0]
+            output = fa3_varlen_func(**fa3_kwargs)
+            if isinstance(output, tuple):
+                output = output[0]
 
         if self.cp_size > 1:
             assert self.cp_layout is not None
