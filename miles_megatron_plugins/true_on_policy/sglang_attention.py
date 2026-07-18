@@ -30,21 +30,28 @@ except ImportError:
         fa3_varlen_func = None
 
 
-_FI_RAGGED_WRAPPER = None
+_ragged_prefill_wrapper = None
+
+# Scratch for flashinfer's deterministic ragged prefill (batch_prefill_tmp_v etc.). Sized to
+# the TRAINING side's parallelism/window, independent of sglang's rollout-side
+# SGLANG_FLASHINFER_WORKSPACE_SIZE: the requirement scales with per-rank heads
+# (total_heads / TP) and batching, which differ between train and rollout, and the size is
+# scratch that does not affect parity. 256 MiB overflowed the canonical config (8192 window,
+# batch 256, ~406 MiB), so default 1 GiB.
+_WORKSPACE_SIZE = int(
+    os.environ.get("MEGATRON_TRUE_ON_POLICY_FLASHINFER_WORKSPACE_SIZE", 1024 * 1024 * 1024)
+)
 
 
-def _get_flashinfer_ragged_wrapper(device):
+def _get_ragged_prefill_wrapper(device):
     """One shared deterministic ragged-prefill wrapper (Blackwell / flashinfer)."""
-    global _FI_RAGGED_WRAPPER
-    if _FI_RAGGED_WRAPPER is None:
+    global _ragged_prefill_wrapper
+    if _ragged_prefill_wrapper is None:
         from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
 
-        # 1 GiB workspace: the deterministic ragged prefill needs batch_prefill_tmp_v
-        # scratch that scales with heads x head_dim x fixed_split tiles; 256 MiB overflows
-        # at the canonical config (8192 response window, batch 256) -> needs ~406 MiB.
-        ws = torch.empty(1024 * 1024 * 1024, dtype=torch.uint8, device=device)
-        _FI_RAGGED_WRAPPER = BatchPrefillWithRaggedKVCacheWrapper(ws, kv_layout="NHD")
-    return _FI_RAGGED_WRAPPER
+        ws = torch.empty(_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
+        _ragged_prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(ws, kv_layout="NHD")
+    return _ragged_prefill_wrapper
 
 
 class _FlashinferRaggedAttn(torch.autograd.Function):
@@ -55,7 +62,7 @@ class _FlashinferRaggedAttn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, cu_q, cu_k, num_q_heads, num_kv_heads, head_dim, scale):
-        w = _get_flashinfer_ragged_wrapper(q.device)
+        w = _get_ragged_prefill_wrapper(q.device)
         # Match sglang's call exactly: plan WITHOUT sm_scale, apply sm_scale at forward-time
         # via .forward (sglang uses fast_prefill_plan (no sm_scale) + .forward(..., sm_scale=...)).
         w.plan(
