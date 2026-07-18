@@ -349,6 +349,50 @@ def test_ulysses_rope_keeps_unsplit_positions_for_full_sequence_layout():
     torch.testing.assert_close(actual, expected)
 
 
+def _sglang_reference_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """SGLang's forward_native neox rotary — the formula the now-removed custom sglang-rope
+    path forced Megatron to use. ``freqs`` is Megatron's [seq, 1, 1, head_dim] cache of
+    duplicated half-angles; SGLang takes the first half as the angles. This is the reference the
+    standard Megatron ``apply_rotary_pos_emb`` must match bitwise for the custom-path removal to
+    be policy-preserving."""
+    head_dim = x.shape[-1]
+    angles = freqs[..., : head_dim // 2]
+    cos = torch.cos(angles).float()
+    sin = torch.sin(angles).float()
+    orig_dtype = x.dtype
+    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    return torch.cat((o1, o2), dim=-1).to(orig_dtype)
+
+
+def test_standard_megatron_rope_matches_sglang_rope_bitwise():
+    # The dense contract drops the custom sglang-rope path and relies on Megatron's own
+    # apply_rotary_pos_emb (unfused, non-interleaved, mscale=1) already being BITWISE-identical
+    # to SGLang's rotary. Guard that equivalence so the removal can't silently change the policy.
+    config = _make_config(
+        true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+        apply_rope_fusion=False,
+        rotary_interleaved=False,
+    )
+    seq, batch, heads, head_dim = 6, 2, 4, 8
+    cp_group = _FakeCPGroup(size=1, rank=0)  # bshd path ignores it; avoids parallel_state init
+    for dtype in (torch.float32, torch.bfloat16):
+        torch.manual_seed(0)
+        half = torch.randn(seq, 1, 1, head_dim // 2)
+        freqs = torch.cat((half, half), dim=-1)  # Megatron duplicates half-angles across head_dim
+        x = torch.randn(seq, batch, heads, head_dim, dtype=dtype)
+
+        megatron_out = apply_rotary_pos_emb(x, freqs, config=config, cp_group=cp_group)
+        sglang_out = _sglang_reference_rope(x, freqs)
+
+        assert torch.equal(megatron_out, sglang_out), (
+            f"Megatron RoPE != SGLang RoPE at dtype={dtype}: dropping the custom sglang-rope "
+            f"path would change the policy (max abs diff "
+            f"{(megatron_out.float() - sglang_out.float()).abs().max().item()})"
+        )
+
+
 def test_local_attention_still_rejects_ulysses_context_parallel_without_true_on_policy():
     with pytest.raises(ValueError, match="only supports all_gather"):
         _make_config(tensor_model_parallel_size=1, context_parallel_size=2, cp_comm_type="a2a")
