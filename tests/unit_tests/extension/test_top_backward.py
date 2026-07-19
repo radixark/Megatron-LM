@@ -47,6 +47,37 @@ def test_rms_norm_batch_invariant_backward_matches_reference():
     assert rel < 1e-3, f"RMSNorm analytic backward vs reference rel err {rel:.2e}"
 
 
+@pytest.mark.skipif(not CUDA, reason="TOP tp-invariant row-linear kernel is CUDA-only")
+def test_tp_invariant_row_linear_backward_matches_reference():
+    pytest.importorskip("sglang.srt.tp_invariant_ops")
+    from miles_megatron_plugins.true_on_policy import kernels
+
+    tokens, K, out = 64, 256, 128
+    torch.manual_seed(0)
+    x = torch.randn(tokens, K, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(out, K, device="cuda", dtype=torch.bfloat16)  # [out, K_local], RowParallelLinear layout
+    go = torch.randn(tokens, out, device="cuda", dtype=torch.bfloat16)
+
+    # Forward delegates to SGLang's matmul_tp_inv (deterministic TP-invariant reduction order),
+    # so it matches a plain x @ Wᵀ reference within kernel tolerance, not bitwise. Backward is the
+    # hand-written linear vjp (grad_x = go @ W, grad_w = goᵀ @ x) and must reproduce the reference's
+    # autograd — same pattern as the RMSNorm test: real Function vs differentiable torch reference.
+    xa, wa = (t.clone().requires_grad_(True) for t in (x, w))
+    xb, wb = (t.clone().requires_grad_(True) for t in (x, w))
+    out_k = kernels.tp_invariant_row_linear(xa, wa)
+    out_ref = xb @ wb.t()
+    out_k.backward(go)
+    out_ref.backward(go)
+
+    def _rel(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()
+
+    assert _rel(out_k, out_ref) < 5e-3, "tp-invariant row-linear forward diverged from reference"
+    for name, gk, gr in (("dx", xa.grad, xb.grad), ("dw", wa.grad, wb.grad)):
+        assert torch.isfinite(gk).all(), f"row-linear backward {name} has non-finite grads"
+        assert _rel(gk, gr) < 5e-3, f"row-linear backward {name} vs reference rel err too large"
+
+
 @pytest.mark.skipif(not CUDA, reason="flashinfer ragged prefill + CUDA required")
 def test_flashinfer_ragged_attn_backward_matches_sdpa():
     pytest.importorskip("flashinfer")
