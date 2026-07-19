@@ -43,6 +43,15 @@ _WORKSPACE_SIZE = int(
 )
 
 
+def _fmha_backend(device) -> str:
+    """The flashinfer prefill backend, matching sglang's rollout-side choice EXACTLY so training
+    and rollout run the IDENTICAL kernel (contractual parity, not coincidental). sglang's
+    flashinfer_backend.py uses "cutlass" on SM100 (Blackwell), "auto" otherwise. Omitting the
+    backend only accidentally matched sglang on Blackwell (both resolved to cutlass) and diverged
+    on Hopper (train "auto" default != rollout "auto" kernel -> abs_diff 0.017)."""
+    return "cutlass" if torch.cuda.get_device_capability(device)[0] >= 10 else "auto"
+
+
 def _get_ragged_prefill_wrapper(device):
     """One shared deterministic ragged-prefill wrapper (Blackwell / flashinfer)."""
     global _ragged_prefill_wrapper
@@ -50,7 +59,9 @@ def _get_ragged_prefill_wrapper(device):
         from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
 
         ws = torch.empty(_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
-        _ragged_prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(ws, kv_layout="NHD")
+        _ragged_prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            ws, kv_layout="NHD", backend=_fmha_backend(device)
+        )
     return _ragged_prefill_wrapper
 
 

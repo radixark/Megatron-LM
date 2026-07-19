@@ -102,3 +102,17 @@ def test_flashinfer_ragged_attn_backward_matches_sdpa():
     for name, gp, gr in (("dq", qp.grad, gq_ref), ("dk", kp.grad, gk_ref), ("dv", vp.grad, gv_ref)):
         assert torch.isfinite(gp).all(), f"attention backward {name} has non-finite grads"
         assert _rel(gp, gr) < 5e-3, f"attention backward {name} vs SDPA reference rel err too large"
+
+
+def test_flashinfer_prefill_backend_matches_sglang(monkeypatch):
+    # CPU guard (no GPU): the training-side flashinfer prefill backend MUST match sglang's
+    # rollout-side choice (flashinfer_backend.py: cutlass on SM100/Blackwell, auto otherwise).
+    # If it drifts, train and rollout run different flashinfer kernels and parity breaks SILENTLY
+    # -- exactly what happened when the backend was left unset: Blackwell coincidentally matched,
+    # Hopper diverged (abs_diff 0.017). This locks the two together by rule.
+    from miles_megatron_plugins.true_on_policy import sglang_attention
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
+    assert sglang_attention._fmha_backend("cuda") == "cutlass"  # SM100 / Blackwell
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+    assert sglang_attention._fmha_backend("cuda") == "auto"  # Hopper and earlier
