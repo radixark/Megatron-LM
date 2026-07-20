@@ -58,10 +58,8 @@ def test_tp_invariant_row_linear_backward_matches_reference():
     w = torch.randn(out, K, device="cuda", dtype=torch.bfloat16)  # [out, K_local], RowParallelLinear layout
     go = torch.randn(tokens, out, device="cuda", dtype=torch.bfloat16)
 
-    # Forward delegates to SGLang's matmul_tp_inv (deterministic TP-invariant reduction order),
-    # so it matches a plain x @ Wᵀ reference within kernel tolerance, not bitwise. Backward is the
-    # hand-written linear vjp (grad_x = go @ W, grad_w = goᵀ @ x) and must reproduce the reference's
-    # autograd — same pattern as the RMSNorm test: real Function vs differentiable torch reference.
+    # Forward = SGLang's matmul_tp_inv (matches x @ Wᵀ within tolerance); backward = the hand-written
+    # linear vjp (grad_x = go @ W, grad_w = goᵀ @ x), checked against the reference's autograd.
     xa, wa = (t.clone().requires_grad_(True) for t in (x, w))
     xb, wb = (t.clone().requires_grad_(True) for t in (x, w))
     out_k = kernels.tp_invariant_row_linear(xa, wa)
@@ -135,15 +133,46 @@ def test_flashinfer_ragged_attn_backward_matches_sdpa():
         assert _rel(gp, gr) < 5e-3, f"attention backward {name} vs SDPA reference rel err too large"
 
 
-def test_flashinfer_prefill_backend_matches_sglang(monkeypatch):
-    # CPU guard (no GPU): the training-side flashinfer prefill backend MUST match sglang's
-    # rollout-side choice (flashinfer_backend.py: cutlass on SM100/Blackwell, auto otherwise).
-    # If it drifts, train and rollout run different flashinfer kernels and parity breaks SILENTLY
-    # -- exactly what happened when the backend was left unset: Blackwell coincidentally matched,
-    # Hopper diverged (abs_diff 0.017). This locks the two together by rule.
+def test_flashinfer_prefill_backend_is_fa2():
+    # Cheap rule guard; the real check is the output-parity test below.
     from miles_megatron_plugins.true_on_policy import sglang_attention
 
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
-    assert sglang_attention._fmha_backend("cuda") == "cutlass"  # SM100 / Blackwell
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
-    assert sglang_attention._fmha_backend("cuda") == "auto"  # Hopper and earlier
+    assert sglang_attention._fmha_backend("cuda") == "fa2"
+
+
+@pytest.mark.skipif(not CUDA, reason="flashinfer required")
+def test_flashinfer_output_matches_deterministic_paged_reference():
+    # Our training flashinfer path (ragged + _fmha_backend) must be bitwise-equal to sglang's
+    # deterministic prefill kernel (paged + fa2) on identical q/k/v. Catches a backend drift.
+    pytest.importorskip("flashinfer")
+    from flashinfer import (
+        BatchPrefillWithRaggedKVCacheWrapper as Ragged,
+        BatchPrefillWithPagedKVCacheWrapper as Paged,
+    )
+    from miles_megatron_plugins.true_on_policy import sglang_attention
+
+    dev, HD, NQ, NKV, L = "cuda", 128, 16, 4, 1024
+    torch.manual_seed(0)
+    q = torch.randn(L, NQ, HD, device=dev, dtype=torch.bfloat16)
+    k = torch.randn(L, NKV, HD, device=dev, dtype=torch.bfloat16)
+    v = torch.randn(L, NKV, HD, device=dev, dtype=torch.bfloat16)
+    cu = torch.tensor([0, L], dtype=torch.int32, device=dev)
+
+    # our training path: ragged wrapper with the backend _fmha_backend selects
+    be = sglang_attention._fmha_backend(dev)
+    wr = Ragged(torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=dev), kv_layout="NHD", backend=be)
+    wr.plan(cu, cu, NQ, NKV, HD, causal=True, q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16, fixed_split_size=4096)
+    o_ours = wr.run(q, k, v)
+
+    # sglang deterministic reference: paged wrapper + "fa2", page_size=1 over the same K/V
+    wp = Paged(torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=dev), kv_layout="NHD", backend="fa2")
+    wp.plan(cu, cu, torch.arange(L, dtype=torch.int32, device=dev),
+            torch.tensor([1], dtype=torch.int32, device=dev), NQ, NKV, HD, 1, causal=True,
+            q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16, fixed_split_size=4096)
+    o_ref = wp.run(q, (k.view(L, 1, NKV, HD).contiguous(), v.view(L, 1, NKV, HD).contiguous()))
+
+    assert torch.equal(o_ours, o_ref), (
+        f"training flashinfer backend {be!r} does not bitwise-match sglang deterministic paged+fa2 "
+        f"(max abs diff {(o_ours.float() - o_ref.float()).abs().max().item():.3e})"
+    )

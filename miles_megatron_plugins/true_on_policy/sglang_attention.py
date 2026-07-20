@@ -44,12 +44,10 @@ _WORKSPACE_SIZE = int(
 
 
 def _fmha_backend(device) -> str:
-    """The flashinfer prefill backend, matching sglang's rollout-side choice EXACTLY so training
-    and rollout run the IDENTICAL kernel (contractual parity, not coincidental). sglang's
-    flashinfer_backend.py uses "cutlass" on SM100 (Blackwell), "auto" otherwise. Omitting the
-    backend only accidentally matched sglang on Blackwell (both resolved to cutlass) and diverged
-    on Hopper (train "auto" default != rollout "auto" kernel -> abs_diff 0.017)."""
-    return "cutlass" if torch.cuda.get_device_capability(device)[0] >= 10 else "auto"
+    """Flashinfer prefill backend for TOP: fa2, matching sglang's deterministic prefill
+    (its paged wrapper uses fa2). Wrapper choice (ragged vs paged) is irrelevant — bitwise-equal
+    under the same backend."""
+    return "fa2"
 
 
 def _get_ragged_prefill_wrapper(device):
@@ -293,8 +291,13 @@ class SGLangFlashAttention(MegatronModule):
                 value,
                 cu_seqlens_q,
                 cu_seqlens_k,
-                self.num_attention_heads_per_partition,
-                self.num_query_groups_per_partition,
+                # Head counts must match the ACTUAL q/k tensors fed to flashinfer's plan().
+                # Read them from the tensors (as fa3 does) rather than the tp-local partition
+                # counts: under Ulysses CP the a2a above leaves heads/cp per rank, so the
+                # partition counts are cp x too large (crashes flashinfer's reshape). At cp=1
+                # query.shape[-2] == num_attention_heads_per_partition, so this is a no-op there.
+                query.shape[-2],
+                key.shape[-2],
                 self.hidden_size_per_attention_head,
                 self.softmax_scale,
             )
