@@ -2505,7 +2505,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
                 self._copy_main_params_to_model_params_for(zip(shard_main_group, model_group))
 
-        # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
 

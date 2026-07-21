@@ -334,11 +334,8 @@ class OptimizerConfig:
     """If True, allocate optimizer states on CPU during checkpoint loading to prevent GPU OOM."""
 
     optimizer_state_nvme_dir: Optional[str] = None
-    """
-    If set, fp32 main params and Adam moments live in per-bucket files under this
-    node-local directory and are streamed through the GPU bucket-by-bucket during
-    the optimizer step, bounding GPU residency to one bucket.
-    """
+    """If set, stream fp32 main params and Adam moments through per-bucket files under this
+    node-local directory during the optimizer step, bounding GPU residency to one bucket."""
 
     optimizer_state_nvme_chunk_mb: int = 256
     """Pinned staging chunk size for NVMe optimizer state streaming."""

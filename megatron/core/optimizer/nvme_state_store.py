@@ -44,10 +44,8 @@ class _BucketSpec:
 class NVMeOptimizerStateStore:
     """Owns residency and I/O of one DistributedOptimizer's state."""
 
-    # ChainedOptimizer members (dense/expert) can share
-    # distributed_optimizer_instance_id, so a per-process counter keeps their
-    # store directories distinct. Construction order is deterministic, which
-    # also keeps checkpoint directory names stable across runs.
+    # ChainedOptimizer's dense/expert members can share distributed_optimizer_instance_id;
+    # this per-process counter keeps their store directories distinct.
     _next_uid = 0
 
     def __init__(self, distrib_optimizer: "DistributedOptimizer", dir_root: str, chunk_mb: int):

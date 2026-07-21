@@ -585,8 +585,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         if not optimizer.is_stub_optimizer:
             optimizer.save_state_dict_to_file(optim_checkpoint_name)
 
-    # NVMe-streamed optimizer state (--optimizer-state-nvme-dir): the flat
-    # bucket files on node-local scratch are the state; copy them per rank.
     if not args.no_save_optim and optimizer is not None:
         for store in _iter_nvme_state_stores(optimizer):
             store.save_to(_nvme_state_checkpoint_dir(checkpoint_name, store))
@@ -1850,9 +1848,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             else:
                 optimizer.reload_model_params()
 
-    # NVMe-streamed optimizer state: restore the bucket files after
-    # reload_model_params so the checkpointed fp32 main wins over the
-    # bf16-recast refresh.
     if optimizer is not None and not release and not args.finetune and not args.no_load_optim:
         for store in _iter_nvme_state_stores(optimizer):
             nvme_dir = _nvme_state_checkpoint_dir(checkpoint_name, store)
