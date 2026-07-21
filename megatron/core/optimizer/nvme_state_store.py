@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 _MOMENT_KEYS = ("exp_avg", "exp_avg_sq")
 
+# Native-fp32 model params (e.g. router expert_bias, GDN/Mamba A_log) stay GPU-resident
+# instead of being NVMe-streamed -- warn if they add up to more than this, since the
+# assumption that they're negligible in size no longer holds.
+_FP32_RESIDENT_WARN_MB = 256
+
 
 class _BucketSpec:
     """One DDP bucket's slice of optimizer state and its backing file.
@@ -63,9 +68,6 @@ class NVMeOptimizerStateStore:
             "NVMe state store is mutually exclusive with --offload-optimizer-states."
         )
         assert not distrib_optimizer.ddp_config.use_megatron_fsdp
-        assert all(len(g) == 0 for g in distrib_optimizer.model_fp32_groups), (
-            "NVMe state store only supports pure bf16/fp16 models (no fp32 model params)."
-        )
 
         rank = torch.distributed.get_rank()
         instance = distrib_optimizer.distributed_optimizer_instance_id
@@ -79,6 +81,7 @@ class NVMeOptimizerStateStore:
 
         self.specs = self._build_specs()
         self._build_bucket_optimizers()
+        self._build_fp32_optimizer()
         for spec in self.specs:
             spec.fd = os.open(spec.path, os.O_RDWR | os.O_CREAT, 0o600)
             os.posix_fallocate(spec.fd, 0, 3 * spec.numel * 4)
@@ -135,6 +138,43 @@ class NVMeOptimizerStateStore:
                 groups.append(group)
             spec.adam = Adam(groups, adam_w_mode=self.dist_opt.config.decoupled_weight_decay)
 
+    def _build_fp32_optimizer(self) -> None:
+        """Step native-fp32 model params (router expert_bias, GDN/Mamba A_log, ...) via a
+        small always-resident Adam instead of NVMe-streaming them.
+
+        ``shard_fp32_groups`` entries are views into the model params' own storage (see
+        DistributedOptimizer._build_model_and_main_param_groups), so stepping them updates
+        the model directly -- no copy-back needed, unlike the bf16 bucket path.
+        """
+        from megatron.core.optimizer import Adam
+
+        master_groups = self.dist_opt.optimizer.param_groups
+        self._fp32_group_indices: List[int] = []
+        groups = []
+        total_bytes = 0
+        for group_idx, (model_group, shard_group) in enumerate(
+            zip(self.dist_opt.model_fp32_groups, self.dist_opt.shard_fp32_groups)
+        ):
+            if not model_group:
+                continue
+            group = {k: v for k, v in master_groups[group_idx].items() if k != "params"}
+            group["params"] = list(shard_group)
+            groups.append(group)
+            self._fp32_group_indices.append(group_idx)
+            total_bytes += sum(p.numel() * p.element_size() for p in shard_group)
+
+        if not groups:
+            self._fp32_adam = None
+            return
+
+        total_mb = total_bytes / 1024**2
+        log = logger.warning if total_mb > _FP32_RESIDENT_WARN_MB else logger.info
+        log(
+            f"NVMe optimizer state store: {total_mb:.1f} MB of native-fp32 model params "
+            f"stay GPU-resident (not NVMe-managed)."
+        )
+        self._fp32_adam = Adam(groups, adam_w_mode=self.dist_opt.config.decoupled_weight_decay)
+
     # ------------------------------------------------------------------ step
 
     @torch.no_grad()
@@ -153,6 +193,8 @@ class NVMeOptimizerStateStore:
         }
         for spec in self.specs:
             shutil.copyfile(spec.path, os.path.join(dirpath, os.path.basename(spec.path)))
+        if self._fp32_adam is not None:
+            torch.save(self._fp32_adam.state_dict(), os.path.join(dirpath, "fp32_resident_optimizer.pt"))
         with open(os.path.join(dirpath, "manifest.json"), "w") as f:
             json.dump(manifest, f)
         logger.info(f"NVMe optimizer state saved: {len(self.specs)} buckets -> {dirpath}")
@@ -181,6 +223,9 @@ class NVMeOptimizerStateStore:
                         state[key] = t
             spec.main_on_disk = True
             spec.moments_on_disk = True
+        fp32_state_path = os.path.join(dirpath, "fp32_resident_optimizer.pt")
+        if self._fp32_adam is not None and os.path.isfile(fp32_state_path):
+            self._fp32_adam.load_state_dict(torch.load(fp32_state_path))
         logger.info(f"NVMe optimizer state loaded: {len(self.specs)} buckets <- {dirpath}")
 
     @torch.no_grad()
@@ -207,6 +252,9 @@ class NVMeOptimizerStateStore:
                 (main, model) for model, main, _ in spec.entries
             )
             written_bytes += self._store_bucket(spec)
+        if self._fp32_adam is not None:
+            self._sync_fp32_hyperparams()
+            self._fp32_adam.step()
         logger.info(
             f"NVMe streaming step: {len(self.specs)} buckets, "
             f"read {read_bytes / 1024**3:.1f} GB, wrote {written_bytes / 1024**3:.1f} GB "
@@ -217,6 +265,12 @@ class NVMeOptimizerStateStore:
     def _sync_hyperparams(self, spec: "_BucketSpec") -> None:
         master_groups = self.dist_opt.optimizer.param_groups
         for group, g_idx in zip(spec.adam.param_groups, spec.group_master_indices):
+            group["lr"] = master_groups[g_idx]["lr"]
+            group["weight_decay"] = master_groups[g_idx]["weight_decay"]
+
+    def _sync_fp32_hyperparams(self) -> None:
+        master_groups = self.dist_opt.optimizer.param_groups
+        for group, g_idx in zip(self._fp32_adam.param_groups, self._fp32_group_indices):
             group["lr"] = master_groups[g_idx]["lr"]
             group["weight_decay"] = master_groups[g_idx]["weight_decay"]
 
