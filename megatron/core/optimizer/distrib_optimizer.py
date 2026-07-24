@@ -2509,7 +2509,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
 
     def _copy_main_params_to_model_params_for(self, pairs):
-        """Copy (shard_main_param, model_param) pairs into the param buffer."""
         for shard_main_param, model_param in pairs:
             param_range_map = self._get_model_param_range_map(model_param)
             world_range = param_range_map["gbuf_world_in_bucket"]
