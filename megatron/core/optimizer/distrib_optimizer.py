@@ -632,7 +632,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self._state_offloader = OptimizerStateOffloader(self)
 
         if self.config.optimizer_state_nvme_dir is not None:
-            from megatron.core.optimizer.nvme_state_store import NVMeOptimizerStateStore
+            from miles.backends.megatron_utils.nvme_state_store import NVMeOptimizerStateStore
 
             self._nvme_state_store = NVMeOptimizerStateStore(
                 self,
