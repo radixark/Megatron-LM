@@ -1512,59 +1512,130 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         return x_out
 
+    def _mxfp4_quantize_weight(w):
+        """bf16/fp32 weight -> MXFP4 (E2M1 values, 1x32 pow-2 scales) via TileKernels.
+
+        Returns the TileKernels QuantTensor pair (packed-int8 data of shape (M, N/2), fp32
+        row-major (M, N/32) pow-2 scales) that ``per_block_cast_lossless`` / ``cast_back``
+        consume directly.
+        """
+        try:
+            from tile_kernels.quant import per_token_cast
+        except ImportError as e:
+            raise ImportError(
+                "USE_MXFP4_QAT weight path needs deepseek-ai/TileKernels (tile_kernels.quant)."
+            ) from e
+
+        assert w.dim() == 2, f"MXFP4 weight QAT expects 2D expert weights, got {tuple(w.shape)}"
+        m, n = w.shape
+        # % 64: TileKernels cast_back requires hidden % 64 in both orientations used below;
+        # % 32 on both dims is TE MXFP8's own quantization requirement (implied).
+        assert m % 64 == 0 and n % 64 == 0, (
+            f"MXFP4 weight QAT needs dims divisible by 64, got {tuple(w.shape)}"
+        )
+
+        return per_token_cast(
+            w.contiguous(), "e2m1", 32, round_sf=True, use_packed_ue8m0=False,
+        )
+
+    def _lift_zero_block_scales(fp4, m, n):
+        """Raise the scale of all-zero 1x32 MXFP4 blocks to their 128x128 tile's max scale.
+
+        TileKernels clamps a zero block's amax to 6*2^-126, giving it the floor scale 2^-126.
+        Inside a tile of normal-magnitude weights that violates the 2^11 scale-ratio bound of
+        ``per_block_cast_lossless`` and trips its CUDA device assert. A zero block dequantizes
+        to 0 under any scale, so lifting it to the tile max is value-preserving.
+        """
+        fp4_data, fp4_sf = fp4
+        kblocks = fp4_sf.shape[1]  # n // 32
+        # 16 packed bytes per 1x32 block; mask sign bits so -0.0 nibbles count as zero.
+        zero_block = ((fp4_data.view(m, kblocks, 16) & 0x77) == 0).all(dim=-1)
+
+        # Scales are positive fp32, so their int32 bit patterns are order-preserving.
+        bits = fp4_sf.view(torch.int32)
+        tiles_r, tiles_c = ceil_div(m, 128), ceil_div(kblocks, 4)
+        padded = torch.nn.functional.pad(bits, (0, tiles_c * 4 - kblocks, 0, tiles_r * 128 - m))
+        tile_max = padded.view(tiles_r, 128, tiles_c, 4).amax(dim=(1, 3))
+        tile_max = (
+            tile_max[:, None, :, None]
+            .expand(tiles_r, 128, tiles_c, 4)
+            .reshape(tiles_r * 128, tiles_c * 4)[:m, :kblocks]
+        )
+        fp4_sf = torch.where(zero_block, tile_max, bits).view(torch.float32)
+        return fp4_data, fp4_sf
+
+    def _mxfp4_weight_needs_columnwise():
+        """Whether the QAT weight tensor needs its columnwise (dgrad) FP8 rep.
+
+        Under ``backward_override`` ('high_precision' or 'dequantized') TE's backward
+        dequantizes the saved weight — for a pre-quantized weight both modes hit the same
+        ``weight.dequantize(activation_dtype)`` call, which reads the ROWWISE rep — and runs
+        the dgrad GEMM in high precision. The columnwise FP8 rep is never read, so building
+        it would only waste compute and saved-for-backward memory. This mirrors TE's own
+        ``columnwise_usage = ... and backward_override is None`` for non-prequantized weights
+        (grouped_linear.py); TE skips that narrowing for pre-quantized weights and instead
+        honors the usages on the tensor's own quantizer, i.e. what we decide here.
+        """
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        recipe = FP8GlobalStateManager.get_fp8_recipe()
+        return torch.is_grad_enabled() and getattr(recipe, "backward_override", None) is None
+
     def _mxfp4_to_blockwise_fp8_qtensor(w):
-        """bf16 weight -> MXFP4 (E2M1, 1x32 UE8M0) -> blockwise FP8 (E4M3, 128x128), entirely via
-        deepseek-ai/TileKernels, wrapped as a TE ``Float8BlockwiseQTensor`` so the TE GEMM consumes
-        it directly: TE does NOT re-quantize the weight (it only quantizes the activation).
+        """bf16 weight -> MXFP4 (E2M1, 1x32 UE8M0) -> blockwise FP8 (E4M3, 128x128, fp32 pow-2
+        scales), wrapped as a TE ``Float8BlockwiseQTensor`` so the TE GEMM consumes it directly
+        under the Float8BlockScaling recipe: TE does NOT re-quantize the weight.
 
-            per_block_cast('e2m1', 1x32)  ->  per_block_cast_lossless((1x32)->(128x128), 'e4m3')
+            per_token_cast('e2m1', 1x32)  ->  per_block_cast_lossless((1x32)->(128x128), 'e4m3')
 
-        FP4->FP8 is lossless under the per-128x128-block scale-ratio bound that
-        ``per_block_cast_lossless`` device-asserts. The columnwise rep (needed by wgrad/dgrad) is
-        produced by quantizing ``w.T`` — for 128x128 square blocks it equals the transpose.
+        FP4->FP8 is exact under the per-128x128-block scale-ratio bound that
+        ``per_block_cast_lossless`` device-asserts (the per-1x32 residual scale is folded into
+        the FP8 values). Only the rowwise rep is built here; when the fp8 backward needs it,
+        TE's ``update_usage`` materializes the columnwise rep as the exact transpose of this
+        same tensor (``tex.fp8_transpose`` + transposed scales, valid because the blocks are
+        square), so fwd and dgrad consume the SAME quantized weight — no re-quantization along
+        the other axis.
 
-        NOTE (needs Blackwell verification): the exact ``Float8BlockwiseQTensor`` scale_inv GEMM
-        layout/padding and constructor kwargs are TE-version specific. Run once with
-        ``MXFP4_QAT_VERIFY=1`` to assert TE's dequant of this tensor matches TileKernels' dequant
-        before trusting it (a wrong layout would otherwise silently corrupt training).
+        recipe.backward_override: None -> dgrad uses the columnwise fp8 transpose (same weight
+        as fwd, exactly). 'dequantized'/'high_precision' -> TE dequantizes the saved rowwise
+        rep to activation dtype for a high-precision dgrad GEMM; since the rowwise rep IS the
+        MXFP4-grid weight, dgrad again sees exactly the fwd weight (for a pre-quantized weight
+        the two override modes coincide — TE never has the bf16 master; they differ only in
+        how the INPUT is saved for wgrad).
+
+        Run once with ``MXFP4_QAT_VERIFY=1`` to assert TE's dequant matches TileKernels' dequant
+        of the MXFP4-grid weight (a wrong layout would otherwise silently corrupt training).
         """
         import transformer_engine_torch as tex
         from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
             Float8BlockQuantizer,
             Float8BlockwiseQTensor,
         )
+        from tile_kernels.quant import cast_back, per_block_cast_lossless
 
-        try:
-            from tile_kernels.quant import cast_back, per_block_cast, per_block_cast_lossless
-        except ImportError as e:
-            raise ImportError(
-                "USE_MXFP4_QAT weight path needs deepseek-ai/TileKernels "
-                "(tile_kernels.quant.per_block_cast / per_block_cast_lossless)."
-            ) from e
+        fp4 = _lift_zero_block_scales(_mxfp4_quantize_weight(w), *w.shape)
+        # Genuinely tiny-but-nonzero 1x32 blocks whose scale sits more than 2^11 below the
+        # 128x128 tile max cannot be represented losslessly in FP8 and trip the kernel's CUDA
+        # device assert (QAT.txt: "we empirically verify that current weights satisfy this").
+        rowwise_fp8, rowwise_sf = per_block_cast_lossless(
+            fp4, "e4m3", x_block_size=(1, 32), out_block_size=(128, 128),
+            round_sf=True, use_packed_ue8m0=False,
+        )
 
-        assert w.dim() == 2, f"MXFP4 weight QAT expects 2D expert weights, got {tuple(w.shape)}"
-
-        # MXFP4 QAT is Blackwell-only (the run_deepseek_v4 recipe pins
-        # NVTE_FP8_BLOCK_SCALING_FP32_SCALES=0), which for TE's Float8BlockScaling means
-        # power_2_scale=True with FP32 scale CONTAINERS (not packed E8M0 — that is the separate
-        # MXFP8 recipe). So we match it with pow-2 values stored as fp32:
-        #   bf16 -> E2M1: 1x32 UE8M0 (pow-2) micro-scale.
-        #   E2M1 -> E4M3: 128x128 pow-2 scale, stored fp32 (use_packed_ue8m0=False).
-        def _to_fp8(mat):
-            fp4 = per_block_cast(mat, "e2m1", (1, 32), round_sf=True, use_packed_ue8m0=True)
-            return per_block_cast_lossless(
-                fp4, "e4m3", x_block_size=(1, 32), out_block_size=(128, 128),
-                round_sf=True, use_packed_ue8m0=False,
-            )
-
-        rowwise_fp8, rowwise_sf = _to_fp8(w.contiguous())
-        colwise_fp8, colwise_sf = _to_fp8(w.t().contiguous())  # 128x128 columnwise == transpose
+        # cuBLAS' 128x128 block-scale layout uses a row stride padded to a multiple of 4
+        # (TE Float8BlockQuantizer.get_scale_shape); TileKernels emits the unpadded
+        # (ceil(M/128), ceil(N/128)) fp32 tensor. dequantize() accepts both, the GEMM does not.
+        pad_cols = -rowwise_sf.shape[1] % 4
+        if pad_cols:
+            rowwise_sf = torch.nn.functional.pad(rowwise_sf, (0, pad_cols))
 
         quantizer = Float8BlockQuantizer(
             fp8_dtype=tex.DType.kFloat8E4M3,
             rowwise=True,
-            columnwise=True,
-            force_pow_2_scales=True,  # env=0 -> power_2_scale=True (pow-2 values, fp32 container)
+            # The tensor's own quantizer drives TE's update_usage on the pre-quantized weight;
+            # only request the columnwise (dgrad) rep when the fp8 backward will read it.
+            columnwise=_mxfp4_weight_needs_columnwise(),
+            force_pow_2_scales=True,  # scales are pow-2 valued, stored in fp32 containers
             block_scaling_dim=2,  # 128x128 weight blocks
         )
 
@@ -1573,44 +1644,227 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             dtype=w.dtype,
             rowwise_data=rowwise_fp8.view(torch.uint8),
             rowwise_scale_inv=rowwise_sf,
-            columnwise_data=colwise_fp8.view(torch.uint8),
-            columnwise_scale_inv=colwise_sf,
+            columnwise_data=None,
+            columnwise_scale_inv=None,
             fp8_dtype=tex.DType.kFloat8E4M3,
             quantizer=quantizer,
             is_2D_scaled=True,
+            requires_grad=False,
+            device=w.device,
         )
 
         if os.getenv("MXFP4_QAT_VERIFY", "0") == "1":
-            # Surface a layout/scale mismatch loudly instead of silently corrupting training:
-            # TE's dequant of our QTensor must equal the MXFP4-grid weight (FP4->FP8 is lossless).
-            # The reference uses an fp32-scale round-trip so it is independent of the FP8 scale packing.
-            ref_fp4 = per_block_cast(w.contiguous(), "e2m1", (1, 32), round_sf=True, use_packed_ue8m0=False)
-            ref = cast_back(ref_fp4, "fp32", (1, 32))
+            # TE's dequant of our QTensor must equal the MXFP4-grid weight (FP4->FP8 is exact).
+            ref = cast_back(fp4, "fp32", (1, 32))
             te_dq = qtensor.dequantize(dtype=torch.float32)
             if not torch.allclose(te_dq, ref, atol=0.0, rtol=0.0):
                 max_err = (te_dq.float() - ref.float()).abs().max().item()
                 raise RuntimeError(
                     "MXFP4_QAT Float8BlockwiseQTensor mismatch vs the MXFP4-grid weight "
-                    f"(max_abs_err={max_err}). The scale_inv GEMM layout/dtype/padding or constructor "
-                    "kwargs likely differ from TE's Float8BlockScaling; fix before training."
+                    f"(max_abs_err={max_err}). The scale_inv GEMM layout/dtype/padding or "
+                    "constructor kwargs likely differ from TE's Float8BlockScaling; fix before "
+                    "training."
                 )
 
         return qtensor
 
-    class _MXFP4WeightToFp8STE(torch.autograd.Function):
+    def _mxfp4_to_mxfp8_qtensor(w):
+        """bf16 weight -> MXFP4 (E2M1, 1x32 UE8M0) -> MXFP8 (E4M3, E8M0 scales), wrapped as a TE
+        ``MXFP8Tensor`` so the TE GEMM consumes it directly under the MXFP8BlockScaling recipe:
+        TE does NOT re-quantize the weight.
+
+        Rowwise rep (fwd, 1x32 blocks): exact E2M1->E4M3 re-encode on the same 1x32 grid via
+        ``per_block_cast_lossless`` (the E2M1 grid is a subset of E4M3, always lossless for
+        (1,32)->(1,32)).
+
+        Columnwise rep (dgrad, 32x1 blocks): TE's MXFP8 ``update_usage`` can never recompute
+        columnwise from rowwise, so it must be built here (skipped in no-grad forwards and
+        under backward_override, where backward never reads it). The MXFP4-grid weight is
+        materialized exactly in bf16 (E2M1-times-pow-2 values are exactly representable) and
+        re-quantized along dim0 — the same two-copies-in-fwd scheme TE itself uses for MXFP8
+        weights, applied to the MXFP4-grid weight instead of the master weight. Unlike the
+        rowwise rep, this is a genuine 32x1 E4M3 re-round: the dgrad weight is NOT on the
+        MXFP4 grid (matching TE-native MXFP8 semantics, where the two copies also differ).
+        Note TE stores MXFP8 columnwise data in the ORIGINAL (M, N) orientation, not transposed.
+
+        recipe.backward_override: None -> dgrad uses the 32x1 columnwise fp8 rep above.
+        'dequantized'/'high_precision' -> TE dequantizes the saved rowwise rep to activation
+        dtype for a high-precision dgrad GEMM — dequant(rowwise) IS the MXFP4-grid weight
+        exactly, so under either override dgrad sees precisely the fwd weight (QAT.txt's
+        "gradients w.r.t. the same FP8 weights" holds exactly; under None it holds only up to
+        the 32x1 re-round). For a pre-quantized weight the two override modes coincide — TE
+        never has the bf16 master; they differ only in how the INPUT is saved for wgrad.
+
+        Scales are stored in TE's compact (unswizzled) padded layout — rowwise
+        (roundup(M,128), roundup(N/32,4)), columnwise (roundup(M/32,4), roundup(N,128)) uint8
+        E8M0 — and TE swizzles them on the fly right before cuBLAS.
+
+        Run once with ``MXFP4_QAT_VERIFY=1`` to assert both reps dequantize correctly.
+        """
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
+        from tile_kernels.quant import cast_back, per_block_cast_lossless, per_token_cast
+
+        fp4 = _mxfp4_quantize_weight(w)
+        m, n = w.shape
+        build_columnwise = _mxfp4_weight_needs_columnwise()
+
+        rowwise_fp8, rowwise_sf = per_block_cast_lossless(
+            fp4, "e4m3", x_block_size=(1, 32), out_block_size=(1, 32),
+            round_sf=True, use_packed_ue8m0=False,
+        )
+
+        def _e8m0_bytes(sf):
+            # pow-2 fp32 scale -> E8M0 biased-exponent byte (TE decodes 2^(byte - 127)).
+            return (sf.view(torch.int32) >> 23).to(torch.uint8)
+
+        def _padded_scales(scales, shape):
+            out = torch.zeros(shape, dtype=torch.uint8, device=scales.device)
+            out[: scales.shape[0], : scales.shape[1]].copy_(scales)
+            return out
+
+        # TE's compact (unswizzled) MXFP8 scale layouts, swizzled by TE right before cuBLAS.
+        rowwise_scale_inv = _padded_scales(
+            _e8m0_bytes(rowwise_sf),
+            (ceil_div(m, 128) * 128, ceil_div(ceil_div(n, 32), 4) * 4),
+        )
+
+        colwise_data = None
+        colwise_scale_inv = None
+        colwise_fp8_t = colwise_sf_t = None
+        if build_columnwise:
+            w_hat_t = cast_back(fp4, "bf16", (1, 32)).t().contiguous()  # exact MXFP4-grid weight, (N, M)
+            colwise_fp8_t, colwise_sf_t = per_token_cast(
+                w_hat_t, "e4m3", 32, round_sf=True, use_packed_ue8m0=False,
+            )
+            colwise_data = colwise_fp8_t.view(torch.uint8).t().contiguous()
+            colwise_scale_inv = _padded_scales(
+                _e8m0_bytes(colwise_sf_t).t(),
+                (ceil_div(ceil_div(m, 32), 4) * 4, ceil_div(n, 128) * 128),
+            )
+
+        quantizer = MXFP8Quantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=build_columnwise
+        )
+
+        qtensor = MXFP8Tensor(
+            shape=w.shape,
+            dtype=w.dtype,
+            rowwise_data=rowwise_fp8.view(torch.uint8),
+            rowwise_scale_inv=rowwise_scale_inv,
+            columnwise_data=colwise_data,
+            columnwise_scale_inv=colwise_scale_inv,
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            quantizer=quantizer,
+            with_gemm_swizzled_scales=False,
+            requires_grad=False,
+            device=w.device,
+        )
+
+        if os.getenv("MXFP4_QAT_VERIFY", "0") == "1":
+            # Rowwise rep must dequantize to exactly the MXFP4-grid weight.
+            ref = cast_back(fp4, "fp32", (1, 32))
+            te_dq = qtensor.dequantize(dtype=torch.float32)
+            if not torch.allclose(te_dq, ref, atol=0.0, rtol=0.0):
+                max_err = (te_dq.float() - ref.float()).abs().max().item()
+                raise RuntimeError(
+                    "MXFP4_QAT MXFP8Tensor rowwise mismatch vs the MXFP4-grid weight "
+                    f"(max_abs_err={max_err}). The scale layout or constructor kwargs likely "
+                    "differ from TE's MXFP8BlockScaling; fix before training."
+                )
+            # Columnwise rep: TE's dequant of a columnwise-only view must match TileKernels'
+            # dequant of the same 32x1 requantization.
+            if not build_columnwise:
+                return qtensor
+            col_only = MXFP8Tensor(
+                shape=w.shape,
+                dtype=w.dtype,
+                rowwise_data=None,
+                rowwise_scale_inv=None,
+                columnwise_data=qtensor._columnwise_data,
+                columnwise_scale_inv=qtensor._columnwise_scale_inv,
+                fp8_dtype=tex.DType.kFloat8E4M3,
+                quantizer=quantizer,
+                with_gemm_swizzled_scales=False,
+                requires_grad=False,
+                device=w.device,
+            )
+            ref_col = cast_back((colwise_fp8_t, colwise_sf_t), "fp32", (1, 32)).t()
+            te_dq_col = col_only.dequantize(dtype=torch.float32)
+            if not torch.allclose(te_dq_col, ref_col, atol=0.0, rtol=0.0):
+                max_err = (te_dq_col.float() - ref_col.float()).abs().max().item()
+                raise RuntimeError(
+                    "MXFP4_QAT MXFP8Tensor columnwise mismatch vs TileKernels' 32x1 requant "
+                    f"(max_abs_err={max_err}). The columnwise scale layout/orientation likely "
+                    "differs from TE's MXFP8BlockScaling; fix before training."
+                )
+
+        return qtensor
+
+    class _MXFP4WeightToQuantizedSTE(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, w):
-            return _mxfp4_to_blockwise_fp8_qtensor(w)
+        def forward(ctx, w, quantize_fn, mirror_wgrad_handshake):
+            ctx.master_weight = w
+            ctx.mirror_wgrad_handshake = mirror_wgrad_handshake
+            return quantize_fn(w)
 
         @staticmethod
         def backward(ctx, grad_output):
+            if ctx.mirror_wgrad_handshake:
+                # TE accumulated the wgrad into main_grad, set grad_added_to_main_grad=True on
+                # the transient quantized weight, and returned a dummy wgrad (grad_output).
+                # Replay the flag on the master param so Megatron's DDP hook skips adding the
+                # dummy and just marks the bucket ready — exactly the non-QAT protocol.
+                ctx.master_weight.grad_added_to_main_grad = True
             # Straight-through: grad flows unchanged to the bf16/fp32 master weight.
-            return grad_output
+            return grad_output, None, None
 
-    def mxfp4_weight_to_fp8_qtensor(w):
-        out = _MXFP4WeightToFp8STE.apply(w)
+    def mxfp4_weight_to_fp8_qtensor(w, fuse_wgrad_accumulation=False):
+        """MXFP4 weight QAT entry point: picks the FP8 target from the active TE recipe
+        (Float8BlockScaling -> Float8BlockwiseQTensor, MXFP8BlockScaling -> MXFP8Tensor).
+
+        Compatible with all recipe.backward_override modes (None / 'high_precision' /
+        'dequantized'); see the per-target docstrings for which weight rep dgrad consumes in
+        each mode. The STE and the fused-wgrad handshake are mode-independent: wgrad never
+        involves the weight operand and TE's handle_custom_ddp_from_mcore branch is shared
+        across modes, so the gradient returned at the weight position (dummy under
+        fuse_wgrad_accumulation, real wgrad otherwise) always flows through the STE to the
+        bf16/fp32 master unchanged.
+
+        Outside fp8 autocast (bf16-override layers, and TE's ``backward_dw`` which re-fetches
+        the weight params to attach ``.grad``) the weight is returned unchanged.
+        """
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        if not FP8GlobalStateManager.is_fp8_enabled():
+            return w
+        recipe = FP8GlobalStateManager.get_fp8_recipe()
+        if recipe.mxfp8():
+            quantize_fn = _mxfp4_to_mxfp8_qtensor
+        elif recipe.float8_block_scaling():
+            assert getattr(recipe, "w_block_scaling_dim", 2) == 2, (
+                "USE_MXFP4_QAT produces 128x128 (2D) weight scales; "
+                f"recipe has w_block_scaling_dim={recipe.w_block_scaling_dim}"
+            )
+            quantize_fn = _mxfp4_to_blockwise_fp8_qtensor
+        else:
+            raise RuntimeError(
+                f"USE_MXFP4_QAT supports mxfp8 and blockwise fp8 recipes, got {type(recipe).__name__}"
+            )
+
+        # TE reads Megatron's fused-wgrad DDP protocol attributes off the weight object passed
+        # to forward, i.e. off the transient quantized tensor. Forward them so TE takes the
+        # same dummy-wgrad handshake it takes for plain params, and mirror the flag back to the
+        # master in backward (see _MXFP4WeightToQuantizedSTE.backward).
+        mirror_handshake = fuse_wgrad_accumulation and hasattr(w, "grad_added_to_main_grad")
+        out = _MXFP4WeightToQuantizedSTE.apply(w, quantize_fn, mirror_handshake)
         if hasattr(w, "main_grad"):
             out.main_grad = w.main_grad
+        if mirror_handshake:
+            out.grad_added_to_main_grad = False
+            out.zero_out_wgrad = getattr(w, "zero_out_wgrad", False)
+        if hasattr(w, "overwrite_main_grad"):
+            out.overwrite_main_grad = w.overwrite_main_grad
         return out
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
@@ -1833,6 +2087,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             weight_tensors = super()._get_weight_tensors()
 
             if os.getenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0") == "1":
+                assert os.getenv("USE_MXFP4_QAT", "0") != "1", (
+                    "OPEN_TRAINING_INT4_FAKE_QAT_FLAG and USE_MXFP4_QAT are mutually exclusive"
+                )
                 group_size = int(os.getenv("OPEN_TRAINING_INT4_GROUP_SIZE", "128"))
 
                 weight_tensors = [
@@ -1840,11 +2097,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     for w in weight_tensors
                 ]
             elif os.getenv("USE_MXFP4_QAT", "0") == "1":
-                # MXFP4 weight QAT: bf16 -> MXFP4 -> blockwise FP8 entirely via TileKernels, handed
-                # to TE as a Float8BlockwiseQTensor (TE does NOT re-quantize the weight). Backward
-                # is STE to the bf16/fp32 master.
+                # MXFP4 weight QAT: bf16 -> MXFP4 -> FP8 entirely via TileKernels, handed to TE
+                # pre-quantized (TE does NOT re-quantize the weight). The FP8 target follows the
+                # active recipe: blockwise fp8 -> Float8BlockwiseQTensor, mxfp8 -> MXFP8Tensor.
+                # Backward is STE to the bf16/fp32 master.
                 weight_tensors = [
-                    mxfp4_weight_to_fp8_qtensor(w)
+                    mxfp4_weight_to_fp8_qtensor(w, self.fuse_wgrad_accumulation)
                     for w in weight_tensors
                 ]
 
