@@ -537,7 +537,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
         self._state_offloader: Optional[OptimizerStateOffloader] = None
-        self._nvme_state_store = None
 
         # when freezing sub-models we have no real optimizer
         # but still need a stub DistributedOptimizer class
@@ -631,15 +630,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.offload_optimizer_states:
             self._state_offloader = OptimizerStateOffloader(self)
 
-        if self.config.optimizer_state_nvme_dir is not None:
-            from megatron.core.optimizer.nvme_state_store import NVMeOptimizerStateStore
-
-            self._nvme_state_store = NVMeOptimizerStateStore(
-                self,
-                self.config.optimizer_state_nvme_dir,
-                self.config.optimizer_state_nvme_chunk_mb,
-            )
-
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
@@ -666,8 +656,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
-        if self._nvme_state_store is not None:
-            return {"nvme_state_store": True}
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
@@ -753,9 +741,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
-        if self._nvme_state_store is not None:
-            return
-
         if self.ddp_config.use_megatron_fsdp:
             if "param_to_group_meta" in state_dict:
                 state_dict["param_groups"] = self._param2group_meta_to_param_groups(
@@ -1262,8 +1247,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
-        if self._nvme_state_store is not None:
-            return {}
         if sharding_type is not None:
             log_single_rank(
                 logger,
@@ -2503,27 +2486,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
-                self._copy_main_params_to_model_params_for(zip(shard_main_group, model_group))
+                for shard_main_param, model_param in zip(shard_main_group, model_group):
 
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    world_range = param_range_map["gbuf_world_in_bucket"]
+
+                    assert world_range.size == shard_main_param.nelement()
+
+                    gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                    model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
+
+                    shard_model_param = model_param_buffer.view(-1)[
+                        world_range.start : world_range.end
+                    ]
+
+                    if is_float8tensor(model_param):
+                        # FP8 params are quantized in the above "quantize_param_shard" function.
+                        continue
+                    else:
+                        shard_model_param.data.copy_(shard_main_param)
+
+        # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
-
-    def _copy_main_params_to_model_params_for(self, pairs):
-        for shard_main_param, model_param in pairs:
-            param_range_map = self._get_model_param_range_map(model_param)
-            world_range = param_range_map["gbuf_world_in_bucket"]
-
-            assert world_range.size == shard_main_param.nelement()
-
-            gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
-            model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
-
-            shard_model_param = model_param_buffer.view(-1)[world_range.start : world_range.end]
-
-            if is_float8tensor(model_param):
-                # FP8 params are quantized in the above "quantize_param_shard" function.
-                continue
-            shard_model_param.data.copy_(shard_main_param)
 
     def _copy_main_params_to_param_buffer(self):
         """
@@ -2586,15 +2571,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return model_param_to_state_dict_param_map
 
     def _copy_model_params_to_main_params(self, state_dict=None):
-        if self._nvme_state_store is not None:
-            self._nvme_state_store.refresh_main_from_model_params(
-                lambda: self._copy_model_params_to_main_params_impl(state_dict)
-            )
-            return
-        self._copy_model_params_to_main_params_impl(state_dict)
-
-    @torch.no_grad()
-    def _copy_model_params_to_main_params_impl(self, state_dict=None):
         """
         Copy model params to main params.
 
@@ -2658,10 +2634,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         if self._state_offloader is not None:
             self._state_offloader.sync_before_step()
-        if self._nvme_state_store is not None:
-            update_successful = self._nvme_state_store.step()
-        else:
-            update_successful = super().step_with_ready_grads()
+        update_successful = super().step_with_ready_grads()
 
         timers = self.config.timers
         if timers is not None:

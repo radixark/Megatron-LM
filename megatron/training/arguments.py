@@ -2110,19 +2110,6 @@ def _add_training_args(parser):
                        'Only support TE FusedAdam optimizer.'
                        'Note that this still uses pure GPU optimizer instead of '
                        'HybridDeviceOptimizer for --optimizer-cpu-offload.')
-    group.add_argument('--optimizer-state-nvme-dir', type=str, default=None,
-                       help='Stream fp32 main params and Adam moments through per-bucket '
-                       'files under this node-local directory during the optimizer step, '
-                       'bounding GPU residency to one bucket. Checkpointing optimizer '
-                       'state is not supported yet.')
-    group.add_argument('--optimizer-state-nvme-chunk-mb', type=int, default=256,
-                       help='Pinned staging chunk size for NVMe optimizer state streaming.')
-    group.add_argument('--optimizer-state-nvme-moment-dtype', type=str, default='fp32',
-                       choices=['fp32', 'bf16', 'fp16', 'fp8e4m3', 'fp8e5m2'],
-                       help='Storage dtype for the NVMe-streamed Adam moments. bf16 cuts '
-                       'streaming volume by a third, which the step is bound by; fp32 is '
-                       'bit-identical to keeping them on GPU. The fp8 options need '
-                       'per-block scaling to be sound and are not recommended.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')

@@ -333,17 +333,6 @@ class OptimizerConfig:
     low_memory_resume: bool = False
     """If True, allocate optimizer states on CPU during checkpoint loading to prevent GPU OOM."""
 
-    optimizer_state_nvme_dir: Optional[str] = None
-    """If set, stream fp32 main params and Adam moments through per-bucket files under this
-    node-local directory during the optimizer step, bounding GPU residency to one bucket."""
-
-    optimizer_state_nvme_chunk_mb: int = 256
-    """Pinned staging chunk size for NVMe optimizer state streaming."""
-
-    optimizer_state_nvme_moment_dtype: str = "fp32"
-    """Storage dtype for the NVMe-streamed Adam moments. bf16 cuts streaming volume by a
-    third, which the step is bound by; fp32 is bit-identical to keeping them on GPU."""
-
     ################
     # Miscellaneous
     ################

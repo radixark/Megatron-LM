@@ -475,12 +475,8 @@ def _iter_nvme_state_stores(optimizer):
             yield store
 
 
-def _nvme_state_checkpoint_dir(checkpoint_name, store):
-    rank = torch.distributed.get_rank()
-    instance = store.dist_opt.distributed_optimizer_instance_id
-    return os.path.join(
-        checkpoint_name, "nvme_opt_state", f"rank{rank:04d}_opt{instance}_{store.uid}"
-    )
+def _nvme_state_base_dir(checkpoint_name):
+    return os.path.join(checkpoint_name, "nvme_opt_state")
 
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
@@ -587,7 +583,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     if not args.no_save_optim and optimizer is not None:
         for store in _iter_nvme_state_stores(optimizer):
-            store.save_to(_nvme_state_checkpoint_dir(checkpoint_name, store))
+            store.save_to(_nvme_state_base_dir(checkpoint_name))
 
     async_save_request = None
     if args.async_save:
@@ -1850,11 +1846,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     if optimizer is not None and not release and not args.finetune and not args.no_load_optim:
         for store in _iter_nvme_state_stores(optimizer):
-            nvme_dir = _nvme_state_checkpoint_dir(checkpoint_name, store)
-            if os.path.isdir(nvme_dir):
-                store.load_from(nvme_dir)
-            else:
-                print_rank_0(f"  no NVMe optimizer state at {nvme_dir}; starting fresh")
+            store.load_from(_nvme_state_base_dir(checkpoint_name))
 
     # rerun state
     if not ignore_rerun_state:
