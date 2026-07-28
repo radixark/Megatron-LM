@@ -559,6 +559,17 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     )
 
 
+def _iter_nvme_state_stores(optimizer):
+    for opt in getattr(optimizer, "chained_optimizers", None) or [optimizer]:
+        store = getattr(opt, "_nvme_state_store", None)
+        if store is not None:
+            yield store
+
+
+def _nvme_state_base_dir(checkpoint_name):
+    return os.path.join(checkpoint_name, "nvme_opt_state")
+
+
 def save_checkpoint(
     iteration,
     model,
@@ -732,6 +743,10 @@ def save_checkpoint(
         ensure_directory_exists(optim_checkpoint_name)
         if not optimizer.is_stub_optimizer:
             optimizer.save_state_dict_to_file(optim_checkpoint_name)
+
+    if not args.no_save_optim and optimizer is not None:
+        for store in _iter_nvme_state_stores(optimizer):
+            store.save_to(_nvme_state_base_dir(checkpoint_name))
 
     async_save_request = None
     if args.async_save:
@@ -2422,6 +2437,10 @@ def load_checkpoint(
                 optimizer.reload_model_params(state_dict=state_dict)
             else:
                 optimizer.reload_model_params()
+
+    if optimizer is not None and not release and not args.finetune and not args.no_load_optim:
+        for store in _iter_nvme_state_stores(optimizer):
+            store.load_from(_nvme_state_base_dir(checkpoint_name))
 
     # rerun state
     if not ignore_rerun_state:
