@@ -6,6 +6,11 @@
 import torch
 import torch.nn.functional as F
 
+from megatron.core.fusions.fast_activations import (
+    flashinfer_fast_swiglu,
+    flashinfer_fast_swiglu_back,
+    use_fast_activations,
+)
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
@@ -13,7 +18,7 @@ from megatron.core.utils import nvtx_decorator
 
 
 @jit_fuser
-def swiglu(y):
+def megatron_swiglu(y):
     """Performs SwiGLU (Swish-Gated Linear Unit) activation function.
 
     Args:
@@ -24,6 +29,11 @@ def swiglu(y):
     """
     y_1, y_2 = torch.chunk(y, 2, -1)
     return F.silu(y_1) * y_2
+
+
+# Resolve the implementation once at import so torch.compile and CUDA graphs see
+# a stable callable. Set the environment variable before importing Megatron.
+swiglu = flashinfer_fast_swiglu if use_fast_activations() else megatron_swiglu
 
 
 @jit_fuser
@@ -52,7 +62,7 @@ def weighted_swiglu(y, weights):
 # gradient of actual gelu is:
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
 @jit_fuser
-def swiglu_back(g, y):
+def megatron_swiglu_back(g, y):
     """Computes the gradient for the SwiGLU activation function.
 
     Args:
@@ -67,6 +77,9 @@ def swiglu_back(g, y):
     return torch.cat(
         (g * torch.sigmoid(y_1) * (1 + y_1 * (1 - torch.sigmoid(y_1))) * y_2, g * F.silu(y_1)), -1
     )
+
+
+swiglu_back = flashinfer_fast_swiglu_back if use_fast_activations() else megatron_swiglu_back
 
 
 @jit_fuser

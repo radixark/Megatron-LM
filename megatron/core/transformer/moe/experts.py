@@ -22,7 +22,11 @@ from megatron.core.dist_checkpointing.mapping import (
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
-from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import (
+    bias_swiglu_impl,
+    weighted_bias_swiglu_impl,
+)
+from megatron.core.fusions.fast_activations import use_fast_activations
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -88,16 +92,25 @@ class GroupedMLP(MegatronModule):
         ), "MoE latent projection not supported in GroupedMLP yet."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
+        use_fast_swiglu = (
+            self.config.gated_linear_unit
+            and self.config.activation_func == F.silu
+            and use_fast_activations()
+        )
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
                 raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
 
-            @jit_fuser
-            def glu(x):
-                x = torch.chunk(x, 2, dim=-1)
-                return self.config.activation_func(x[0]) * x[1]
+            if use_fast_swiglu:
+                self.activation_func = partial(bias_swiglu_impl, bias=None)
+            else:
 
-            self.activation_func = glu
+                @jit_fuser
+                def glu(x):
+                    x = torch.chunk(x, 2, dim=-1)
+                    return self.config.activation_func(x[0]) * x[1]
+
+                self.activation_func = glu
         else:
             self.activation_func = self.config.activation_func
         self.activation_recompute = (
@@ -109,11 +122,18 @@ class GroupedMLP(MegatronModule):
                 "moe_act recompute for fp8 or fp4 cannot work with the legacy GroupedMLP."
             )
 
-        @jit_fuser
-        def activation_func_with_probs(x, probs):
-            dtype = x.dtype
-            res = self.activation_func(x) * probs
-            return res.to(dtype)
+        if use_fast_swiglu:
+
+            def activation_func_with_probs(x, probs):
+                return weighted_bias_swiglu_impl(x, None, probs)
+
+        else:
+
+            @jit_fuser
+            def activation_func_with_probs(x, probs):
+                dtype = x.dtype
+                res = self.activation_func(x) * probs
+                return res.to(dtype)
 
         self.activation_func_with_probs = activation_func_with_probs
 
