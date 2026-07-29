@@ -232,6 +232,83 @@ candidate differences were far-underflow outputs, with maximum absolute error
 `4.27e-36`. The finite validation contract above uses `[-20, 20]` for the
 edge and sweep cases; the wide random case can sample beyond that range.
 
+## Miles GLM-5.2 end-to-end check
+
+The integration was also checked with
+`tests/e2e/megatron/test_glm5_2_744b_a40b_5layer_nvfp4.py` from Miles main at
+`8cb2ac1c8`. This was an experiment-only Miles edit:
+
+- both `NUM_LAYERS_AT_START_IN_BF16` and
+  `NUM_LAYERS_AT_END_IN_BF16` were changed from 1 to 0;
+- SGLang DSA Top-K used `sgl-kernel`;
+- Miles DSA Top-K used `torch`;
+- `MILES_USE_FAST_ACTIVATIONS` was explicitly forwarded to Ray workers.
+
+The successful runs used devbox `miles-fast-activations-glm5` on host
+`B200-122`, image `radixark/miles:dev-202607281246`, and the existing
+FlashInfer 0.6.12 installation. FlashInfer was not pulled, reinstalled,
+cache-cleared, or modified. The Megatron sources in `/root/Megatron-LM`
+matched this checkout byte-for-byte for `fast_activations.py`,
+`fused_bias_swiglu.py`, and `experts.py`.
+
+`NCCL_NVLS_ENABLE=0` was applied identically to every successful arm after an
+earlier host hung in `cuMulticastBindMem` during NCCL NVLS setup. This is an
+infrastructure control, not an activation or FlashInfer change.
+
+Two ordinary end-to-end runs initially appeared to favor the fast activation:
+
+| step | metric | strict (`0`) | fast (`1`) | apparent reduction |
+| ---: | --- | ---: | ---: | ---: |
+| 0 | `train_rollout_logprob_abs_diff` | 0.015341824 | 0.014908222 | 2.826% |
+| 0 | `train_rollout_kl` | 0.000214807 | 0.000204328 | 4.878% |
+| 0 | `kl_loss` | 0.000191792 | 0.000182615 | 4.785% |
+| 1 | `train_rollout_logprob_abs_diff` | 0.015085755 | 0.014913565 | 1.141% |
+| 1 | `train_rollout_kl` | 0.000210631 | 0.000208244 | 1.134% |
+| 1 | `kl_loss` | 0.000174828 | 0.000158239 | 9.489% |
+
+These are not a controlled activation comparison. GLM-5.2 NSA does not
+support SGLang deterministic inference, and the test samples with temperature
+1, so the two runs produced different response tokens.
+
+For the controlled comparison, both arms replayed the exact rollout tensors
+saved by the strict end-to-end run. The two source files and both replay
+copies were byte-identical:
+
+```text
+rollout 0: 3204181416cba0b95f8971bfaa2a24f1e937125b2ded3c5a7ee2f6401e476472
+rollout 1: cf819cdc8b6b6368134e32a08c94ea1aa0d4bcd2950d111d67b634326e939e88
+```
+
+The replay starts no SGLang engines; its fixed samples retain the rollout
+log-probabilities and routed-expert choices produced by the corrected
+`sgl-kernel` rollout arm. The strict replay reproduced the original strict
+metrics exactly. With only `MILES_USE_FAST_ACTIVATIONS` changed, the results
+were:
+
+| step | metric | strict (`0`) | fast (`1`) | relative outcome |
+| ---: | --- | ---: | ---: | --- |
+| 0 | `train_rollout_logprob_abs_diff` | 0.015341824 | 0.015338320 | 0.0228% lower |
+| 0 | `train_rollout_kl` | 0.000214807 | 0.000214773 | 0.0159% lower |
+| 0 | `kl_loss` | 0.000191792 | 0.000192108 | 0.1645% higher |
+| 1 | `train_rollout_logprob_abs_diff` | 0.015085755 | 0.015118198 | 0.2151% higher |
+| 1 | `train_rollout_kl` | 0.000210631 | 0.000211074 | 0.2103% higher |
+| 1 | `kl_loss` | 0.000174828 | 0.000174647 | 0.1038% lower |
+
+The controlled result does not show a consistent end-to-end improvement.
+Averaged across the two fixed rollouts, the fast arm was higher by 0.0951%
+for absolute log-probability difference, 0.0961% for rollout KL, and 0.0366%
+for KL loss. The larger apparent improvement in the independent runs should
+therefore be treated as sampling variance, not evidence for the activation
+toggle. In addition, `kl_loss` compares the trainer with the Megatron
+reference model and is not a direct trainer-versus-rollout metric.
+
+Downloaded command-traced logs:
+
+- `logs/glm5_nvfp4_sglkernel_torch_topk_fast_activation_off_nvls0_20260728_205603/run.log`
+- `logs/glm5_nvfp4_sglkernel_torch_topk_fast_activation_on_nvls0_20260728_210103/run.log`
+- `logs/glm5_nvfp4_fast_activation_off_replay_off_rollouts_nvls0_20260728_211100/run.log`
+- `logs/glm5_nvfp4_fast_activation_on_replay_off_rollouts_nvls0_20260728_210800/run.log`
+
 ## Tests and checks
 
 The focused tests ran once with the env disabled and once enabled:
