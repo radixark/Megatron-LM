@@ -251,6 +251,22 @@ cache-cleared, or modified. The Megatron sources in `/root/Megatron-LM`
 matched this checkout byte-for-byte for `fast_activations.py`,
 `fused_bias_swiglu.py`, and `experts.py`.
 
+The GLM configuration resolves to `TEGroupedMLP`, not the legacy
+`GroupedMLP`. A one-time rank-0 warning was therefore added where
+`TEGroupedMLP` selects the weighted SwiGLU implementation. The controlled
+replay emitted exactly one marker in each arm:
+
+```text
+TEGroupedMLP weighted SwiGLU activation path: megatron_swiglu/megatron_swiglu_back (MILES_USE_FAST_ACTIVATIONS=0)
+TEGroupedMLP weighted SwiGLU activation path: flashinfer_fast_swiglu/flashinfer_fast_swiglu_back (MILES_USE_FAST_ACTIVATIONS=1)
+```
+
+Both arms then completed two actor forward/backward steps and produced the
+metrics below. This directly verifies that the flag reached the Ray trainer
+worker and selected the intended production activation pair. The warning is
+at constructor-time rather than inside the JIT-fused activation or custom
+autograd body, so it does not introduce a graph break.
+
 `NCCL_NVLS_ENABLE=0` was applied identically to every successful arm after an
 earlier host hung in `cuMulticastBindMem` during NCCL NVLS setup. This is an
 infrastructure control, not an activation or FlashInfer change.
@@ -308,6 +324,8 @@ Downloaded command-traced logs:
 - `logs/glm5_nvfp4_sglkernel_torch_topk_fast_activation_on_nvls0_20260728_210103/run.log`
 - `logs/glm5_nvfp4_fast_activation_off_replay_off_rollouts_nvls0_20260728_211100/run.log`
 - `logs/glm5_nvfp4_fast_activation_on_replay_off_rollouts_nvls0_20260728_210800/run.log`
+- `logs/numerical_runner_activation_path_log_20260729_044459/run.log`
+- `logs/numerical_runner_activation_path_log_20260729_044459/comparison/{strict,fast}/run.log`
 
 ## Tests and checks
 

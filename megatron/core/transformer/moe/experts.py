@@ -52,6 +52,7 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import log_single_rank
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -65,6 +66,24 @@ except ImportError:
     HAVE_TE = False
 
 logger = logging.getLogger(__name__)
+_LOGGED_SWIGLU_PATHS: set[tuple[str, str]] = set()
+
+
+def _log_swiglu_path(
+    backend: str, implementation: str, fast_activations_enabled: bool
+) -> None:
+    key = (backend, implementation)
+    if key in _LOGGED_SWIGLU_PATHS:
+        return
+    _LOGGED_SWIGLU_PATHS.add(key)
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        "%s SwiGLU activation path: %s (MILES_USE_FAST_ACTIVATIONS=%d)",
+        backend,
+        implementation,
+        int(fast_activations_enabled),
+    )
 
 
 class GroupedMLP(MegatronModule):
@@ -103,6 +122,7 @@ class GroupedMLP(MegatronModule):
 
             if use_fast_swiglu:
                 self.activation_func = partial(bias_swiglu_impl, bias=None)
+                swiglu_implementation = "flashinfer_fast_swiglu/flashinfer_fast_swiglu_back"
             else:
 
                 @jit_fuser
@@ -111,6 +131,14 @@ class GroupedMLP(MegatronModule):
                     return self.config.activation_func(x[0]) * x[1]
 
                 self.activation_func = glu
+                swiglu_implementation = "torch.nn.functional.silu/autograd"
+
+            if self.config.activation_func == F.silu:
+                _log_swiglu_path(
+                    "GroupedMLP",
+                    swiglu_implementation,
+                    use_fast_swiglu,
+                )
         else:
             self.activation_func = self.config.activation_func
         self.activation_recompute = (
@@ -593,6 +621,25 @@ class TEGroupedMLP(MegatronModule):
             self.activation_func = build_module(submodules.activation_func, config=self.config)
         else:
             self.activation_func = self.config.activation_func
+
+        uses_weighted_swiglu = (
+            not self.config.use_te_activation_func
+            and self.config.bias_activation_fusion
+            and self.activation_func == F.silu
+            and self.config.gated_linear_unit
+        )
+        if uses_weighted_swiglu:
+            fast_activations_enabled = use_fast_activations()
+            swiglu_implementation = (
+                "flashinfer_fast_swiglu/flashinfer_fast_swiglu_back"
+                if fast_activations_enabled
+                else "megatron_swiglu/megatron_swiglu_back"
+            )
+            _log_swiglu_path(
+                "TEGroupedMLP weighted",
+                swiglu_implementation,
+                fast_activations_enabled,
+            )
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
