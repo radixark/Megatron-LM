@@ -691,6 +691,12 @@ class TransformerConfig(ModelParallelConfig):
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
 
+    moe_activation_in_fp32: bool = False
+    """Compute the inter-GEMM swiglu in fp32 with one round back to the params dtype."""
+
+    moe_combine_in_fp32: bool = False
+    """Apply routing probs and accumulate expert outputs in fp32 with one final round."""
+
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
     The routing decision is based on the sum of the routing scores and the expert bias.
@@ -1921,6 +1927,21 @@ class TransformerConfig(ModelParallelConfig):
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
                     f"variable sequence length, please use alltoall dispatcher instead."
                 )
+
+        if self.moe_activation_in_fp32 or self.moe_combine_in_fp32:
+            assert not (
+                self.fp8 or getattr(self, 'fp4', None)
+            ), "moe_*_in_fp32 supports bf16/fp16 only"
+            assert (
+                not self.moe_permute_fusion
+            ), "moe_*_in_fp32 bypasses fused permute/unpermute; disable --moe-permute-fusion"
+            assert (
+                self.activation_func_clamp_value is None
+            ), "moe_*_in_fp32 is an inference-alignment mode; drop --activation-func-clamp-value"
+        if self.moe_combine_in_fp32:
+            assert (
+                self.moe_router_dtype == 'fp32'
+            ), "moe_combine_in_fp32 needs --moe-router-dtype fp32 (probs reach combine un-rounded)"
 
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (
