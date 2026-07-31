@@ -1502,30 +1502,26 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+
     def ceil_div(x: int, y: int) -> int:
+        """Divide and round up."""
         return (x + y - 1) // y
 
     class _FakeInt4QuantizationSTE(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, group_size):
+            """Fake-quantize an INT4 weight."""
             m, n = x.shape
             block_size_m, block_size_n = 1, group_size
-
 
             m_padded = ceil_div(m, block_size_m) * block_size_m
             n_padded = ceil_div(n, block_size_n) * block_size_n
 
-            x_padded = torch.zeros(
-                (m_padded, n_padded),
-                dtype=x.dtype, device=x.device
-            )
+            x_padded = torch.zeros((m_padded, n_padded), dtype=x.dtype, device=x.device)
             x_padded[:m, :n] = x
 
             x_view = x_padded.view(
-                m_padded // block_size_m,
-                block_size_m,
-                n_padded // block_size_n,
-                block_size_n
+                m_padded // block_size_m, block_size_m, n_padded // block_size_n, block_size_n
             )
 
             x_max = x_view.abs().float().amax(dim=(1, 3), keepdim=True)
@@ -1548,10 +1544,68 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         @staticmethod
         def backward(ctx, grad_output):
+            """Pass gradients through unchanged."""
             return grad_output, None
 
     def fake_int4_quantization_ste(x, group_size):
+        """Fake-quantize an INT4 weight with straight-through gradients."""
         x_out = _FakeInt4QuantizationSTE.apply(x, group_size)
+
+        if hasattr(x, 'main_grad'):
+            x_out.main_grad = x.main_grad
+
+        return x_out
+
+    def _get_nvfp4_qat_quantizer():
+        """Build TE's inference-compatible NVFP4 weight quantizer."""
+        if not hasattr(te.pytorch, "NVFP4Quantizer"):
+            raise RuntimeError(
+                "NVFP4 fake QAT requires a Transformer Engine build with NVFP4Quantizer."
+            )
+
+        nvfp4_use_4over6 = os.getenv("NVTE_NVFP4_4OVER6", "none").strip().lower() in (
+            "weights",
+            "all",
+        )
+        nvfp4_use_e4m3_256 = os.getenv("NVTE_NVFP4_4OVER6_E4M3_USE_256", "all").strip().lower() in (
+            "weights",
+            "all",
+        )
+        nvfp4_e4m3_max = 256 if nvfp4_use_4over6 and nvfp4_use_e4m3_256 else 448
+
+        return te.pytorch.NVFP4Quantizer(
+            rowwise=True,
+            columnwise=False,
+            with_amax_reduction=False,
+            with_rht=False,
+            with_post_rht_amax=False,
+            with_2d_quantization=False,
+            stochastic_rounding=False,
+            row_scaled_nvfp4=False,
+            nvfp4_use_4over6=nvfp4_use_4over6,
+            nvfp4_e4m3_max=nvfp4_e4m3_max,
+            nvfp4_4over6_err_mode=os.getenv("NVTE_NVFP4_4OVER6_ERR_MODE", "MAE").strip().upper(),
+            with_random_sign_mask=False,
+        )
+
+    def fake_nvfp4_quantization_ste(x, quantizer):
+        """Fake-quantize a weight with a TE NVFP4 quantizer and straight-through gradients."""
+        m, n = x.shape
+        block_size = 16
+        if n % block_size != 0:
+            raise ValueError(
+                f"NVFP4 fake QAT requires the weight K dimension to be divisible by {block_size}, "
+                f"got {n}."
+            )
+
+        m_padded = ceil_div(m, block_size) * block_size
+        if m_padded == m:
+            x_padded = x.contiguous()
+        else:
+            padding = torch.zeros((m_padded - m, n), dtype=x.dtype, device=x.device)
+            x_padded = torch.cat((x.contiguous(), padding), dim=0)
+
+        x_out = quantizer.quantize(x_padded).dequantize(dtype=x.dtype)[:m, :n].contiguous()
 
         if hasattr(x, 'main_grad'):
             x_out.main_grad = x.main_grad
@@ -1654,6 +1708,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 **extra_kwargs,
             )
             self.te_quant_params: Optional[TEQuantizationParams] = None
+            self._nvfp4_qat_quantizer = None
+            if os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1":
+                self._nvfp4_qat_quantizer = _get_nvfp4_qat_quantizer()
             _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
 
             def merge_extra_states(
@@ -1781,11 +1838,20 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """Get the weight tensors of the module."""
             weight_tensors = super()._get_weight_tensors()
 
-            if os.getenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0") == "1":
+            int4_qat_enabled = os.getenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0") == "1"
+            nvfp4_qat_enabled = os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1"
+            if int4_qat_enabled and nvfp4_qat_enabled:
+                raise RuntimeError("INT4 and NVFP4 fake QAT cannot be enabled together.")
+
+            if int4_qat_enabled:
                 group_size = int(os.getenv("OPEN_TRAINING_INT4_GROUP_SIZE", "128"))
 
+                weight_tensors = [fake_int4_quantization_ste(w, group_size) for w in weight_tensors]
+            elif nvfp4_qat_enabled:
+                if self._nvfp4_qat_quantizer is None:
+                    self._nvfp4_qat_quantizer = _get_nvfp4_qat_quantizer()
                 weight_tensors = [
-                    fake_int4_quantization_ste(w, group_size)
+                    fake_nvfp4_quantization_ste(w, self._nvfp4_qat_quantizer)
                     for w in weight_tensors
                 ]
 
