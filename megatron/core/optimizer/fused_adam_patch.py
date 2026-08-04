@@ -19,7 +19,10 @@ _patch_applied = False
 def _patched_initialize_state(self, param, state_name, zero_buffer, store_param_remainders=False):
     """Patched _initialize_state: allocate on CPU for low-memory resume."""
     from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
-    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+    except ImportError:
+        from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     import transformer_engine_torch as tex
 
     dtype = self.name_to_dtype_map[state_name]

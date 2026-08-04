@@ -526,6 +526,33 @@ class GroupedMLP(MegatronModule):
         pass
 
 
+class _MoEActivationInFP32(torch.autograd.Function):
+    """fp32 swiglu (x prob) between the grouped GEMMs, one round back to the params dtype."""
+
+    @staticmethod
+    def forward(ctx, fc1_out, probs, glu_offset):
+        ctx.save_for_backward(fc1_out, probs)
+        ctx.glu_offset = glu_offset
+        g, u = torch.chunk(fc1_out.float(), 2, dim=-1)
+        y = F.silu(g) * (u + glu_offset) * probs.float()
+        return y.to(fc1_out.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        fc1_out, probs = ctx.saved_tensors
+        g, u = torch.chunk(fc1_out.float(), 2, dim=-1)
+        s = torch.sigmoid(g)
+        silu = g * s
+        go = grad_out.float() * probs.float()
+        d_g = go * (u + ctx.glu_offset) * (s + silu * (1 - s))
+        d_u = go * silu
+        d_p = None
+        if ctx.needs_input_grad[1]:
+            d_p = (grad_out.float() * silu * (u + ctx.glu_offset)).sum(-1, keepdim=True)
+            d_p = d_p.to(probs.dtype)
+        return torch.cat([d_g, d_u], dim=-1).to(fc1_out.dtype), d_p, None
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -681,6 +708,9 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
+        if self.config.moe_combine_in_fp32:
+            permuted_probs = torch.ones_like(permuted_probs)
+
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         ) as permuted_local_hidden_states:
@@ -695,6 +725,11 @@ class TEGroupedMLP(MegatronModule):
             )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
+            if self.config.moe_activation_in_fp32:
+                assert bias_parallel is None and self.config.gated_linear_unit
+                return _MoEActivationInFP32.apply(
+                    intermediate_parallel, permuted_probs, self.config.glu_linear_offset
+                )
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel

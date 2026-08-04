@@ -832,11 +832,17 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
 
         # Unpermutation 1: AlltoAll output to output
+        if self.config.moe_combine_in_fp32:
+            assert not self.config.moe_permute_fusion
+            combine_probs = self.probs
+        else:
+            combine_probs = None
         output = unpermute(
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.routing_map,
+            probs=combine_probs,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
         )

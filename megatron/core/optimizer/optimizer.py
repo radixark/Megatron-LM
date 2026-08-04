@@ -156,7 +156,8 @@ class MegatronOptimizer(ABC):
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
                 param, getattr(self, 'tp_group', None)
             )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            is_not_witness = not getattr(param, "_is_witness_param", False)
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_witness:
                 grads_for_norm.append(grad)
 
         return grads_for_norm
