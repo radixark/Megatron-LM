@@ -397,19 +397,19 @@ class MultiTokenPredictionLayerSubmodules:
             embedding normalization to be applied.
         eh_proj (Union[ModuleSpec, type]): Specification or instance of the
             linear projection to be applied.
-        mtp_model_layer (Union[ModuleSpec, type]): Specification
+        transformer_layer (Union[ModuleSpec, type]): Specification
             or instance of the transformer or mamba block to be applied.
     """
 
     enorm: Union[ModuleSpec, type] = None
     hnorm: Union[ModuleSpec, type] = None
     eh_proj: Union[ModuleSpec, type] = None
-    mtp_model_layer: Union[ModuleSpec, type] = None
+    transformer_layer: Union[ModuleSpec, type] = None
     layer_norm: Union[ModuleSpec, type] = None
 
 
 def get_mtp_layer_spec(
-    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool
+    transformer_layer_spec: ModuleSpec, use_transformer_engine: bool
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -417,13 +417,13 @@ def get_mtp_layer_spec(
         ModuleSpec: Module specification with TE modules
     """
     return get_mtp_layer_spec_for_backend(
-        mtp_model_layer_spec,
+        transformer_layer_spec,
         backend=TESpecProvider() if use_transformer_engine else LocalSpecProvider(),
     )
 
 
 def get_mtp_layer_spec_for_backend(
-    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
+    transformer_layer_spec: ModuleSpec, backend: BackendSpecProvider
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -438,7 +438,7 @@ def get_mtp_layer_spec_for_backend(
             enorm=layer_norm_impl,
             hnorm=layer_norm_impl,
             eh_proj=column_parallel_linear_impl,
-            mtp_model_layer=mtp_model_layer_spec,
+            transformer_layer=transformer_layer_spec,
             layer_norm=layer_norm_impl,
         ),
     )
@@ -700,23 +700,23 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.mtp_layer_pattern = mtp_layer_pattern
 
         # Validate attention mask type if using transformer-based inner layers
-        if self.submodules.mtp_model_layer is not None and hasattr(
-            self.submodules.mtp_model_layer, 'submodules'
+        if self.submodules.transformer_layer is not None and hasattr(
+            self.submodules.transformer_layer, 'submodules'
         ):
             from megatron.core.ssm.mamba_block import MambaStackSubmodules
             from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 
             layer_submodules = None
-            if isinstance(self.submodules.mtp_model_layer.submodules, MambaStackSubmodules):
-                attention_layer_spec = self.submodules.mtp_model_layer.submodules.attention_layer
+            if isinstance(self.submodules.transformer_layer.submodules, MambaStackSubmodules):
+                attention_layer_spec = self.submodules.transformer_layer.submodules.attention_layer
                 if hasattr(attention_layer_spec, 'submodules'):
                     assert isinstance(attention_layer_spec.submodules, TransformerLayerSubmodules)
                     layer_submodules = attention_layer_spec.submodules
-            elif isinstance(self.submodules.mtp_model_layer.submodules, TransformerLayerSubmodules):
-                layer_submodules = self.submodules.mtp_model_layer.submodules
+            elif isinstance(self.submodules.transformer_layer.submodules, TransformerLayerSubmodules):
+                layer_submodules = self.submodules.transformer_layer.submodules
             else:
                 raise ValueError(
-                    "Unsupported mtp_model_layer submodules type for attention mask validation."
+                    "Unsupported transformer_layer submodules type for attention mask validation."
                 )
             if layer_submodules:
                 self_attention_spec = layer_submodules.self_attention
@@ -765,7 +765,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         if mtp_layer_pattern is not None and mamba_submodules is not None:
             from megatron.core.ssm.mamba_block import MambaStack
 
-            self.mtp_model_layer = MambaStack(
+            self.transformer_layer = MambaStack(
                 config=self.config,
                 submodules=mamba_submodules,
                 hybrid_override_pattern=mtp_layer_pattern,
@@ -780,8 +780,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             # MTP inner layers use their own layer numbering (self.layer_number = 1, 2, etc.)
             # rather than continuing from decoder layer numbers. This is consistent with the
             # Mamba path and ensures proper aux loss tracking in router.py.
-            self.mtp_model_layer = build_module(
-                self.submodules.mtp_model_layer,
+            self.transformer_layer = build_module(
+                self.submodules.transformer_layer,
                 config=self.config,
                 vp_stage=self.vp_stage,
                 layer_number=self.layer_number,
@@ -908,7 +908,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # True so that the fp8 weight caching can be triggered correctly.
             with transformer_layer_fp8_context:
                 if self.mtp_layer_pattern is not None:
-                    hidden_states = self.mtp_model_layer(
+                    hidden_states = self.transformer_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         rotary_pos_emb=rotary_pos_emb,
@@ -917,7 +917,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     )
                 else:
                     # GPT path: single TransformerLayer
-                    hidden_states, _ = self.mtp_model_layer(
+                    hidden_states, _ = self.transformer_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         context=context,

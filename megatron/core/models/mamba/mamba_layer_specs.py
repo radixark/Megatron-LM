@@ -54,7 +54,7 @@ _mamba_mtp_block_spec = ModuleSpec(
                     enorm=TENorm,
                     hnorm=TENorm,
                     eh_proj=TEColumnParallelLinear,
-                    mtp_model_layer=None,  # Built via pattern + mamba_submodules
+                    transformer_layer=None,  # Built via pattern + mamba_submodules
                     layer_norm=TENorm,
                 ),
             )
