@@ -224,7 +224,10 @@ class TopKRouter(Router):
         assert not self._routing_mode_initialized
         self._routing_mode_initialized = True
 
-        mode_hash = layer_number <= self.config.dsv4_n_hash_layers
+        # MTP inner layers number from 1 (see MultiTokenPredictionLayer), which
+        # would land them inside the dsv4 hash-routed range; MTP routers were
+        # always learned-routing (they numbered past the decoder before #51).
+        mode_hash = not self.is_mtp_layer and layer_number <= self.config.dsv4_n_hash_layers
 
         self.enable_expert_bias = (
             self.config.moe_router_enable_expert_bias and not mode_hash
