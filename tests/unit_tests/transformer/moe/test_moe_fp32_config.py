@@ -19,7 +19,6 @@ from megatron.core.transformer.moe.fp32_activation import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
-
 STANDARD_PRECISION_CONFIGS = [
     pytest.param({}, id="unquantized"),
     *[
@@ -133,9 +132,7 @@ def test_fp32_moe_modes_reject_unsupported_expert_paths(mode_config, invalid_con
 
 def test_fp32_moe_activation_rejects_clamp():
     with pytest.raises(AssertionError, match="drop --activation-func-clamp-value"):
-        make_fp32_moe_config(
-            moe_activation_in_fp32=True, activation_func_clamp_value=7.0
-        )
+        make_fp32_moe_config(moe_activation_in_fp32=True, activation_func_clamp_value=7.0)
 
 
 @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall", "flex"])
@@ -170,9 +167,7 @@ def test_fp32_moe_activation_accepts_squared_relu_with_fused_permute(precision_c
 @pytest.mark.parametrize(
     "activation_config",
     [
-        pytest.param(
-            {"gated_linear_unit": False, "activation_func": F.gelu}, id="gelu"
-        ),
+        pytest.param({"gated_linear_unit": False, "activation_func": F.gelu}, id="gelu"),
         pytest.param(
             {
                 "gated_linear_unit": False,
@@ -218,9 +213,7 @@ def test_fp32_moe_activation_accepts_registered_activation(monkeypatch):
     )
 
     config = make_fp32_moe_config(
-        moe_activation_in_fp32=True,
-        gated_linear_unit=False,
-        activation_func=cubic_relu,
+        moe_activation_in_fp32=True, gated_linear_unit=False, activation_func=cubic_relu
     )
 
     assert config.activation_func is cubic_relu
@@ -228,9 +221,7 @@ def test_fp32_moe_activation_accepts_registered_activation(monkeypatch):
 
 def test_yaml_squared_relu_uses_registered_activation():
     config = make_fp32_moe_config(
-        moe_activation_in_fp32=True,
-        gated_linear_unit=False,
-        activation_func=squared_relu,
+        moe_activation_in_fp32=True, gated_linear_unit=False, activation_func=squared_relu
     )
     yaml_fields = vars(config).copy()
     yaml_fields["activation_func"] = "squaredrelu"

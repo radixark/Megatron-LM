@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
 
-
 ActivationFunc = Callable[[torch.Tensor], torch.Tensor]
 ActivationContextFactory = Callable[[Any], Any]
 ActivationForward = Callable[[torch.Tensor, Any], torch.Tensor]
@@ -36,9 +35,7 @@ _MOE_ACTIVATIONS_IN_FP32: Dict[Tuple[ActivationFunc, bool], MoEActivationInFP32S
 
 
 def register_moe_activation_in_fp32(
-    activation_func: ActivationFunc,
-    gated_linear_unit: bool,
-    spec: MoEActivationInFP32Spec,
+    activation_func: ActivationFunc, gated_linear_unit: bool, spec: MoEActivationInFP32Spec
 ) -> None:
     """Register an activation/gating pair for ``moe_activation_in_fp32``."""
     key = (activation_func, gated_linear_unit)
@@ -76,9 +73,7 @@ def _swiglu_backward(
     gate, linear = torch.chunk(fc1_out, 2, dim=-1)
     sigmoid = torch.sigmoid(gate)
     silu = gate * sigmoid
-    gate_grad = grad_output * (linear + glu_offset) * (
-        sigmoid + silu * (1 - sigmoid)
-    )
+    gate_grad = grad_output * (linear + glu_offset) * (sigmoid + silu * (1 - sigmoid))
     linear_grad = grad_output * silu
     return torch.cat([gate_grad, linear_grad], dim=-1)
 
