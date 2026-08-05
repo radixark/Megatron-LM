@@ -87,10 +87,12 @@ class BaseMoELayer(MegatronModule, ABC):
         config: TransformerConfig,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
         self.attn_tp_group = pg_collection.tp
@@ -125,11 +127,6 @@ class BaseMoELayer(MegatronModule, ABC):
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
 
-    def set_is_mtp(self):
-        """Mark this MoE layer as an MTP layer."""
-        self.router.is_mtp = True
-
-
 class MoELayer(BaseMoELayer):
     """Mixture of Experts layer.
 
@@ -144,6 +141,7 @@ class MoELayer(BaseMoELayer):
         submodules: Optional[MoESubmodules] = None,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -151,7 +149,10 @@ class MoELayer(BaseMoELayer):
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
         super(MoELayer, self).__init__(
-            config=config, layer_number=layer_number, pg_collection=pg_collection
+            config=config,
+            layer_number=layer_number,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
         # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
@@ -167,7 +168,12 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = submodules.router(config=self.config, pg_collection=pg_collection, layer_number=layer_number)
+        self.router = submodules.router(
+            config=self.config,
+            pg_collection=pg_collection,
+            layer_number=layer_number,
+            is_mtp_layer=is_mtp_layer,
+        )
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
