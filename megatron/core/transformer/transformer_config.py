@@ -10,6 +10,9 @@ import torch.nn.functional as F
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.moe.fp32_activation import (
+    is_moe_activation_in_fp32_supported,
+)
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import experimental_api
 
@@ -692,7 +695,7 @@ class TransformerConfig(ModelParallelConfig):
     None means no changes for dtype."""
 
     moe_activation_in_fp32: bool = False
-    """Compute SwiGLU between TE grouped GEMMs in fp32 and round once to the params dtype."""
+    """Compute a registered expert activation between TE grouped GEMMs in fp32 with one round."""
 
     moe_combine_in_fp32: bool = False
     """Apply routing probs and accumulate AlltoAll expert outputs in fp32 with one final round."""
@@ -1945,17 +1948,20 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_*_in_fp32 requires TEGroupedMLP; enable --moe-grouped-gemm and disable "
                 "--moe-use-legacy-grouped-gemm"
             )
-            assert (
-                not self.moe_permute_fusion
-            ), "moe_*_in_fp32 does not support --moe-permute-fusion"
-            assert (
-                self.activation_func_clamp_value is None
-            ), "moe_*_in_fp32 is an inference-alignment mode; drop --activation-func-clamp-value"
         if self.moe_activation_in_fp32:
             assert (
-                self.gated_linear_unit and self.activation_func == F.silu
-            ), "moe_activation_in_fp32 supports SwiGLU only; enable --swiglu"
+                is_moe_activation_in_fp32_supported(
+                    self.activation_func, self.gated_linear_unit
+                )
+            ), "moe_activation_in_fp32 requires a registered activation/gating pair"
+            assert self.activation_func_clamp_value is None, (
+                "moe_activation_in_fp32 is an inference-alignment mode; drop "
+                "--activation-func-clamp-value"
+            )
         if self.moe_combine_in_fp32:
+            assert (
+                not self.moe_permute_fusion
+            ), "moe_combine_in_fp32 does not support --moe-permute-fusion"
             assert (
                 self.moe_token_dispatcher_type == 'alltoall'
             ), "moe_combine_in_fp32 requires --moe-token-dispatcher-type alltoall"

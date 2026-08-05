@@ -37,6 +37,7 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
+from megatron.core.transformer.moe.fp32_activation import get_moe_activation_in_fp32_spec
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -527,30 +528,34 @@ class GroupedMLP(MegatronModule):
 
 
 class _MoEActivationInFP32(torch.autograd.Function):
-    """fp32 swiglu (x prob) between the grouped GEMMs, one round back to the params dtype."""
+    """Supported FP32 expert activation (x prob), with one round to the params dtype."""
 
     @staticmethod
-    def forward(ctx, fc1_out, probs, glu_offset):
+    def forward(ctx, fc1_out, probs, activation_spec, activation_context):
         ctx.save_for_backward(fc1_out, probs)
-        ctx.glu_offset = glu_offset
-        g, u = torch.chunk(fc1_out.float(), 2, dim=-1)
-        y = F.silu(g) * (u + glu_offset) * probs.float()
-        return y.to(fc1_out.dtype)
+        ctx.activation_spec = activation_spec
+        ctx.activation_context = activation_context
+        activation = activation_spec.forward(fc1_out.float(), activation_context)
+        assert activation.dtype == torch.float32
+        return (activation * probs.float()).to(fc1_out.dtype)
 
     @staticmethod
     def backward(ctx, grad_out):
         fc1_out, probs = ctx.saved_tensors
-        g, u = torch.chunk(fc1_out.float(), 2, dim=-1)
-        s = torch.sigmoid(g)
-        silu = g * s
-        go = grad_out.float() * probs.float()
-        d_g = go * (u + ctx.glu_offset) * (s + silu * (1 - s))
-        d_u = go * silu
+        fc1_out_dtype = fc1_out.dtype
+        fc1_out = fc1_out.float()
+        grad_out = grad_out.float()
+        d_x = ctx.activation_spec.backward(
+            grad_out * probs.float(), fc1_out, ctx.activation_context
+        )
+        assert d_x.dtype == torch.float32
+
         d_p = None
         if ctx.needs_input_grad[1]:
-            d_p = (grad_out.float() * silu * (u + ctx.glu_offset)).sum(-1, keepdim=True)
-            d_p = d_p.to(probs.dtype)
-        return torch.cat([d_g, d_u], dim=-1).to(fc1_out.dtype), d_p, None
+            activation = ctx.activation_spec.forward(fc1_out, ctx.activation_context)
+            assert activation.dtype == torch.float32
+            d_p = (grad_out * activation).sum(-1, keepdim=True).to(probs.dtype)
+        return d_x.to(fc1_out_dtype), d_p, None, None
 
 
 class TEGroupedMLP(MegatronModule):
@@ -600,6 +605,17 @@ class TEGroupedMLP(MegatronModule):
             self.activation_func = build_module(submodules.activation_func, config=self.config)
         else:
             self.activation_func = self.config.activation_func
+
+        self.moe_activation_in_fp32_spec = None
+        self.moe_activation_in_fp32_context = None
+        if self.config.moe_activation_in_fp32:
+            self.moe_activation_in_fp32_spec = get_moe_activation_in_fp32_spec(
+                self.config.activation_func, self.config.gated_linear_unit
+            )
+            assert self.moe_activation_in_fp32_spec is not None
+            self.moe_activation_in_fp32_context = (
+                self.moe_activation_in_fp32_spec.context_factory(self.config)
+            )
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -726,9 +742,12 @@ class TEGroupedMLP(MegatronModule):
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.moe_activation_in_fp32:
-                assert bias_parallel is None and self.config.gated_linear_unit
+                assert bias_parallel is None
                 return _MoEActivationInFP32.apply(
-                    intermediate_parallel, permuted_probs, self.config.glu_linear_offset
+                    intermediate_parallel,
+                    permuted_probs,
+                    self.moe_activation_in_fp32_spec,
+                    self.moe_activation_in_fp32_context,
                 )
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:
