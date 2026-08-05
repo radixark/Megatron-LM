@@ -564,7 +564,6 @@ def _linear_dgrad_matmul(grad_output: torch.Tensor, weight: torch.Tensor) -> tor
     fp32 = _should_compute_dgrad_in_fp32(grad_output, weight)
     if grad_output.dim() > 2:
         # Work around PyTorch matmul not folding some size-1 leading dims to mm.
-        # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
         shape = grad_output.shape
         grad_output_2d = grad_output.reshape(-1, shape[-1])
         if fp32:
