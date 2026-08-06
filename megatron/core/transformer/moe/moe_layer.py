@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol, Union
@@ -37,6 +38,9 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+
+_MOE_APPLY_PROBS_ON_OUTPUT_LOGGED = False
 
 
 class RouterInterface(Protocol):
@@ -333,7 +337,29 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
+        if os.environ.get("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT") == "1":
+            global _MOE_APPLY_PROBS_ON_OUTPUT_LOGGED
+            if not _MOE_APPLY_PROBS_ON_OUTPUT_LOGGED:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    print(
+                        "MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT branch taken",
+                        flush=True,
+                    )
+                _MOE_APPLY_PROBS_ON_OUTPUT_LOGGED = True
+            if self.config.moe_combine_in_fp32 or self.config.moe_apply_probs_on_input:
+                raise ValueError(
+                    "MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT is incompatible with "
+                    "moe_combine_in_fp32 or moe_apply_probs_on_input"
+                )
+            expert_probs = torch.ones_like(permuted_probs, dtype=dispatched_input.dtype)
+            expert_output, mlp_bias = self.experts(
+                dispatched_input, tokens_per_expert, expert_probs
+            )
+            expert_output = expert_output * permuted_probs.to(expert_output.dtype).unsqueeze(-1)
+        else:
+            expert_output, mlp_bias = self.experts(
+                dispatched_input, tokens_per_expert, permuted_probs
+            )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
