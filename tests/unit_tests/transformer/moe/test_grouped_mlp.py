@@ -12,6 +12,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import MoERouterWeightPlacement
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import parse_args
@@ -21,6 +22,37 @@ from tests.unit_tests.test_utilities import Utils
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
+
+
+def _reference_sequential_swiglu(
+    experts, hidden_states, tokens_per_expert, router_weights, router_weight_placement
+):
+    """Evaluate the requested router-weight placement using the experts' linear layers."""
+    assert experts.config.gated_linear_unit
+    assert experts.config.activation_func == F.silu
+    assert experts.config.activation_func_clamp_value is None
+    assert not experts.config.add_bias_linear
+
+    outputs = []
+    for expert, tokens, weights in zip(
+        experts.local_experts,
+        torch.split(hidden_states, tokens_per_expert.tolist()),
+        torch.split(router_weights, tokens_per_expert.tolist()),
+    ):
+        fc1_output, fc1_bias = expert.linear_fc1(tokens)
+        assert fc1_bias is None
+        gate, linear = torch.chunk(fc1_output, 2, dim=-1)
+        activation = F.silu(gate) * (linear + experts.config.glu_linear_offset)
+        if router_weight_placement == MoERouterWeightPlacement.FC2_INPUT:
+            activation = (activation * weights.unsqueeze(-1)).to(activation.dtype)
+
+        output, fc2_bias = expert.linear_fc2(activation)
+        assert fc2_bias is None
+        if router_weight_placement == MoERouterWeightPlacement.FC2_OUTPUT:
+            output = (output.float() * weights.unsqueeze(-1)).to(output.dtype)
+        outputs.append(output)
+
+    return torch.cat(outputs)
 
 
 @pytest.mark.skipif(is_te_min_version("1.9.0.dev0"), reason="Switch to TEGroupedMLP when TE>1.9.")
@@ -318,7 +350,71 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    def test_gpu_forward_backward(self):
+    def test_sequential_router_weight_placement_matches_explicit_swiglu(self):
+        experts = self.sequential_mlp.experts.cuda()
+        with torch.no_grad():
+            for expert_idx, expert in enumerate(experts.local_experts):
+                for linear_idx, linear in enumerate((expert.linear_fc1, expert.linear_fc2)):
+                    values = torch.arange(linear.weight.numel(), device="cuda")
+                    values = ((values * 17 + expert_idx * 11 + linear_idx * 5) % 31 - 15) / 64
+                    linear.weight.copy_(values.reshape_as(linear.weight))
+
+        hidden_states = torch.arange(
+            4 * self.hidden_size, dtype=torch.float32, device="cuda"
+        ).reshape(4, self.hidden_size)
+        hidden_states = ((hidden_states % 17) - 8).div(16).to(torch.bfloat16)
+        tokens_per_expert = torch.tensor([2, 2], dtype=torch.int32, device="cuda")
+        router_weights = torch.tensor(
+            [0.010198, 0.33331, 0.61271, 0.98763], dtype=torch.float32, device="cuda"
+        )
+        output_grad = torch.linspace(
+            -0.75, 1.25, 4 * self.hidden_size, dtype=torch.float32, device="cuda"
+        ).reshape(4, self.hidden_size)
+
+        outputs = {}
+        for placement in MoERouterWeightPlacement:
+            actual_weights = router_weights.clone().requires_grad_(True)
+            actual, _ = experts(
+                hidden_states, tokens_per_expert, actual_weights, router_weight_placement=placement
+            )
+            actual_weight_grad = torch.autograd.grad(
+                (actual.float() * output_grad).sum(), actual_weights
+            )[0]
+
+            reference_weights = router_weights.clone().requires_grad_(True)
+            expected = _reference_sequential_swiglu(
+                experts, hidden_states, tokens_per_expert, reference_weights, placement
+            )
+            expected_weight_grad = torch.autograd.grad(
+                (expected.float() * output_grad).sum(), reference_weights
+            )[0]
+
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual_weight_grad, expected_weight_grad, rtol=1e-6, atol=1e-6
+            )
+            outputs[placement] = actual.detach()
+
+        # The modes are equivalent in real arithmetic; this difference confirms that the
+        # intentionally different BF16 rounding points were exercised.
+        assert not torch.equal(
+            outputs[MoERouterWeightPlacement.FC2_INPUT],
+            outputs[MoERouterWeightPlacement.FC2_OUTPUT],
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize("apply_probs_on_output", [False, True])
+    @pytest.mark.parametrize("bias_activation_fusion", [False, True])
+    def test_gpu_forward_backward(self, monkeypatch, apply_probs_on_output, bias_activation_fusion):
+        if apply_probs_on_output:
+            monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "1")
+        else:
+            monkeypatch.delenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", raising=False)
+        self.sequential_mlp.config.moe_router_dtype = "fp32"
+        self.grouped_mlp.config.moe_router_dtype = "fp32"
+        self.sequential_mlp.config.bias_activation_fusion = bias_activation_fusion
+        self.grouped_mlp.config.bias_activation_fusion = bias_activation_fusion
         self.sequential_mlp.cuda()
         self.grouped_mlp.cuda()
         # Copy the weights to ensure the same init value

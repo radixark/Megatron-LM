@@ -15,6 +15,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
+    MoERouterWeightPlacement,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
 )
@@ -346,16 +347,12 @@ class MoELayer(BaseMoELayer):
                         flush=True,
                     )
                 _MOE_APPLY_PROBS_ON_OUTPUT_LOGGED = True
-            if self.config.moe_combine_in_fp32 or self.config.moe_apply_probs_on_input:
-                raise ValueError(
-                    "MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT is incompatible with "
-                    "moe_combine_in_fp32 or moe_apply_probs_on_input"
-                )
-            expert_probs = torch.ones_like(permuted_probs, dtype=dispatched_input.dtype)
             expert_output, mlp_bias = self.experts(
-                dispatched_input, tokens_per_expert, expert_probs
+                dispatched_input,
+                tokens_per_expert,
+                permuted_probs,
+                router_weight_placement=MoERouterWeightPlacement.FC2_OUTPUT,
             )
-            expert_output = expert_output * permuted_probs.to(expert_output.dtype).unsqueeze(-1)
         else:
             expert_output, mlp_bias = self.experts(
                 dispatched_input, tokens_per_expert, permuted_probs

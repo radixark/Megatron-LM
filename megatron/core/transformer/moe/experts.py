@@ -22,7 +22,7 @@ from megatron.core.dist_checkpointing.mapping import (
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
-from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -38,6 +38,7 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_shard
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_utils import (
+    MoERouterWeightPlacement,
     ProcessGroupCollection,
     get_align_size_for_quantization,
 )
@@ -61,6 +62,49 @@ except ImportError:
     HAVE_TE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_router_weight_placement(
+    config: TransformerConfig, router_weight_placement: MoERouterWeightPlacement
+) -> None:
+    """Validate the expert implementation requested by ``router_weight_placement``."""
+    if not isinstance(router_weight_placement, MoERouterWeightPlacement):
+        raise ValueError(
+            "router_weight_placement must be a MoERouterWeightPlacement, got "
+            f"{router_weight_placement!r}"
+        )
+    if router_weight_placement == MoERouterWeightPlacement.FC2_OUTPUT:
+        if not config.gated_linear_unit or config.activation_func != F.silu:
+            raise ValueError("FC2-output router weighting currently supports only SwiGLU")
+        if config.moe_combine_in_fp32 or config.moe_apply_probs_on_input:
+            raise ValueError(
+                "FC2-output router weighting is incompatible with moe_combine_in_fp32 or "
+                "moe_apply_probs_on_input"
+            )
+        if config.expert_tensor_parallel_size > 1:
+            raise ValueError(
+                "FC2-output router weighting does not support expert tensor parallelism"
+            )
+        if (config.fp8 or config.fp4) and config.add_bias_linear:
+            raise ValueError(
+                "FC2-output router weighting does not support bias with quantized experts"
+            )
+
+
+@jit_fuser
+def _apply_router_weight(output: torch.Tensor, router_weight: torch.Tensor) -> torch.Tensor:
+    """Apply a router weight without first narrowing it to the expert output dtype."""
+    output_dtype = output.dtype
+    return (output.float() * router_weight).to(output_dtype)
+
+
+@jit_fuser
+def _apply_router_weight_with_bias(
+    output: torch.Tensor, bias: torch.Tensor, router_weight: torch.Tensor
+) -> torch.Tensor:
+    """Add an expert bias, then apply a router weight in FP32 or higher precision."""
+    output_dtype = output.dtype
+    return ((output.float() + bias.float()) * router_weight).to(output_dtype)
 
 
 class GroupedMLP(MegatronModule):
@@ -237,8 +281,11 @@ class GroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        *,
+        router_weight_placement: MoERouterWeightPlacement = MoERouterWeightPlacement.FC2_INPUT,
     ):
         """Forward step of the GroupedMLP."""
+        _validate_router_weight_placement(self.config, router_weight_placement)
         assert self.config.bf16, "Currently GroupedMLP for MoE only supports bf16."
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -255,6 +302,13 @@ class GroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
+        if router_weight_placement == MoERouterWeightPlacement.FC2_INPUT:
+            activation_func = self.activation_func_with_probs
+            activation_args = (permuted_probs.unsqueeze(-1),)
+        else:
+            activation_func = self.activation_func
+            activation_args = ()
+
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.
             w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
@@ -265,14 +319,12 @@ class GroupedMLP(MegatronModule):
             )
             if self.activation_recompute:
                 intermediate_parallel = self.activation_checkpoint.checkpoint(
-                    self.activation_func_with_probs, fc1_output, permuted_probs.unsqueeze(-1)
+                    activation_func, fc1_output, *activation_args
                 )
                 fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
                 self.activation_checkpoint.discard_output_and_register_recompute(fc2_output)
             else:
-                intermediate_parallel = self.activation_func_with_probs(
-                    fc1_output, permuted_probs.unsqueeze(-1)
-                )
+                intermediate_parallel = activation_func(fc1_output, *activation_args)
                 fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
         else:
             # No token is allocated for local experts.
@@ -283,14 +335,15 @@ class GroupedMLP(MegatronModule):
             w2 = self.weight2.view(-1, self.config.hidden_size)
             h = torch.matmul(permuted_local_hidden_states, w1)
             if self.activation_recompute:
-                h = self.activation_checkpoint.checkpoint(
-                    self.activation_func_with_probs, h, permuted_probs.unsqueeze(-1)
-                )
+                h = self.activation_checkpoint.checkpoint(activation_func, h, *activation_args)
                 fc2_output = torch.matmul(h, w2)
                 self.activation_checkpoint.discard_output_and_register_recompute(fc2_output)
             else:
-                h = self.activation_func_with_probs(h, permuted_probs.unsqueeze(-1))
+                h = activation_func(h, *activation_args)
                 fc2_output = torch.matmul(h, w2)
+
+        if router_weight_placement == MoERouterWeightPlacement.FC2_OUTPUT:
+            fc2_output = _apply_router_weight(fc2_output, permuted_probs.unsqueeze(-1))
 
         return fc2_output, None
 
@@ -527,27 +580,33 @@ class GroupedMLP(MegatronModule):
 
 
 class _MoEActivationInFP32(torch.autograd.Function):
-    """fp32 swiglu (x prob) between the grouped GEMMs, one round back to the params dtype."""
+    """FP32 SwiGLU, optionally weighted, between the grouped GEMMs."""
 
     @staticmethod
     def forward(ctx, fc1_out, probs, glu_offset):
+        """Apply SwiGLU in FP32, optionally weighting its output."""
         ctx.save_for_backward(fc1_out, probs)
         ctx.glu_offset = glu_offset
         g, u = torch.chunk(fc1_out.float(), 2, dim=-1)
-        y = F.silu(g) * (u + glu_offset) * probs.float()
+        y = F.silu(g) * (u + glu_offset)
+        if probs is not None:
+            y = y * probs.float()
         return y.to(fc1_out.dtype)
 
     @staticmethod
     def backward(ctx, grad_out):
+        """Differentiate the optional weighted FP32 SwiGLU."""
         fc1_out, probs = ctx.saved_tensors
         g, u = torch.chunk(fc1_out.float(), 2, dim=-1)
         s = torch.sigmoid(g)
         silu = g * s
-        go = grad_out.float() * probs.float()
+        go = grad_out.float()
+        if probs is not None:
+            go = go * probs.float()
         d_g = go * (u + ctx.glu_offset) * (s + silu * (1 - s))
         d_u = go * silu
         d_p = None
-        if ctx.needs_input_grad[1]:
+        if probs is not None and ctx.needs_input_grad[1]:
             d_p = (grad_out.float() * silu * (u + ctx.glu_offset)).sum(-1, keepdim=True)
             d_p = d_p.to(probs.dtype)
         return torch.cat([d_g, d_u], dim=-1).to(fc1_out.dtype), d_p, None
@@ -669,11 +728,29 @@ class TEGroupedMLP(MegatronModule):
             .to(intermediate_parallel.dtype)
         )
 
+    @staticmethod
+    def _apply_output_router_weight(output, output_bias, tokens_per_expert, permuted_probs):
+        if output_bias is None:
+            return _apply_router_weight(output, permuted_probs)
+        shape = output.shape
+        return torch.cat(
+            [
+                _apply_router_weight_with_bias(t, b, p)
+                for t, b, p in zip(
+                    torch.split(output.view(-1, shape[-1]), tokens_per_expert),
+                    output_bias,
+                    torch.split(permuted_probs, tokens_per_expert),
+                )
+            ]
+        ).view(shape)
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        *,
+        router_weight_placement: MoERouterWeightPlacement = MoERouterWeightPlacement.FC2_INPUT,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -686,17 +763,19 @@ class TEGroupedMLP(MegatronModule):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
+        _validate_router_weight_placement(self.config, router_weight_placement)
+        router_weight_on_fc2_input = router_weight_placement == MoERouterWeightPlacement.FC2_INPUT
         tokens_per_expert = tokens_per_expert.tolist()
+        actual_tokens_per_expert = tokens_per_expert
+        permuted_probs = permuted_probs.unsqueeze(-1)
         if self.config.fp8 or self.config.fp4:
-            actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
-            permuted_probs, _ = self.quantization_padding(
-                permuted_probs.unsqueeze(-1), actual_tokens_per_expert
-            )
-        else:
-            permuted_probs = permuted_probs.unsqueeze(-1)
+            if router_weight_on_fc2_input:
+                permuted_probs, _ = self.quantization_padding(
+                    permuted_probs, actual_tokens_per_expert
+                )
 
         if self.config.moe_apply_probs_on_input:
             assert (
@@ -710,6 +789,8 @@ class TEGroupedMLP(MegatronModule):
 
         if self.config.moe_combine_in_fp32:
             permuted_probs = torch.ones_like(permuted_probs)
+
+        activation_probs = permuted_probs if router_weight_on_fc2_input else None
 
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
@@ -740,13 +821,20 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = intermediate_parallel.to(original_dtype)
             elif self.config.bias_activation_fusion:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
-                    # dtype is handled inside the fused kernel
-                    intermediate_parallel = weighted_bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        permuted_probs,
-                        self.config.activation_func_fp8_input_store,
-                    )
+                    if permuted_probs is None:
+                        intermediate_parallel = bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            self.config.activation_func_fp8_input_store,
+                        )
+                    else:
+                        # dtype is handled inside the fused kernel
+                        intermediate_parallel = weighted_bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            permuted_probs,
+                            self.config.activation_func_fp8_input_store,
+                        )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
                         intermediate_parallel,
@@ -782,20 +870,21 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
                     intermediate_parallel = self.activation_func(intermediate_parallel)
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * permuted_probs
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
+                if permuted_probs is not None:
+                    original_dtype = intermediate_parallel.dtype
+                    intermediate_parallel = intermediate_parallel * permuted_probs
+                    intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
-                    bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    bias_act_func, fc1_output, bias_parallel, activation_probs
                 )
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
-                bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+                bias_act_output = bias_act_func(fc1_output, bias_parallel, activation_probs)
 
         output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
@@ -807,11 +896,17 @@ class TEGroupedMLP(MegatronModule):
             output = off_interface.group_commit(
                 output, name="moe_act", forced_released_tensors=[fc1_output]
             )
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        if router_weight_on_fc2_input:
+            output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
             output = self.quantization_unpadding(output, actual_tokens_per_expert)
+
+        if not router_weight_on_fc2_input:
+            output = self._apply_output_router_weight(
+                output, output_bias, actual_tokens_per_expert, permuted_probs
+            )
 
         output_bias = None
 
@@ -911,7 +1006,7 @@ class SequentialMLP(MegatronModule):
             )
             self.local_experts.append(expert)
 
-    def _pad_tensor_for_quantization(self, hidden, probs):
+    def _pad_tensor_for_quantization(self, hidden, probs=None):
         """Padding tensor shape to multiples of 16/32."""
         actual_num_tokens = hidden.shape[0]
         divisor = get_align_size_for_quantization(self.config)
@@ -921,8 +1016,9 @@ class SequentialMLP(MegatronModule):
                 padded_num_tokens, hidden.shape[1], dtype=hidden.dtype, device=hidden.device
             )
             hidden = torch.cat((hidden, pad_tensor), dim=0)
-            pad_probs = torch.zeros(padded_num_tokens, dtype=probs.dtype, device=probs.device)
-            probs = torch.cat((probs, pad_probs), dim=0)
+            if probs is not None:
+                pad_probs = torch.zeros(padded_num_tokens, dtype=probs.dtype, device=probs.device)
+                probs = torch.cat((probs, pad_probs), dim=0)
         return hidden, probs
 
     def forward(
@@ -930,8 +1026,12 @@ class SequentialMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        *,
+        router_weight_placement: MoERouterWeightPlacement = MoERouterWeightPlacement.FC2_INPUT,
     ):
         """Forward step of the SequentialMLP."""
+        _validate_router_weight_placement(self.config, router_weight_placement)
+        router_weight_on_fc2_input = router_weight_placement == MoERouterWeightPlacement.FC2_INPUT
 
         if self.config.moe_apply_probs_on_input:
             assert (
@@ -946,17 +1046,26 @@ class SequentialMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         if self.num_local_experts == 1:
+            expert_probs = permuted_probs if router_weight_on_fc2_input else None
             if self.config.fp8 or self.config.fp4:
-                hidden, probs = self._pad_tensor_for_quantization(
-                    permuted_local_hidden_states, permuted_probs
+                hidden, expert_probs = self._pad_tensor_for_quantization(
+                    permuted_local_hidden_states, expert_probs
                 )
-                output, output_bias = self.local_experts[0](hidden, probs)
+                output, output_bias = self.local_experts[0](hidden, expert_probs)
                 output = output[: permuted_local_hidden_states.shape[0]]
             else:
                 output, output_bias = self.local_experts[0](
-                    permuted_local_hidden_states, permuted_probs
+                    permuted_local_hidden_states, expert_probs
                 )
 
+            if not router_weight_on_fc2_input:
+                if output_bias is None:
+                    output = _apply_router_weight(output, permuted_probs.unsqueeze(-1))
+                else:
+                    output = _apply_router_weight_with_bias(
+                        output, output_bias, permuted_probs.unsqueeze(-1)
+                    )
+                output_bias = None
             return output, output_bias
         else:
             tokens_per_expert = tokens_per_expert.tolist()
@@ -966,12 +1075,20 @@ class SequentialMLP(MegatronModule):
             output_local_list = []
 
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
+                expert_probs = probs if router_weight_on_fc2_input else None
                 if self.config.fp8 or self.config.fp4:
-                    hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
-                    output, output_bias = expert(hidden, probs)
+                    hidden, expert_probs = self._pad_tensor_for_quantization(tokens, expert_probs)
+                    output, output_bias = expert(hidden, expert_probs)
                     output = output[: tokens.shape[0]]
                 else:
-                    output, output_bias = expert(tokens, probs)
+                    output, output_bias = expert(tokens, expert_probs)
+                if not router_weight_on_fc2_input:
+                    if output_bias is None:
+                        output = _apply_router_weight(output, probs.unsqueeze(-1))
+                    else:
+                        output = _apply_router_weight_with_bias(
+                            output, output_bias, probs.unsqueeze(-1)
+                        )
                 output_local_list.append(output)
 
             output_local = torch.cat(output_local_list, dim=0)
