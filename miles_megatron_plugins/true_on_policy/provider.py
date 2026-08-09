@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import warnings
 from typing import Optional, Tuple
 
 import torch
 
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
+from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from .attention_fa3 import SGLangCoreAttention
 from .linear import SGLangColumnParallelLinear, SGLangRowParallelLinear
+from .moe import SGLangGroupedMLP
 from .norm import SGLangNorm, SGLangQKRMSNorm
 
 
@@ -50,11 +50,7 @@ class SGLangSpecProvider(BackendSpecProvider):
         del moe_use_legacy_grouped_gemm
 
         if moe_use_grouped_gemm:
-            warnings.warn(
-                "SGLang backend falls back to Megatron's existing GroupedMLP surface "
-                "until the deterministic MoE backend is introduced."
-            )
-            return GroupedMLP, None
+            return SGLangGroupedMLP, None
 
         return SequentialMLP, MLPSubmodules(
             linear_fc1=SGLangColumnParallelLinear, linear_fc2=SGLangRowParallelLinear
