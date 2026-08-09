@@ -1512,6 +1512,57 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         return x_out
 
+    def _get_nvfp4_qat_quantizer():
+        """Build TE's inference-compatible NVFP4 weight quantizer."""
+        nvfp4_use_4over6 = os.getenv("NVTE_NVFP4_4OVER6", "none").strip().lower() in (
+            "weights",
+            "all",
+        )
+        nvfp4_use_e4m3_256 = os.getenv("NVTE_NVFP4_4OVER6_E4M3_USE_256", "all").strip().lower() in (
+            "weights",
+            "all",
+        )
+        nvfp4_e4m3_max = 256 if nvfp4_use_4over6 and nvfp4_use_e4m3_256 else 448
+
+        return te.pytorch.NVFP4Quantizer(
+            rowwise=True,
+            columnwise=False,
+            with_amax_reduction=False,
+            with_rht=False,
+            with_post_rht_amax=False,
+            with_2d_quantization=False,
+            stochastic_rounding=False,
+            row_scaled_nvfp4=False,
+            nvfp4_use_4over6=nvfp4_use_4over6,
+            nvfp4_e4m3_max=nvfp4_e4m3_max,
+            nvfp4_4over6_err_mode=os.getenv("NVTE_NVFP4_4OVER6_ERR_MODE", "MAE").strip().upper(),
+            with_random_sign_mask=False,
+        )
+
+    def fake_nvfp4_quantization_ste(x, quantizer):
+        """Fake-quantize a weight with a TE NVFP4 quantizer and straight-through gradients."""
+        m, n = x.shape
+        block_size = 16
+        if n % block_size != 0:
+            raise ValueError(
+                f"NVFP4 fake QAT requires the weight K dimension to be divisible by {block_size}, "
+                f"got {n}."
+            )
+
+        m_padded = ceil_div(m, block_size) * block_size
+        if m_padded == m:
+            x_padded = x.contiguous()
+        else:
+            padding = torch.zeros((m_padded - m, n), dtype=x.dtype, device=x.device)
+            x_padded = torch.cat((x.contiguous(), padding), dim=0)
+
+        x_out = quantizer.quantize(x_padded).dequantize(dtype=x.dtype)[:m, :n].contiguous()
+
+        if hasattr(x, 'main_grad'):
+            x_out.main_grad = x.main_grad
+
+        return x_out
+
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
         Wrapper for the Transformer-Engine's `GroupedLinear` layer.
@@ -1603,6 +1654,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 **extra_kwargs,
             )
             self.te_quant_params: Optional[TEQuantizationParams] = None
+            self._nvfp4_qat_quantizer = None
+            if os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1":
+                self._nvfp4_qat_quantizer = _get_nvfp4_qat_quantizer()
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
@@ -1736,6 +1790,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
                 weight_tensors = [
                     fake_int4_quantization_ste(w, group_size)
+                    for w in weight_tensors
+                ]
+            elif os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1":
+                weight_tensors = [
+                    fake_nvfp4_quantization_ste(w, self._nvfp4_qat_quantizer)
                     for w in weight_tensors
                 ]
 
