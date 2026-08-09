@@ -3,6 +3,7 @@
 import re
 from typing import Optional, Union
 
+from ..file_arg_utils import PSEUDO_FILE_PREFIX, resolve_file_arg
 from .quant_config import GlobMatcher, MatchContext, QuantizationConfig, RecipeConfig
 
 
@@ -21,7 +22,11 @@ def get_quant_config_or_none(
 
 
 def load_quantization_recipe(recipe_path: str) -> RecipeConfig:
-    """Loads a quantization recipe from a path."""
+    """Loads a quantization recipe from a path or an inline `base64:` payload."""
+    if recipe_path.startswith(PSEUDO_FILE_PREFIX):
+        import yaml
+
+        return RecipeConfig.from_config_dict(yaml.safe_load(resolve_file_arg(recipe_path)))
     recipe = RecipeConfig.from_yaml_file(recipe_path)
     return recipe
 
