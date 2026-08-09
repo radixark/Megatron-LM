@@ -109,6 +109,20 @@ def register_default_torch_strategies():
 
 logger = getLogger(__name__)
 
+_COORDINATION_PROCESS_GROUP = None
+
+
+def _get_coordination_process_group():
+    """Gloo group for checkpoint plan/metadata object collectives. On an
+    NCCL-only default group these would be staged through GPU and leave
+    permanent per-peer NCCL channel buffers on the coordinator rank."""
+    global _COORDINATION_PROCESS_GROUP
+    if not torch.distributed.is_initialized():
+        return None
+    if _COORDINATION_PROCESS_GROUP is None:
+        _COORDINATION_PROCESS_GROUP = torch.distributed.new_group(backend="gloo")
+    return _COORDINATION_PROCESS_GROUP
+
 
 def flatten_state_dict(
     state_dict: ShardedStateDict,
@@ -701,7 +715,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         ) = save_state_dict_async_plan(
             pyt_state_dict,
             writer,
-            None,
+            _get_coordination_process_group(),
             coordinator,
             planner=MCoreSavePlanner(
                 dedup_replicated_tensors=not self.keep_only_main_replica, flatten_state_dict=False
@@ -805,6 +819,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         checkpoint.load_state_dict(
             pyt_state_dict,
             fsr,
+            process_group=_get_coordination_process_group(),
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
