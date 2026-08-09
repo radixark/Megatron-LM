@@ -2275,6 +2275,14 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--ckpt-save-thread-count', type=int, default=2,
+                       help='Number of write buckets (and files) per rank for torch_dist '
+                       'checkpoint save.')
+    group.add_argument('--ckpt-save-staging-buckets', type=int, default=0,
+                       help='Stage and write at most this many buckets at a time during '
+                       'synchronous torch_dist checkpoint save, bounding host memory to '
+                       'roughly this fraction of the rank shard. 0 stages all buckets '
+                       'upfront. Incompatible with --async-save.')
     return parser
 
 

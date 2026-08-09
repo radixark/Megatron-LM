@@ -629,6 +629,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             else:
                 validate_sharding_integrity = True
                 save_strategy = get_default_save_sharded_strategy(args.ckpt_format)
+                save_strategy.thread_count = args.ckpt_save_thread_count
+                if args.ckpt_save_staging_buckets:
+                    assert not args.async_save, \
+                        '--ckpt-save-staging-buckets stages tensors inside the write function, ' \
+                        'which must run in the training process'
+                    save_strategy.staging_max_buckets = args.ckpt_save_staging_buckets
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
                     if checkpointing_context is not None and 'load_strategy' in checkpointing_context:

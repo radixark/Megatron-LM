@@ -83,10 +83,12 @@ class FileSystemWriterAsync(FileSystemWriter):
         *args,
         separation_hint: Optional[str] = None,
         use_msc: bool = False,
+        staging_max_buckets: int = 0,
         **kwargs,
     ):
         self.checkpoint_dir = path
         self.use_msc = use_msc
+        self.staging_max_buckets = staging_max_buckets
 
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
@@ -202,9 +204,20 @@ class FileSystemWriterAsync(FileSystemWriter):
         if not self.write_buckets:
             return None, None, []
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
+        if self.staging_max_buckets:
+            # Staging happens wave-by-wave inside write_preloaded_data_multiproc,
+            # which then must run in the training process (sync save only).
+            preload_fn = None
+        else:
+            preload_fn = partial(self.preload_tensors, self.write_buckets, True)
         return (
-            partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
-            partial(self.preload_tensors, self.write_buckets, True),
+            partial(
+                self.write_preloaded_data_multiproc,
+                transform_list,
+                self.use_msc,
+                staging_max_buckets=self.staging_max_buckets,
+            ),
+            preload_fn,
             [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
         )
 
@@ -245,6 +258,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         rank: int,
         write_buckets: List[WriteBucket],
         global_results_queue: mp.Queue,
+        staging_max_buckets: int = 0,
     ) -> None:
         """
         Performs saving data to storage with multiple processes.
@@ -265,10 +279,40 @@ class FileSystemWriterAsync(FileSystemWriter):
             write_buckets (List[WriteBucket]): write plan
             global_results_queue (mp.Queue): mp.Queue to collect Dict[List[WriteResults]]
                 (or an Exception) from parallel write processes to the main training process
+            staging_max_buckets (int): when > 0, `write_buckets` still holds GPU tensors
+                and is staged to host and written at most this many buckets at a time,
+                bounding host memory. Requires running in the training process (sync save).
         Returns: None
         """
         logger = logging.getLogger(__name__)
         w_start = time()
+        write_results_or_exc: Union[dict, Exception] = dict()
+        wave_size = staging_max_buckets or len(write_buckets)
+        for wave_start in range(0, len(write_buckets), wave_size):
+            wave = write_buckets[wave_start : wave_start + wave_size]
+            if staging_max_buckets:
+                wave = FileSystemWriterAsync.preload_tensors(wave, non_blocking=True)
+            wave_results = FileSystemWriterAsync._fork_and_write_wave(transform_list, use_msc, wave)
+            del wave
+            if isinstance(wave_results, Exception):
+                write_results_or_exc = wave_results
+                break
+            for local_proc_idx, local_results in wave_results.items():
+                write_results_or_exc[wave_start + local_proc_idx] = local_results
+
+        global_results_queue.put(write_results_or_exc)
+
+        w_end = time()
+        logger.debug(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
+
+    @staticmethod
+    def _fork_and_write_wave(
+        transform_list: List[_StorageWriterTransforms],
+        use_msc: bool,
+        write_buckets: List[WriteBucket],
+    ) -> Union[dict, Exception]:
+        """Fork a writer process per bucket, join them and collect their results."""
+        logger = logging.getLogger(__name__)
         write_results_or_exc: Union[dict, Exception] = dict()
         ctx = mp.get_context("fork")
         local_results_queue = ctx.Queue()
@@ -339,10 +383,7 @@ class FileSystemWriterAsync(FileSystemWriter):
 
             logger.debug("FileSystemWriterAsync: collected worker results successfully")
 
-        global_results_queue.put(write_results_or_exc)
-
-        w_end = time()
-        logger.debug(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
+        return write_results_or_exc
 
     @staticmethod
     @_disable_gc()
