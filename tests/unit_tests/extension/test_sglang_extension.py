@@ -30,7 +30,13 @@ from miles_megatron_plugins.true_on_policy.contracts import get_true_on_policy_c
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.layers import linear_with_grad_accumulation_and_async_allreduce
-from miles_megatron_plugins.true_on_policy.matmul import _sglang_row_parallel_matmul, sglang_reference_matmul
+from miles_megatron_plugins.true_on_policy.matmul import (
+    _fixed_tree_sum_tensors,
+    _sglang_first_level_block,
+    _sglang_kernel_order_sum,
+    _sglang_row_parallel_matmul,
+    sglang_reference_matmul,
+)
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     matmul_persistent,
@@ -411,6 +417,71 @@ def test_sglang_row_parallel_matmul_uses_fixed_k_block_order():
     expected = _sglang_row_parallel_matmul(input_, weight, bias)
 
     assert torch.equal(actual, expected)
+
+
+class _AddOrder:
+    """Records the association order of a chain of `+` calls."""
+
+    def __init__(self, expr):
+        self.expr = expr
+
+    def __add__(self, other):
+        return _AddOrder(f"({self.expr}+{other.expr})")
+
+
+def _reduction_expr(reducer, num_partials):
+    return reducer([_AddOrder(f"p{i}") for i in range(num_partials)]).expr
+
+
+@pytest.mark.parametrize(
+    "num_partials,expected",
+    [(2, 2), (4, 2), (6, 3), (8, 2), (12, 3), (19, 19), (38, 19), (40, 5), (64, 2)],
+)
+def test_sglang_first_level_block(num_partials, expected):
+    assert _sglang_first_level_block(num_partials) == expected
+
+
+def test_sglang_kernel_order_sum_accumulates_first_level_block_sequentially():
+    # T=6 -> FIRST_LEVEL_BLOCK=3: two sequential runs of three, then one pairwise add.
+    assert _reduction_expr(_sglang_kernel_order_sum, 6) == "(((p0+p1)+p2)+((p3+p4)+p5))"
+
+
+def test_sglang_kernel_order_sum_degenerates_to_binary_tree_on_power_of_two():
+    for num_partials in (2, 4, 8, 16):
+        assert _reduction_expr(_sglang_kernel_order_sum, num_partials) == _reduction_expr(
+            _fixed_tree_sum_tensors, num_partials
+        )
+
+
+def test_sglang_kernel_order_sum_differs_from_binary_tree_on_odd_factor():
+    for num_partials in (6, 12, 19, 38, 40):
+        assert _reduction_expr(_sglang_kernel_order_sum, num_partials) != _reduction_expr(
+            _fixed_tree_sum_tensors, num_partials
+        )
+
+
+def test_sglang_kernel_order_sum_is_not_bitwise_equal_to_binary_tree_in_bf16():
+    torch.manual_seed(0)
+    partials = [torch.randn(4, 8, dtype=torch.bfloat16) for _ in range(6)]
+
+    assert not torch.equal(_sglang_kernel_order_sum(partials), _fixed_tree_sum_tensors(partials))
+
+
+def test_sglang_row_parallel_matmul_reduces_in_kernel_order():
+    # K=4864 -> 38 k-tiles of 128, the Qwen3-4B down_proj shard at TP=2.
+    torch.manual_seed(0)
+    input_ = torch.randn(2, 3, 4864, dtype=torch.bfloat16)
+    weight = torch.randn(5, 4864, dtype=torch.bfloat16)
+
+    actual = _sglang_row_parallel_matmul(input_, weight, None)
+
+    input_2d = input_.reshape(-1, 4864)
+    weight_t = weight.t()
+    partials = [input_2d[:, s : s + 128] @ weight_t[s : s + 128, :] for s in range(0, 4864, 128)]
+    expected = _sglang_kernel_order_sum(partials).reshape(2, 3, 5)
+
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, _fixed_tree_sum_tensors(partials).reshape(2, 3, 5))
 
 
 def test_sglang_column_matmul_keeps_default_linear_path_for_same_k_size():
