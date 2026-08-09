@@ -41,7 +41,7 @@ class MegatronTrueOnPolicyRuntimePolicy:
     apply_logits_contract: bool
     use_sglang_final_norm: bool
     use_sglang_residual_pair: bool
-    use_ulysses_cp_recompute_fallback: bool
+    use_non_reentrant_recompute: bool
 
 
 DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
@@ -62,7 +62,7 @@ DEFAULT_RUNTIME_POLICY = MegatronTrueOnPolicyRuntimePolicy(
     apply_logits_contract=False,
     use_sglang_final_norm=False,
     use_sglang_residual_pair=False,
-    use_ulysses_cp_recompute_fallback=False,
+    use_non_reentrant_recompute=False,
 )
 
 
@@ -98,7 +98,9 @@ class MegatronTrueOnPolicyContract:
             apply_logits_contract=True,
             use_sglang_final_norm=True,
             use_sglang_residual_pair=True,
-            use_ulysses_cp_recompute_fallback=uses_ulysses_cp,
+            # Non-reentrant activation recompute for all TOP runs (reentrant NaNs
+            # under TOP; validated tp=4 abs_diff==0). Generalizes the CP-scoped fallback.
+            use_non_reentrant_recompute=True,
         )
 
 

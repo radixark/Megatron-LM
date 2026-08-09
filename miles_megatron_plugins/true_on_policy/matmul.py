@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 import torch
 
@@ -9,133 +9,25 @@ from megatron.core.tensor_parallel.layers import (
     linear_with_grad_accumulation_and_async_allreduce,
 )
 
-_ROW_LINEAR_INV_BLOCK_K = 128
-
-
-def _fixed_tree_sum_tensors(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
-    """Sum tensors in the same fixed pairwise order as SGLang."""
-    partials = list(tensors)
-    if not partials:
-        raise ValueError("at least one tensor is required")
-
-    while len(partials) > 1:
-        next_partials = []
-        for index in range(0, len(partials), 2):
-            if index + 1 < len(partials):
-                next_partials.append(partials[index] + partials[index + 1])
-            else:
-                next_partials.append(partials[index])
-        partials = next_partials
-
-    return partials[0]
-
-
-def _safe_group_size(group: Optional[torch.distributed.ProcessGroup]) -> int:
-    if group is not None:
-        return group.size()
-    try:
-        from megatron.core.parallel_state import get_tensor_model_parallel_world_size
-
-        return get_tensor_model_parallel_world_size()
-    except Exception:
-        return 1
-
-
-def _safe_tensor_context_parallel_size() -> int:
-    try:
-        from megatron.core.parallel_state import get_tensor_and_context_parallel_world_size
-
-        return get_tensor_and_context_parallel_world_size()
-    except Exception:
-        return _safe_group_size(None)
-
-
-def _rollout_row_parallel_partition_k(
-    input_: torch.Tensor, tp_group: Optional[torch.distributed.ProcessGroup]
-) -> int:
-    train_tp_size = _safe_group_size(tp_group)
-    rollout_tp_size = _safe_tensor_context_parallel_size()
-    global_k_size = input_.shape[-1] * train_tp_size
-    if rollout_tp_size <= 0 or global_k_size % rollout_tp_size != 0:
-        return input_.shape[-1]
-    return global_k_size // rollout_tp_size
-
-
-def _should_use_sglang_tp_invariant_row_linear(
-    input_: torch.Tensor, row_parallel: bool, tp_group: Optional[torch.distributed.ProcessGroup]
-) -> bool:
-    rollout_partition_k = _rollout_row_parallel_partition_k(input_, tp_group)
-    return (
-        row_parallel
-        and rollout_partition_k >= _ROW_LINEAR_INV_BLOCK_K
-        and rollout_partition_k % _ROW_LINEAR_INV_BLOCK_K == 0
-    )
+from . import kernels
 
 
 def _sglang_row_parallel_matmul(
     input_: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
-    """SGLang's row-linear TP-invariant matmul contract.
+    """SGLang row-linear local GEMM, delegated through the shared kernel seam.
 
-    SGLang chunks the K dimension into 128-wide products, casts each product to
-    the input dtype, then combines those partials with a fixed binary tree.
-    Mirroring that order is required before the TP tree all-reduce can be
-    bitwise identical.
+    Routes to ``kernels.tp_invariant_row_linear`` -> SGLang's ``matmul_tp_inv`` (a
+    two-level-tree TP-invariant matmul), so this rank's partial is bitwise-identical to
+    inference; the subsequent TP all-reduce (a no-op at TP=1) then combines identical
+    partials.
     """
     input_shape = input_.shape
     input_2d = input_.reshape(-1, input_shape[-1])
-    weight_t = weight.t()
-    partials = []
-
-    for start in range(0, input_2d.shape[1], _ROW_LINEAR_INV_BLOCK_K):
-        end = min(start + _ROW_LINEAR_INV_BLOCK_K, input_2d.shape[1])
-        partials.append(input_2d[:, start:end] @ weight_t[start:end, :])
-
-    output = _fixed_tree_sum_tensors(partials).to(input_.dtype)
+    output = kernels.tp_invariant_row_linear(input_2d, weight)
     if bias is not None:
         output = output + bias
     return output.reshape(*input_shape[:-1], weight.shape[0])
-
-
-def _sglang_rollout_partition_row_parallel_matmul(
-    input_: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    *,
-    tp_group: Optional[torch.distributed.ProcessGroup],
-) -> torch.Tensor:
-    """Mirror SGLang rollout row-linear shards when train TP is smaller than rollout TP."""
-    rollout_partition_k = _rollout_row_parallel_partition_k(input_, tp_group)
-    if (
-        rollout_partition_k <= 0
-        or rollout_partition_k >= input_.shape[-1]
-        or input_.shape[-1] % rollout_partition_k != 0
-    ):
-        return _linear_reference_matmul(input_, weight, bias)
-
-    input_shape = input_.shape
-    input_2d = input_.reshape(-1, input_shape[-1])
-    weight_t = weight.t()
-    partials = []
-
-    for start in range(0, input_2d.shape[1], rollout_partition_k):
-        end = start + rollout_partition_k
-        partials.append(input_2d[:, start:end] @ weight_t[start:end, :])
-
-    output = _fixed_tree_sum_tensors(partials).to(input_.dtype)
-    if bias is not None:
-        output = output + bias
-    return output.reshape(*input_shape[:-1], weight.shape[0])
-
-
-def _linear_reference_matmul(
-    input_: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
-) -> torch.Tensor:
-    output = input_.reshape(-1, input_.shape[-1]) @ weight.t()
-    output = output.reshape(*input_.shape[:-1], weight.shape[0])
-    if bias is not None:
-        output = output + bias
-    return output
 
 
 def sglang_reference_matmul(
@@ -151,25 +43,26 @@ def sglang_reference_matmul(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     row_parallel: bool = False,
 ) -> torch.Tensor:
-    """Reference TP matmul entrypoint for the SGLang-compatible backend.
+    """Matmul entry point for the SGLang-compatible (true-on-policy) backend -- a router.
 
-    PR 6 keeps Megatron on the same local numerical path by default and introduces a
-    single surface that later PRs can specialize for TP-invariant ordering. The
-    implementation intentionally delegates to the existing Megatron kernels so enabling
-    the backend flag does not yet change the training contract.
+    Row-parallel linears (o_proj, down_proj) reduce partials across TP ranks, so their
+    reduction order must match SGLang's inference GEMM bitwise. They ALWAYS route through
+    ``matmul_tp_inv`` (``_sglang_row_parallel_matmul``); SGLang does the same
+    unconditionally. Because ``matmul_tp_inv`` is TP-degree-invariant, both engines then
+    agree for every (train_tp, rollout_tp) -- including TP=1/TP=1, where the tree is
+    marginally slower than a single GEMM but never mismatches. Using it always (rather
+    than gating on tp) makes divergence impossible and needs no cross-engine tp signal.
+
+    Column-parallel linears and frozen weights have no cross-rank K-reduction and fall
+    through to the stock Megatron kernels, numerically unchanged.
     """
-
     if input_.dtype != weight.dtype:
         input_ = input_.to(weight.dtype)
     if bias is not None and bias.dtype != weight.dtype:
         bias = bias.to(weight.dtype)
 
-    if _should_use_sglang_tp_invariant_row_linear(input_, row_parallel, tp_group):
-        return _sglang_row_parallel_matmul(input_, weight, bias)
     if row_parallel:
-        return _sglang_rollout_partition_row_parallel_matmul(
-            input_, weight, bias, tp_group=tp_group
-        )
+        return _sglang_row_parallel_matmul(input_, weight, bias)
 
     if weight.requires_grad:
         return linear_with_grad_accumulation_and_async_allreduce(

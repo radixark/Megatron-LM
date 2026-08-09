@@ -56,7 +56,6 @@ except ImportError:
     HAVE_KITCHEN = False
 
 from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
-from miles_megatron_plugins.true_on_policy.rope import enable_sglang_rope
 from miles_megatron_plugins.true_on_policy.runtime import enable_sglang_batch_invariant_mode
 from miles_megatron_plugins.true_on_policy.sglang_backend import (
     SGLangFinalRMSNorm,
@@ -330,7 +329,6 @@ def _select_local_backend(
     if use_true_on_policy_backend:
         assert not use_kitchen, "true_on_policy_contract is not compatible with use_kitchen."
         enable_sglang_batch_invariant_mode()
-        enable_sglang_rope()
         return SGLangSpecProvider(), True
     if use_kitchen:
         assert HAVE_KITCHEN

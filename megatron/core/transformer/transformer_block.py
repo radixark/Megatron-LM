@@ -124,7 +124,8 @@ def _maybe_dump_final_layernorm_backward(name: str, tensor: Optional[Tensor]) ->
 
 
 def _get_sglang_cp_recompute_mode() -> str:
-    mode = os.environ.get("MEGATRON_TRUE_ON_POLICY_SGLANG_CP_RECOMPUTE", "disabled")
+    # Default non_reentrant: reentrant checkpoint NaNs under TOP.
+    mode = os.environ.get("MEGATRON_TRUE_ON_POLICY_SGLANG_CP_RECOMPUTE", "non_reentrant")
     return mode.lower().replace("-", "_")
 
 
@@ -579,7 +580,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         def checkpoint_handler(forward_func):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
-            if true_on_policy_policy.use_ulysses_cp_recompute_fallback:
+            if true_on_policy_policy.use_non_reentrant_recompute:
                 mode = _get_sglang_cp_recompute_mode()
                 global _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK
                 if mode in ("disabled", "disable", "off", "none", "false", "0"):
@@ -587,7 +588,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         logger.info(
                             "Bypassing full activation recompute for SGLang Ulysses CP. "
                             "Set MEGATRON_TRUE_ON_POLICY_SGLANG_CP_RECOMPUTE to "
-                            "'non_reentrant' or 'reentrant' to override."
+                            "'non_reentrant' (default) or 'reentrant' to override."
                         )
                         _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = True
                     return forward_func(
@@ -601,7 +602,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 if mode == "non_reentrant":
                     if not _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK:
                         logger.info(
-                            "Using non-reentrant torch checkpoint for SGLang Ulysses CP "
+                            "Using non-reentrant torch checkpoint for true-on-policy "
                             "full recompute."
                         )
                         _WARNED_SGLANG_CP_RECOMPUTE_FALLBACK = True

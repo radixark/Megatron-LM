@@ -9,7 +9,7 @@ from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
-from .attention_fa3 import SGLangCoreAttention
+from .sglang_attention import SGLangCoreAttention
 from .linear import SGLangColumnParallelLinear, SGLangRowParallelLinear
 from .norm import SGLangNorm, SGLangQKRMSNorm
 
