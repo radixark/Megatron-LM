@@ -636,6 +636,75 @@ def test_optimizer_reload_model_params():
 
 
 @pytest.mark.skipif(
+    int(os.getenv('WORLD_SIZE', '1')) < 2, reason="Test requires at least two distributed ranks"
+)
+@pytest.mark.parametrize('pg_collection_mode', ['legacy', 'explicit', 'custom_without_expt_tp'])
+def test_expert_optimizer_uses_expert_tp_group_for_grad_norm(pg_collection_mode):
+    world_size = int(os.environ['WORLD_SIZE'])
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=world_size,
+        expert_model_parallel_size=world_size,
+        expert_tensor_parallel_size=1,
+    )
+
+    try:
+
+        class ModelWithExpertParameter(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dense = nn.Parameter(torch.ones(2, 2, device='cuda'))
+                self.expert = nn.Parameter(torch.ones(2, 2, device='cuda'))
+                self.expert.allreduce = False
+                self.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+
+        model = ModelWithExpertParameter()
+        default_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        if pg_collection_mode == 'legacy':
+            pg_collection = None
+            expected_dense_tp_group = default_pg_collection.tp
+            expected_expert_tp_group = default_pg_collection.expt_tp
+        elif pg_collection_mode == 'explicit':
+            pg_collection = default_pg_collection
+            expected_dense_tp_group = pg_collection.tp
+            expected_expert_tp_group = pg_collection.expt_tp
+        else:
+            pg_collection = default_pg_collection
+            del pg_collection.expt_tp
+            expected_dense_tp_group = pg_collection.tp
+            expected_expert_tp_group = pg_collection.tp
+
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(optimizer='sgd', lr=0.1),
+            [model],
+            config_overrides={},
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+        dense_optimizer, expert_optimizer = optimizer.chained_optimizers
+
+        assert dense_optimizer.tp_group is expected_dense_tp_group
+        assert expert_optimizer.tp_group is expected_expert_tp_group
+
+        model.dense.grad = torch.ones_like(model.dense)
+        model.expert.grad = torch.ones_like(model.expert)
+        dense_grads = dense_optimizer.get_main_grads_for_grad_norm()
+        expert_grads = expert_optimizer.get_main_grads_for_grad_norm()
+
+        if expected_dense_tp_group.rank() == 0:
+            assert len(dense_grads) == 1
+            assert dense_grads[0] is model.dense.grad
+        else:
+            assert dense_grads == []
+        if expected_expert_tp_group.rank() == 0:
+            assert len(expert_grads) == 1
+            assert expert_grads[0] is model.expert.grad
+        else:
+            assert expert_grads == []
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
     not is_torch_min_version("2.4.0"),
     reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
 )
