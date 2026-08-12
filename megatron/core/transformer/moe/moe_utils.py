@@ -2,7 +2,6 @@
 import functools
 import math
 from dataclasses import dataclass
-from enum import Enum
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -44,22 +43,6 @@ except ImportError:
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
-
-
-class MoERouterWeightPlacement(str, Enum):
-    """Placement and numerical contract for router weights within an expert MLP.
-
-    ``FC2_INPUT`` selects the historical expert path; the existing
-    ``moe_apply_probs_on_input`` and ``moe_combine_in_fp32`` modes retain their current behavior.
-    ``FC2_OUTPUT`` promotes the materialized FC2 output, bias, and router weight to at least FP32,
-    then adds the bias, multiplies, and casts the result once to the expert output dtype. The FC2
-    output has already been rounded to that dtype; this mode does not expose the GEMM accumulator.
-    It is currently limited to SwiGLU, expert tensor parallel size 1, and unquantized experts when
-    expert bias is enabled.
-    """
-
-    FC2_INPUT = "fc2_input"
-    FC2_OUTPUT = "fc2_output"
 
 
 def switch_load_balancing_loss_func(
