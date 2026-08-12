@@ -276,6 +276,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> MegatronOptimizer:
     """Get Megatron optimizer based on parameter groups.
 
@@ -292,6 +293,9 @@ def _get_megatron_optimizer_based_on_param_groups(
             optimizer. Defaults to None.
         distributed_optimizer_instance_id (int, optional): Distributed optimizer instance. Defaults
             0.
+        tp_group (torch.distributed.ProcessGroup, optional): Tensor-parallel group used to filter
+            replicated parameters when computing gradient statistics. Defaults to the tensor model
+            parallel group.
 
     Returns:
         Instance of MegatronOptimizer.
@@ -465,10 +469,11 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-    else:
-        tp_group = pg_collection.tp
+    if tp_group is None:
+        if pg_collection is None or not hasattr(pg_collection, 'tp'):
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            tp_group = pg_collection.tp
     # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
     setattr(optimizer, 'tp_group', tp_group)
 
@@ -660,6 +665,11 @@ def get_megatron_optimizer(
             param_group_id += 1
     if len(moe_param_groups) > 0:
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
+        expert_tensor_parallel_group = (
+            parallel_state.get_expert_tensor_parallel_group()
+            if pg_collection is None
+            else getattr(pg_collection, 'expt_tp', None)
+        )
         # Pass Gloo process groups into optimizer only if needed.
         if use_gloo_process_groups:
             expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
@@ -678,6 +688,7 @@ def get_megatron_optimizer(
                 intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
+                tp_group=expert_tensor_parallel_group,
             )
         )
 
