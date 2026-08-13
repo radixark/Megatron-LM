@@ -154,7 +154,9 @@ class MegatronOptimizer(ABC):
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-                param, getattr(self, 'tp_group', None)
+                param,
+                tp_group=getattr(self, 'tp_group', None),
+                expert_tp_group=getattr(self, 'expert_tp_group', None),
             )
             is_not_witness = not getattr(param, "_is_witness_param", False)
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_witness:
@@ -229,6 +231,7 @@ class MegatronOptimizer(ABC):
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=getattr(self, 'tp_group', None),
+            expert_tp_group=getattr(self, 'expert_tp_group', None),
         )
 
     @abstractmethod
@@ -675,6 +678,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+                            if hasattr(param, 'allreduce'):
+                                main_param.allreduce = param.allreduce
                             if hasattr(param, 'shared'):
                                 main_param.shared = param.shared
                             # Replace the optimizer params with the new fp32 copy.
@@ -1296,6 +1301,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 params,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
                 use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                tp_group=getattr(self.chained_optimizers[0], 'tp_group', None),
+                expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
             )
         else:
             num_zeros_in_grad = 0

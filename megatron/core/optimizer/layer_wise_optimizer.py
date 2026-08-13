@@ -80,6 +80,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
 
+        self.tp_group = self.pg_collection.tp
+        self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', None) or self.tp_group
+        for optimizer in optimizers:
+            # Child optimizers filter TP replicas when collecting gradients for
+            # the world-reduced LayerWise gradient statistics.
+            optimizer.tp_group = self.tp_group
+            optimizer.expert_tp_group = self.expert_tp_group
+
         super().__init__(optimizers)
 
         # TODO(kunlun, deyuf): potential future perf optimization
@@ -95,15 +103,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list will be
         # [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]]
 
-        # simplify when dp_cp group size is 1
-        if get_pg_size(self.pg_collection.dp_cp) == 1:
+        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
+        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
+
+        # Dense and expert parameters use independent data-parallel ownership
+        # domains. Only skip sharding when neither domain has replicas.
+        if dp_cp_size == 1 and expt_dp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
 
         dp_cp_idx, expt_dp_idx = 0, 0
-        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
-        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
         # create ping-pong style loop so memory is more balanced
         dp_cp_loop = list(range(dp_cp_size)) + list(range(dp_cp_size))[::-1]
         expt_dp_loop = list(range(expt_dp_size)) + list(range(expt_dp_size))[::-1]
@@ -139,8 +149,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for groups, params in zip(param_groups, param_groups_this_rank):
             groups["params"] = params
 
-        # simplify when expt_dp group size is 1 or expert parallel is off
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+        # Dense and expert all-gathers are independent. A singleton ownership
+        # domain or a domain with no parameters needs no synchronization.
+        if dp_cp_size == 1 or not any(self.dp_cp_params_list):
+            self.dp_cp_params_list = None
+        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
             self.expt_dp_params_list = None
 
     @torch.no_grad()
@@ -149,9 +162,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # helper function to flatten local params, allgather, unflatten and copy to model params
         def _allgather_helper(params_list, group):
-            # flatten this rank's params and create empty tensor output list
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
+            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
+            if not any(flat_sizes):
+                return
+
+            # The first ownership shard may legitimately be empty (for example,
+            # a pure-expert optimizer with no dense parameters).
+            prototype = next(p for params in params_list for p in params)
+            device = prototype.device
+            dtype = prototype.dtype
             rank = get_pg_rank(group)
             # for rank without params create empty tensor and participate in allgather
             src = (
@@ -159,10 +178,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 if len(params_list[rank]) > 0
                 else torch.empty(0, device=device, dtype=dtype)
             )
-            output_list = [
-                torch.empty(sum([p.numel() for p in params]), device=device, dtype=dtype)
-                for params in params_list
-            ]
+            output_list = [torch.empty(size, device=device, dtype=dtype) for size in flat_sizes]
             # single all_gather_v to collect all updated params
             torch.distributed.all_gather(output_list, src, group=group)
             # unflatten and copy gathered params for each rank i
@@ -185,18 +201,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def broadcast_params(self):
         """All rank broadcast updated local params."""
         # Broadcast linear layer weights to all other ranks. Kept as reference test.
-        if self.dp_cp_params_list is None:
-            return
-        for i, params in enumerate(self.dp_cp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.dp_cp, i)
-            for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.dp_cp)
-        if self.expt_dp_params_list is None:
-            return
-        for i, params in enumerate(self.expt_dp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
-            for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
+        if self.dp_cp_params_list is not None:
+            for i, params in enumerate(self.dp_cp_params_list):
+                src_global_rank = torch.distributed.get_global_rank(self.pg_collection.dp_cp, i)
+                for p in params:
+                    torch.distributed.broadcast(p, src_global_rank, self.pg_collection.dp_cp)
+        if self.expt_dp_params_list is not None:
+            for i, params in enumerate(self.expt_dp_params_list):
+                src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
+                for p in params:
+                    torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
 
     @torch.no_grad()
     def get_grad_norm(self):
@@ -216,6 +230,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params,
             grad_stats_parallel_group=None,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            tp_group=self.tp_group,
+            expert_tp_group=self.expert_tp_group,
         )
 
     @torch.no_grad()

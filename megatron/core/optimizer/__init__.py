@@ -467,10 +467,15 @@ def _get_megatron_optimizer_based_on_param_groups(
 
     if pg_collection is None or not hasattr(pg_collection, 'tp'):
         tp_group = parallel_state.get_tensor_model_parallel_group()
+        expert_tp_group = (
+            parallel_state.get_expert_tensor_parallel_group(check_initialized=False) or tp_group
+        )
     else:
         tp_group = pg_collection.tp
-    # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
+        expert_tp_group = getattr(pg_collection, 'expt_tp', None) or tp_group
+    # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
     setattr(optimizer, 'tp_group', tp_group)
+    setattr(optimizer, 'expert_tp_group', expert_tp_group)
 
     return optimizer
 
