@@ -19,6 +19,7 @@ from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelop
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
+from megatron.core.post_training.modelopt.layers import Linear as ModelOptLinear
 from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -223,6 +224,38 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
             max_sequence_length=4,
             hybrid_override_pattern="M*-",
         )
+
+
+def test_modelopt_expert_linear_uses_expert_topology_metadata():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        tensor_model_parallel_size=2,
+        expert_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        use_cpu_initialization=True,
+    )
+
+    expert_linear = ModelOptLinear(
+        input_size=8,
+        output_size=8,
+        config=config,
+        init_method=config.init_method,
+        bias=True,
+        is_expert=True,
+    )
+    dense_linear = ModelOptLinear(
+        input_size=8,
+        output_size=8,
+        config=config,
+        init_method=config.init_method,
+        bias=True,
+        is_expert=False,
+    )
+
+    assert all(param.allreduce is False for param in expert_linear.parameters())
+    assert all(param.allreduce is True for param in dense_linear.parameters())
 
 
 def test_get_gpt_modelopt_spec_interface():

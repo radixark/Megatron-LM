@@ -217,8 +217,12 @@ class GroupedMLP(MegatronModule):
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight2, is_parallel=True, dim=0, stride=1
                 )
-        setattr(self.weight1, 'allreduce', not self.expert_parallel)
-        setattr(self.weight2, 'allreduce', not self.expert_parallel)
+        use_expert_pgs = (
+            self.expert_parallel
+            or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+        )
+        setattr(self.weight1, 'allreduce', not use_expert_pgs)
+        setattr(self.weight2, 'allreduce', not use_expert_pgs)
 
         def remove_extra_states_check(self, incompatible_keys):
             """

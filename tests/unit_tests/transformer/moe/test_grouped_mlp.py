@@ -1,16 +1,21 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
+
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core.extensions import transformer_engine as te_ext
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import grouped_gemm_util as gg
-from megatron.core.transformer.moe.experts import TEGroupedMLP
+from megatron.core.transformer.moe.experts import GroupedMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -21,6 +26,78 @@ from tests.unit_tests.test_utilities import Utils
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
+
+
+@pytest.mark.parametrize(("parallel_mode", "partition_dim"), (("column", 0), ("row", 1)))
+def test_expert_parameter_attributes_use_expert_topology(parallel_mode, partition_dim):
+    module = nn.Module()
+    module.register_parameter("weight0", nn.Parameter(torch.empty(4, 4)))
+    module.register_parameter("bias0", nn.Parameter(torch.empty(4)))
+
+    te_ext._set_expert_parameter_attributes(
+        module, parallel_mode=parallel_mode, use_expert_pgs=True
+    )
+
+    assert module.weight0.allreduce is False
+    assert module.weight0.tensor_model_parallel is True
+    assert module.weight0.partition_dim == partition_dim
+    assert module.bias0.allreduce is False
+    assert module.bias0.tensor_model_parallel is (parallel_mode == "column")
+
+
+@pytest.mark.parametrize(
+    ("name", "is_partitioned"),
+    (
+        ("weight", True),
+        ("weight12", True),
+        ("bias", True),
+        ("bias12", True),
+        ("weight_scale", False),
+        ("bias_extra", False),
+    ),
+)
+def test_expert_parameter_attributes_match_parameter_names(name, is_partitioned):
+    module = nn.Module()
+    module.register_parameter(name, nn.Parameter(torch.empty(4)))
+
+    te_ext._set_expert_parameter_attributes(module, parallel_mode="column", use_expert_pgs=True)
+
+    param = module.get_parameter(name)
+    assert getattr(param, "tensor_model_parallel", False) is is_partitioned
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or int(os.getenv("WORLD_SIZE", "1")) < 2
+    or int(os.getenv("WORLD_SIZE", "1")) % 2
+    or not gg.grouped_gemm_is_available(),
+    reason="Requires grouped GEMM and an even multi-GPU world",
+)
+def test_legacy_grouped_mlp_uses_expert_topology_metadata():
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2, expert_model_parallel_size=1, expert_tensor_parallel_size=1
+    )
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_moe_experts=1,
+            moe_ffn_hidden_size=16,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(["ep", "expt_tp", "expt_dp"])
+        grouped_mlp = GroupedMLP(1, config, pg_collection)
+
+        assert grouped_mlp.weight1.allreduce is False
+        assert grouped_mlp.weight2.allreduce is False
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(is_te_min_version("1.9.0.dev0"), reason="Switch to TEGroupedMLP when TE>1.9.")
