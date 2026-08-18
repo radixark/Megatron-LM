@@ -32,8 +32,9 @@ from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    mtp_on_this_rank,
+    process_mtp_loss,
     roll_tensor,
-    tie_word_embeddings_state_dict,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -209,7 +210,9 @@ class GPTModel(LanguageModule):
             self.rotary_base = rotary_base
         self.rotary_scaling = rope_scaling
         self.mtp_block_spec = mtp_block_spec
-        self.mtp_process = mtp_block_spec is not None
+        self.mtp_process = mtp_block_spec is not None and mtp_on_this_rank(
+            self.config, ignore_virtual=False, vp_stage=vp_stage
+        )
 
         self.fuse_linear_cross_entropy = (
             self.config.cross_entropy_loss_fusion
@@ -865,27 +868,6 @@ class GPTModel(LanguageModule):
 
         return loss
 
-    def shared_embedding_or_output_weight(self) -> Tensor:
-        """Gets the embedding weight or output logit weights when share input embedding and
-        output weights set to True or when use Multi-Token Prediction (MTP) feature.
-
-        Returns:
-            Tensor: During pre processing or MTP process it returns the input embeddings weight.
-            Otherwise, during post processing it returns the final output layers weight.
-        """
-        if self.pre_process or self.mtp_process:
-            # Multi-Token Prediction (MTP) need both embedding layer and output layer.
-            # So there will be both embedding layer and output layer in the mtp process stage.
-            # In this case, if share_embeddings_and_output_weights is True, the shared weights
-            # will be stored in embedding layer, and output layer will not have any weight.
-            assert hasattr(
-                self, 'embedding'
-            ), f"embedding is needed in this pipeline stage, but it is not initialized."
-            return self.embedding.word_embeddings.weight
-        elif self.post_process:
-            return self.output_layer.weight
-        return None
-
     def build_schedule_plan(
         self,
         input_ids: Tensor,
@@ -975,21 +957,5 @@ class GPTModel(LanguageModule):
         assert not (
             output_extra_state and output_extra_state.data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
-
-        # Multi-Token Prediction (MTP) need embedding layer in mtp process stage.
-        # If MTP is not placed in the pre processing stage, we need to maintain a copy of
-        # embedding layer in the mtp process stage and tie it to the embedding in the pre
-        # processing stage.
-        # Now MTP loss is computed in post processing stage, so the output_layer is not needed.
-        if self.mtp_process and not self.pre_process:
-            emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
-            emb_weight = self.embedding.word_embeddings.weight
-            tie_word_embeddings_state_dict(
-                sharded_state_dict,
-                emb_weight,
-                emb_weight_key,
-                tp_group=self.tp_group,
-                dp_cp_group=metadata['dp_cp_group'],
-            )
 
         return sharded_state_dict
