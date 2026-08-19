@@ -10,6 +10,9 @@ import torch.nn.functional as F
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.moe.fp32_activation import (
+    is_moe_activation_in_fp32_supported,
+)
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import experimental_api
 
@@ -701,10 +704,10 @@ class TransformerConfig(ModelParallelConfig):
     None means no changes for dtype."""
 
     moe_activation_in_fp32: bool = False
-    """Compute the inter-GEMM swiglu in fp32 with one round back to the params dtype."""
+    """Compute a registered expert activation between TE grouped GEMMs in fp32 with one round."""
 
     moe_combine_in_fp32: bool = False
-    """Apply routing probs and accumulate expert outputs in fp32 with one final round."""
+    """Apply routing probs and accumulate AlltoAll expert outputs in fp32 with one final round."""
 
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
@@ -1938,16 +1941,42 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_activation_in_fp32 or self.moe_combine_in_fp32:
-            assert not (
-                self.fp8 or getattr(self, 'fp4', None)
-            ), "moe_*_in_fp32 supports bf16/fp16 only"
+            if self.fp8:
+                assert self.fp8_recipe in (
+                    Fp8Recipe.delayed,
+                    Fp8Recipe.tensorwise,
+                    Fp8Recipe.blockwise,
+                    Fp8Recipe.mxfp8,
+                ), "moe_*_in_fp32 supports standard FP8 recipes only"
+            if self.fp4:
+                assert self.fp4_recipe == Fp4Recipe.nvfp4, "moe_*_in_fp32 supports NVFP4 only"
+            assert (
+                self.transformer_impl == 'transformer_engine'
+            ), "moe_*_in_fp32 requires --transformer-impl transformer_engine"
+            assert self.moe_grouped_gemm and not self.moe_use_legacy_grouped_gemm, (
+                "moe_*_in_fp32 requires TEGroupedMLP; enable --moe-grouped-gemm and disable "
+                "--moe-use-legacy-grouped-gemm"
+            )
+        if self.moe_activation_in_fp32:
+            assert (
+                is_moe_activation_in_fp32_supported(
+                    self.activation_func, self.gated_linear_unit
+                )
+            ), "moe_activation_in_fp32 requires a registered activation/gating pair"
+            assert self.activation_func_clamp_value is None, (
+                "moe_activation_in_fp32 is an inference-alignment mode; drop "
+                "--activation-func-clamp-value"
+            )
+        if self.moe_combine_in_fp32:
             assert (
                 not self.moe_permute_fusion
-            ), "moe_*_in_fp32 bypasses fused permute/unpermute; disable --moe-permute-fusion"
+            ), "moe_combine_in_fp32 does not support --moe-permute-fusion"
             assert (
-                self.activation_func_clamp_value is None
-            ), "moe_*_in_fp32 is an inference-alignment mode; drop --activation-func-clamp-value"
-        if self.moe_combine_in_fp32:
+                self.moe_token_dispatcher_type == 'alltoall'
+            ), "moe_combine_in_fp32 requires --moe-token-dispatcher-type alltoall"
+            assert (
+                not self.moe_apply_probs_on_input
+            ), "moe_combine_in_fp32 is incompatible with --moe-apply-probs-on-input"
             assert (
                 self.moe_router_dtype == 'fp32'
             ), "moe_combine_in_fp32 needs --moe-router-dtype fp32 (probs reach combine un-rounded)"
