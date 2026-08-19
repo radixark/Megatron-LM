@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
 import os
 
 import pytest
@@ -10,10 +11,14 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.muon import TensorParallelMuon, get_megatron_muon_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from tests.unit_tests.test_utilities import Utils
 
 # Skip all tests in this file for LTS versions
@@ -273,8 +278,6 @@ class TestMuonOptimizerMultiRank:
         )
 
         # Verify it's a LayerWiseDistributedOptimizer
-        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
-
         assert isinstance(
             optimizer, LayerWiseDistributedOptimizer
         ), "Should return LayerWiseDistributedOptimizer"
@@ -290,6 +293,209 @@ class TestMuonOptimizerMultiRank:
 
         assert update_successful, "Optimizer step should be successful"
         assert grad_norm is not None or grad_norm is None, "Grad norm should be returned"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or int(os.getenv("WORLD_SIZE", "1")) < 2
+    or int(os.getenv("WORLD_SIZE", "1")) % 2,
+    reason="Requires an even multi-GPU world",
+)
+def test_real_moe_ddp_layerwise_muon_expert_ownership_tp2_etp1_ep1():
+    """Production expert metadata must survive DDP, Muon, and LayerWise ownership."""
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2, expert_model_parallel_size=1, expert_tensor_parallel_size=1
+    )
+    model_parallel_cuda_manual_seed(123)
+    try:
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=4,
+            num_attention_heads=2,
+            ffn_hidden_size=4,
+            num_moe_experts=1,
+            moe_ffn_hidden_size=4,
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_aux_loss_coeff=0.01,
+            moe_token_dispatcher_type="alltoall",
+            add_bias_linear=True,
+            sequence_parallel=True,
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            gradient_accumulation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        layer_spec = get_gpt_layer_local_spec(num_experts=1, moe_grouped_gemm=False)
+        moe_layer = MoELayer(transformer_config, layer_spec.submodules.mlp.submodules).cuda()
+
+        expert = moe_layer.experts.local_experts[0]
+        params_by_scale = (
+            (expert.linear_fc1.weight, 1.0),
+            (expert.linear_fc1.bias, 2.0),
+            (expert.linear_fc2.bias, 3.0),
+        )
+        expert_params = [param for name, param in moe_layer.named_parameters() if "experts" in name]
+        assert expert_params
+        assert all(param.allreduce is False for param in expert_params)
+        assert not getattr(expert.linear_fc2.bias, "tensor_model_parallel", False)
+
+        moe_layer.requires_grad_(False)
+        for param, _ in params_by_scale:
+            param.requires_grad_(True)
+
+        ddp_model = DistributedDataParallel(
+            transformer_config,
+            ddp_config=DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True,
+                use_distributed_optimizer=False,
+                overlap_grad_reduce=False,
+                average_in_collective=False,
+            ),
+            module=moe_layer,
+        )
+        ddp_model.broadcast_params()
+
+        assert not ddp_model.buffers
+        assert len(ddp_model.expert_parallel_buffers) == 1
+        for param, _ in params_by_scale:
+            bucket_group = ddp_model.param_to_bucket_group[param]
+            assert bucket_group in ddp_model.expert_parallel_bucket_groups
+            assert bucket_group.data_parallel_group is ddp_model.intra_expt_dp_group
+
+        expert_dp_rank = parallel_state.get_expert_data_parallel_rank(
+            partial_expert_data_parallel=True
+        )
+        for param, scale in params_by_scale:
+            param.main_grad.fill_(scale * (expert_dp_rank + 1))
+        ddp_model.finish_grad_sync()
+
+        expert_dp_size = ddp_model.expt_dp_group.size()
+        data_parallel_size = ddp_model.dp_cp_group.size()
+        reduced_gradient_base = expert_dp_size * (expert_dp_size + 1) / 2 / data_parallel_size
+        for param, scale in params_by_scale:
+            torch.testing.assert_close(
+                param.main_grad,
+                torch.full_like(param.main_grad, scale * reduced_gradient_base),
+                rtol=0,
+                atol=0,
+            )
+
+        expected_norm = reduced_gradient_base * math.sqrt(
+            sum(scale**2 * param.numel() for param, scale in params_by_scale)
+        )
+        clip_grad = expected_norm / 2
+        optimizer_config = OptimizerConfig(
+            optimizer="muon",
+            lr=0.1,
+            min_lr=0.0,
+            weight_decay=0.0,
+            bf16=True,
+            use_distributed_optimizer=False,
+            clip_grad=clip_grad,
+            log_num_zeros_in_grad=True,
+            muon_momentum=0.0,
+            muon_use_nesterov=False,
+            muon_num_ns_steps=1,
+            muon_scale_mode="spectral",
+            muon_tp_mode="duplicated",
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            ["tp", "expt_tp", "dp_cp", "expt_dp"]
+        )
+        optimizer = get_megatron_muon_optimizer(
+            config=optimizer_config,
+            model_chunks=[ddp_model],
+            use_gloo_process_groups=True,
+            layer_wise_distributed_optimizer=True,
+            pg_collection=pg_collection,
+        )
+
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+        assert optimizer.dp_cp_params_list is None
+        assert optimizer.expt_dp_params_list is not None
+        sharded_param_ids = [
+            id(param) for shard in optimizer.expt_dp_params_list for param in shard
+        ]
+        expected_param_ids = [id(param) for param, _ in params_by_scale]
+        assert sorted(sharded_param_ids) == sorted(expected_param_ids)
+
+        for child in optimizer.chained_optimizers:
+            for group in child.param_groups:
+                if group["params"]:
+                    assert group["is_expert_parallel"] is True
+
+        local_owner_count = sum(
+            len(child.get_parameters()) for child in optimizer.chained_optimizers
+        )
+        global_owner_count = torch.tensor(local_owner_count, dtype=torch.int64, device="cuda")
+        torch.distributed.all_reduce(global_owner_count)
+        assert global_owner_count.item() == len(params_by_scale)
+
+        muon_children = [
+            child
+            for child in optimizer.chained_optimizers
+            if isinstance(getattr(child, "optimizer", None), TensorParallelMuon)
+        ]
+        assert len(muon_children) == 1
+        muon = muon_children[0].optimizer
+        muon.scaled_orthogonalize_fn = lambda grad, tp_group, partition_dim=None: grad
+
+        owned_master_by_model = {}
+        for child in optimizer.chained_optimizers:
+            if not hasattr(child, "float16_groups"):
+                continue
+            for model_group, master_group in zip(
+                child.float16_groups, child.fp32_from_float16_groups
+            ):
+                for model_param, master_param in zip(model_group, master_group):
+                    owned_master_by_model[id(model_param)] = master_param
+
+        model_before = {id(param): param.detach().clone() for param, _ in params_by_scale}
+        master_before = {
+            param_id: master.detach().clone() for param_id, master in owned_master_by_model.items()
+        }
+        update_successful, grad_norm, num_zeros = optimizer.step()
+
+        assert update_successful
+        assert grad_norm == pytest.approx(expected_norm, rel=1e-6, abs=1e-6)
+        assert num_zeros == 0
+        clip_coefficient = clip_grad / (expected_norm + 1.0e-6)
+        for param, _ in params_by_scale:
+            assert not torch.equal(param, model_before[id(param)])
+
+        for param, _ in params_by_scale:
+            replicas = [
+                torch.empty_like(param)
+                for _ in range(torch.distributed.get_world_size(pg_collection.expt_dp))
+            ]
+            torch.distributed.all_gather(replicas, param, group=pg_collection.expt_dp)
+            for replica in replicas[1:]:
+                torch.testing.assert_close(replica, replicas[0], rtol=0, atol=0)
+
+        for param, scale in params_by_scale:
+            master = owned_master_by_model.get(id(param))
+            if master is not None:
+                clipped_grad = scale * reduced_gradient_base * clip_coefficient
+                torch.testing.assert_close(
+                    master.grad, torch.full_like(master.grad, clipped_grad), rtol=1e-6, atol=1e-6
+                )
+
+        weight = expert.linear_fc1.weight
+        weight_master = owned_master_by_model.get(id(weight))
+        if weight_master is not None:
+            clipped_weight_grad = reduced_gradient_base * clip_coefficient
+            torch.testing.assert_close(
+                weight_master,
+                master_before[id(weight)] - optimizer_config.lr * clipped_weight_grad,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("mode", ["duplicated", "blockwise", "distributed"])
