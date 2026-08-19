@@ -8,6 +8,7 @@ import inspect
 import io
 import os
 import pickle
+import re
 import warnings
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
@@ -87,6 +88,31 @@ except ImportError:
         HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+_EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def _set_expert_parameter_attributes(
+    module: torch.nn.Module,
+    parallel_mode: Optional[str],
+    use_expert_pgs: bool,
+    partition_stride: int = 1,
+) -> None:
+    """Route expert gradients and restore TP metadata hidden from TE."""
+    for name, param in module.named_parameters(recurse=False):
+        param.allreduce = not use_expert_pgs
+
+        name_match = _EXPERT_PARAMETER_NAME_PATTERN.fullmatch(name)
+        parameter_kind = name_match.group(1) if name_match else None
+        is_weight = parameter_kind == "weight"
+        is_bias = parameter_kind == "bias"
+        is_partitioned = parallel_mode in ("column", "row") and (
+            is_weight or (parallel_mode == "column" and is_bias)
+        )
+        if is_weight or is_bias:
+            param.tensor_model_parallel = is_partitioned
+        if is_partitioned:
+            param.partition_dim = 1 if parallel_mode == "row" else 0
+            param.partition_stride = partition_stride
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -860,6 +886,10 @@ class TELinear(te.pytorch.Linear):
             tp_size = get_pg_size(tp_group)
 
         self.expert_parallel = self.config.expert_model_parallel_size > 1
+        use_expert_pgs = is_expert and (
+            self.expert_parallel
+            or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+        )
         if is_expert:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
@@ -919,10 +949,10 @@ class TELinear(te.pytorch.Linear):
 
         for param in self.parameters():
             setattr(param, "parallel_mode", parallel_mode)
-            if is_expert:
-                # Reduce the gradient on the expert_data_parallel group for expert linear layers
-                setattr(param, "allreduce", not self.expert_parallel)
-            else:
+        if is_expert:
+            _set_expert_parameter_attributes(self, parallel_mode, use_expert_pgs)
+        else:
+            for param in self.parameters():
                 # Reduce the gradient on DP group
                 setattr(param, "allreduce", True)
                 if parallel_mode == "duplicated":
@@ -1317,6 +1347,15 @@ class TEColumnParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
 
+        if is_expert:
+            use_expert_pgs = (
+                config.expert_model_parallel_size > 1
+                or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
+            )
+            _set_expert_parameter_attributes(
+                self, "column", use_expert_pgs, partition_stride=stride
+            )
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
@@ -1555,6 +1594,13 @@ class TERowParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
                 setattr(self.bias, "sequence_parallel", config.sequence_parallel)
+
+        if is_expert:
+            use_expert_pgs = (
+                config.expert_model_parallel_size > 1
+                or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
+            )
+            _set_expert_parameter_attributes(self, "row", use_expert_pgs)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
@@ -2009,6 +2055,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
             self.expert_parallel = self.config.expert_model_parallel_size > 1
+            use_expert_pgs = is_expert and (
+                self.expert_parallel
+                or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+            )
             if is_expert:
                 extra_kwargs["rng_tracker_name"] = get_expert_parallel_rng_tracker_name()
 
@@ -2024,6 +2074,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_group_for_te = tp_group
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
+            original_parallel_mode = parallel_mode
 
             # Save original parallel_mode before clearing it for explicit_expert_comm.
             # When explicit_expert_comm is True, Megatron handles TP communication externally
@@ -2091,8 +2142,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     **extra_kwargs,
                 )
 
-            for param in self.parameters():
-                setattr(param, "allreduce", not (is_expert and self.expert_parallel))
+            _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
 
             # Explicitly stamp partition_dim and partition_stride on expert weight
             # tensors when explicit_expert_comm cleared parallel_mode.  TE ≤2.12

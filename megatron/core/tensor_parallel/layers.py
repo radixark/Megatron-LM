@@ -29,7 +29,6 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
     prepare_input_tensors_for_wgrad_compute,
 )
-
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from .mappings import (
@@ -873,6 +872,10 @@ class ColumnParallelLinear(torch.nn.Module):
         world_size = get_pg_size(self.tp_group)
         rank = get_pg_rank(self.tp_group)
         self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
+        use_expert_pgs = self.is_expert and (
+            self.expert_parallel
+            or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+        )
         self.output_size_per_partition = divide(output_size, world_size)
 
         # Parameters.
@@ -925,7 +928,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
-            setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(self.weight, "allreduce", not use_expert_pgs)
         else:
             self.weight = None
 
@@ -947,7 +950,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(self.bias, "allreduce", not use_expert_pgs)
         else:
             self.register_parameter("bias", None)
 
@@ -1275,7 +1278,11 @@ class RowParallelLinear(torch.nn.Module):
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
-        setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+        use_expert_pgs = self.is_expert and (
+            self.expert_parallel
+            or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+        )
+        setattr(self.weight, "allreduce", not use_expert_pgs)
 
         if bias:
             if config.use_cpu_initialization:
@@ -1293,7 +1300,7 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(self.bias, "allreduce", not use_expert_pgs)
             setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
             self.register_parameter("bias", None)

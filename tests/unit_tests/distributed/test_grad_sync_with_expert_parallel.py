@@ -182,7 +182,8 @@ def test_grad_sync(
         non_ep_expected_grad_data_value_after_collective /= (
             parallel_state.get_data_parallel_world_size()
         )
-    if ep_size > 1:
+    uses_expert_topology = ep_size > 1 or etp_size != 1
+    if uses_expert_topology:
         # For MoE models with exper parallelism, each expert will receive tokens from EPxETP
         # times batches, such that the expert gradient will be EPxETP times after backward,
         # and the expected gradient after collective should be 1.0 as same as dense params.

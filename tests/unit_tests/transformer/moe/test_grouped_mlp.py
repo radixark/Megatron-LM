@@ -4,17 +4,22 @@ import argparse
 import sys
 from types import ModuleType, SimpleNamespace
 
+import os
+
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 import megatron.core.transformer.moe.experts as experts_module
+from megatron.core.extensions import transformer_engine as te_ext
 from megatron.core.activations import squared_relu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
@@ -1195,3 +1200,41 @@ class TestTEGroupedMLP:
             f"Fused-path training did not reduce loss enough: "
             f"initial={losses[0]:.6f}, final={losses[-1]:.6f}, full={losses}"
         )
+
+
+@pytest.mark.parametrize(("parallel_mode", "partition_dim"), (("column", 0), ("row", 1)))
+def test_expert_parameter_attributes_use_expert_topology(parallel_mode, partition_dim):
+    module = nn.Module()
+    module.register_parameter("weight0", nn.Parameter(torch.empty(4, 4)))
+    module.register_parameter("bias0", nn.Parameter(torch.empty(4)))
+
+    te_ext._set_expert_parameter_attributes(
+        module, parallel_mode=parallel_mode, use_expert_pgs=True
+    )
+
+    assert module.weight0.allreduce is False
+    assert module.weight0.tensor_model_parallel is True
+    assert module.weight0.partition_dim == partition_dim
+    assert module.bias0.allreduce is False
+    assert module.bias0.tensor_model_parallel is (parallel_mode == "column")
+
+
+@pytest.mark.parametrize(
+    ("name", "is_partitioned"),
+    (
+        ("weight", True),
+        ("weight12", True),
+        ("bias", True),
+        ("bias12", True),
+        ("weight_scale", False),
+        ("bias_extra", False),
+    ),
+)
+def test_expert_parameter_attributes_match_parameter_names(name, is_partitioned):
+    module = nn.Module()
+    module.register_parameter(name, nn.Parameter(torch.empty(4)))
+
+    te_ext._set_expert_parameter_attributes(module, parallel_mode="column", use_expert_pgs=True)
+
+    param = module.get_parameter(name)
+    assert getattr(param, "tensor_model_parallel", False) is is_partitioned

@@ -548,6 +548,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         if hasattr(p, 'clear_high_precision_init_val'):
                             p.clear_high_precision_init_val()
 
+        self.tp_group = self.pg_collection.tp
+        self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', None) or self.tp_group
+        for optimizer in optimizers:
+            # Child optimizers filter TP replicas when collecting gradients for
+            # the world-reduced LayerWise gradient statistics.
+            optimizer.tp_group = self.tp_group
+            optimizer.expert_tp_group = self.expert_tp_group
+
         super().__init__(optimizers)
 
         self._managed_optimizer_state_offload_indices = tuple(
@@ -587,14 +595,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             full_param_layouts: List of :class:`FullParamLayout` (one per model
                 chunk).  ``None`` triggers the legacy fallback.
         """
-        # Simplify when dp_cp group size is 1.
         dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
-        if dp_cp_size == 1:
+        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
+
+        # Dense and expert parameters use independent data-parallel ownership
+        # domains. Only skip sharding when neither domain has replicas.
+        if dp_cp_size == 1 and expt_dp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
-
-        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
 
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
@@ -664,8 +673,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for group, local_params in zip(param_groups, param_groups_this_rank):
             group["params"] = local_params
 
-        # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+        # Dense and expert all-gathers are independent. A singleton ownership
+        # domain or a domain with no parameters needs no synchronization.
+        if dp_cp_size == 1 or not any(self.dp_cp_params_list):
+            self.dp_cp_params_list = None
+        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
             self.expt_dp_params_list = None
 
     def _build_param_sort_keys(self, model_chunks):
@@ -756,8 +768,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for groups, params in zip(param_groups, param_groups_this_rank):
             groups["params"] = params
 
-        # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+        # Dense and expert all-gathers are independent. A singleton ownership
+        # domain or a domain with no parameters needs no synchronization.
+        if dp_cp_size == 1 or not any(self.dp_cp_params_list):
+            self.dp_cp_params_list = None
+        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
             self.expt_dp_params_list = None
 
     def set_bucket_layerwise_params_list(self, model_chunks):
@@ -891,8 +906,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
         def _allgather_helper(params_list, group):
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
+            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
+            if not any(flat_sizes):
+                return
+
+            # The first ownership shard may legitimately be empty (for example,
+            # a pure-expert optimizer with no dense parameters).
+            prototype = next(p for params in params_list for p in params)
+            device = prototype.device
+            dtype = prototype.dtype
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Flatten this rank's params.
@@ -901,10 +923,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 if len(params_list[rank]) > 0
                 else torch.empty(0, device=device, dtype=dtype)
             )
-            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
-            if max(flat_sizes) == 0:
-                return
-
             # Allocate per-rank receive buffers with actual sizes (no padding).
             # PyTorch's NCCL backend handles uneven sizes in all_gather via
             # grouped send/recv internally. Reuse src for local rank's slot.
@@ -961,18 +979,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def broadcast_params(self):
         """All rank broadcast updated local params."""
         # Broadcast linear layer weights to all other ranks. Kept as reference test.
-        if self.dp_cp_params_list is None:
-            return
-        for i, params in enumerate(self.dp_cp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.dp_cp, i)
-            for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.dp_cp)
-        if self.expt_dp_params_list is None:
-            return
-        for i, params in enumerate(self.expt_dp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
-            for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
+        if self.dp_cp_params_list is not None:
+            for i, params in enumerate(self.dp_cp_params_list):
+                src_global_rank = torch.distributed.get_global_rank(self.pg_collection.dp_cp, i)
+                for p in params:
+                    torch.distributed.broadcast(p, src_global_rank, self.pg_collection.dp_cp)
+        if self.expt_dp_params_list is not None:
+            for i, params in enumerate(self.expt_dp_params_list):
+                src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
+                for p in params:
+                    torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
 
     @torch.no_grad()
     def get_grad_norm(self):
@@ -1028,6 +1044,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params,
             grad_stats_parallel_group=None,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            tp_group=self.tp_group,
+            expert_tp_group=self.expert_tp_group,
         )
 
     def _managed_optimizer_state_offload_child_indices(self) -> tuple[int, ...]:
