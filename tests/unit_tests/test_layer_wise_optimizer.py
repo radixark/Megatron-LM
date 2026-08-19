@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,18 +12,298 @@ from packaging.version import Version
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import layer_wise_optimizer as layer_wise_optimizer_module
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import param_is_not_tensor_parallel_duplicate
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_pg_size
 from tests.unit_tests.test_utilities import Utils
 
-# Skip all tests in this file for LTS versions
-pytestmark = pytest.mark.skipif(
+skip_layerwise_lts = pytest.mark.skipif(
     Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
-    reason="Skip layer-wise optimizer for LTS test",
+    reason="Skip the legacy layer-wise optimizer suite for LTS images",
 )
+
+
+class _RankGroup:
+    """Minimal process-group stand-in for duplicate-filter tests."""
+
+    def __init__(self, rank):
+        self._rank = rank
+
+    def rank(self):
+        return self._rank
+
+
+@pytest.mark.parametrize("expert_rank", [0, 1])
+def test_shard_params_keeps_expert_plane_when_dense_dp_is_singleton(monkeypatch, expert_rank):
+    """Expert ownership must not be disabled by a singleton dense-DP group."""
+    dp_group = object()
+    expert_dp_group = object()
+    monkeypatch.setattr(
+        layer_wise_optimizer_module, "get_pg_size", lambda group: 1 if group is dp_group else 2
+    )
+    monkeypatch.setattr(
+        layer_wise_optimizer_module,
+        "get_pg_rank",
+        lambda group: 0 if group is dp_group else expert_rank,
+    )
+
+    dense_param = nn.Parameter(torch.ones(1))
+    expert_params = [nn.Parameter(torch.ones(size)) for size in (1, 2, 3)]
+    base_optimizer = torch.optim.SGD(
+        [
+            {"params": [dense_param], "is_expert_parallel": False},
+            {"params": expert_params, "is_expert_parallel": True},
+        ],
+        lr=0.1,
+    )
+    optimizer = LayerWiseDistributedOptimizer.__new__(LayerWiseDistributedOptimizer)
+    optimizer.pg_collection = SimpleNamespace(dp_cp=dp_group, expt_dp=expert_dp_group)
+
+    optimizer.shard_params([base_optimizer])
+
+    assert optimizer.dp_cp_params_list is None
+    assert optimizer.expt_dp_params_list is not None
+    owned_ids = [id(param) for shard in optimizer.expt_dp_params_list for param in shard]
+    assert sorted(owned_ids) == sorted(id(param) for param in expert_params)
+    local_ids = {id(param) for param in base_optimizer.param_groups[1]["params"]}
+    assert local_ids == {id(param) for param in optimizer.expt_dp_params_list[expert_rank]}
+    assert [id(param) for param in base_optimizer.param_groups[0]["params"]] == [id(dense_param)]
+
+
+def test_allgather_params_ignores_completely_empty_plane(monkeypatch):
+    """An ownership plane with no parameters is a valid no-op."""
+    optimizer = LayerWiseDistributedOptimizer.__new__(LayerWiseDistributedOptimizer)
+    optimizer.pg_collection = SimpleNamespace(dp_cp=object(), expt_dp=object())
+    optimizer.dp_cp_params_list = [[], []]
+    optimizer.expt_dp_params_list = None
+
+    def fail_all_gather(*args, **kwargs):
+        raise AssertionError("all_gather must not run for a completely empty plane")
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fail_all_gather)
+    optimizer.allgather_params()
+
+
+def test_allgather_params_accepts_empty_first_shard(monkeypatch):
+    """Device and dtype discovery must use the first non-empty ownership shard."""
+    group = object()
+    param = nn.Parameter(torch.zeros(3))
+    optimizer = LayerWiseDistributedOptimizer.__new__(LayerWiseDistributedOptimizer)
+    optimizer.pg_collection = SimpleNamespace(dp_cp=group, expt_dp=object())
+    optimizer.dp_cp_params_list = [[], [param]]
+    optimizer.expt_dp_params_list = None
+    monkeypatch.setattr(layer_wise_optimizer_module, "get_pg_rank", lambda _: 0)
+
+    def fake_all_gather(output_list, src, group):
+        assert src.numel() == 0
+        output_list[1].fill_(5.0)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    optimizer.allgather_params()
+    torch.testing.assert_close(param, torch.full_like(param, 5.0))
+
+
+def test_broadcast_params_runs_expert_plane_without_dense_plane(monkeypatch):
+    """Dense and expert broadcasts are independent ownership domains."""
+    expert_group = object()
+    expert_params = [nn.Parameter(torch.tensor([1.0])), nn.Parameter(torch.tensor([2.0]))]
+    optimizer = LayerWiseDistributedOptimizer.__new__(LayerWiseDistributedOptimizer)
+    optimizer.pg_collection = SimpleNamespace(dp_cp=object(), expt_dp=expert_group)
+    optimizer.dp_cp_params_list = None
+    optimizer.expt_dp_params_list = [[expert_params[0]], [expert_params[1]]]
+    calls = []
+    monkeypatch.setattr(torch.distributed, "get_global_rank", lambda _, rank: rank + 10)
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast",
+        lambda param, src, group: calls.append((id(param), src, group)),
+    )
+
+    optimizer.broadcast_params()
+
+    assert calls == [
+        (id(expert_params[0]), 10, expert_group),
+        (id(expert_params[1]), 11, expert_group),
+    ]
+
+
+def test_expert_parameters_use_expert_tp_duplicate_filter():
+    """Expert parameters use ETP, while ordinary parameters use dense TP."""
+    param = nn.Parameter(torch.ones(1))
+    param.tensor_model_parallel = False
+    dense_tp_group = _RankGroup(rank=0)
+    expert_tp_group = _RankGroup(rank=1)
+
+    param.allreduce = True
+    assert param_is_not_tensor_parallel_duplicate(param, dense_tp_group, expert_tp_group)
+
+    param.allreduce = False
+    assert not param_is_not_tensor_parallel_duplicate(param, dense_tp_group, expert_tp_group)
+
+    param.tensor_model_parallel = True
+    assert param_is_not_tensor_parallel_duplicate(param, dense_tp_group, expert_tp_group)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_bf16_main_parameter_preserves_expert_reduction_metadata():
+    """The FP32 optimizer master must retain expert-topology routing metadata."""
+    param = nn.Parameter(torch.ones(4, dtype=torch.bfloat16, device="cuda"))
+    param.allreduce = False
+    base_optimizer = torch.optim.SGD([param], lr=0.1)
+    config = OptimizerConfig(optimizer="sgd", lr=0.1, bf16=True)
+
+    optimizer = Float16OptimizerWithFloat16Params(base_optimizer, config, None, None)
+
+    main_param = optimizer.fp32_from_float16_groups[0][0]
+    assert main_param.allreduce is False
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or int(os.getenv("WORLD_SIZE", "1")) < 2
+    or int(os.getenv("WORLD_SIZE", "1")) % 2,
+    reason="Requires an even multi-GPU world",
+)
+class TestLayerWiseExpertTopology:
+    """Distributed regressions for independent dense-DP and expert-DP ownership."""
+
+    @pytest.fixture(autouse=True, params=["etp_split", "ep_split"])
+    def setup_and_teardown(self, request):
+        world_size = int(os.environ["WORLD_SIZE"])
+        if request.param == "etp_split":
+            tensor_parallel_size = world_size
+            self.expert_model_parallel_size = 1
+            self.expert_tensor_parallel_size = world_size // 2
+        else:
+            if world_size < 4:
+                pytest.skip("EP topology requires at least four GPUs")
+            tensor_parallel_size = world_size // 2
+            self.expert_model_parallel_size = 2
+            self.expert_tensor_parallel_size = 1
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tensor_parallel_size,
+            expert_model_parallel_size=self.expert_model_parallel_size,
+            expert_tensor_parallel_size=self.expert_tensor_parallel_size,
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _process_groups():
+        return ProcessGroupCollection.use_mpu_process_groups(["tp", "expt_tp", "dp_cp", "expt_dp"])
+
+    def _make_optimizer(self, params, clip_grad):
+        config = OptimizerConfig(
+            optimizer="sgd",
+            lr=0.1,
+            min_lr=0.0,
+            weight_decay=0.0,
+            sgd_momentum=0.0,
+            clip_grad=clip_grad,
+            log_num_zeros_in_grad=True,
+            bf16=False,
+            use_distributed_optimizer=False,
+            params_dtype=torch.float32,
+        )
+        base_optimizer = torch.optim.SGD(
+            [{"params": params, "is_expert_parallel": True}], lr=config.lr
+        )
+        optimizer = LayerWiseDistributedOptimizer(
+            [FP32Optimizer(base_optimizer, config, None)], config, self._process_groups()
+        )
+        return optimizer
+
+    @staticmethod
+    def _assert_group_replicas_equal(param, group):
+        replicas = [
+            torch.empty_like(param) for _ in range(torch.distributed.get_world_size(group=group))
+        ]
+        torch.distributed.all_gather(replicas, param, group=group)
+        for replica in replicas[1:]:
+            torch.testing.assert_close(replica, replicas[0], rtol=0, atol=0)
+
+    def test_expert_shards_have_one_edp_owner_and_exact_norm(self):
+        """Each ETP shard contributes once to norm and clipping, not once per EDP replica."""
+        expert_scale = parallel_state.get_expert_model_parallel_rank() + 1
+        param = nn.Parameter(torch.full((8,), expert_scale, dtype=torch.float32, device="cuda"))
+        param.tensor_model_parallel = True
+        param.allreduce = False
+        param.main_grad = torch.full_like(param, 3.0 * expert_scale)
+        optimizer = self._make_optimizer([param], clip_grad=1.0)
+
+        assert optimizer.dp_cp_params_list is None
+        assert optimizer.expt_dp_params_list is not None
+        local_owner_count = len(optimizer.chained_optimizers[0].get_parameters())
+        global_owner_count = torch.tensor(local_owner_count, dtype=torch.int64, device="cuda")
+        torch.distributed.all_reduce(global_owner_count)
+        expected_shards = self.expert_model_parallel_size * self.expert_tensor_parallel_size
+        assert global_owner_count.item() == expected_shards
+
+        update_successful, grad_norm, num_zeros = optimizer.step()
+
+        expert_scale_sq_sum = sum(
+            scale**2 for scale in range(1, self.expert_model_parallel_size + 1)
+        )
+        expected_norm = (
+            self.expert_tensor_parallel_size * param.numel() * 3.0**2 * expert_scale_sq_sum
+        ) ** 0.5
+        assert update_successful
+        assert grad_norm == pytest.approx(expected_norm, rel=1e-6, abs=1e-6)
+        assert num_zeros == 0
+        clip_coefficient = 1.0 / (expected_norm + 1.0e-6)
+        expected_param = torch.full_like(
+            param, expert_scale - 0.1 * 3.0 * expert_scale * clip_coefficient
+        )
+        torch.testing.assert_close(param, expected_param, rtol=1e-6, atol=1e-6)
+        self._assert_group_replicas_equal(param, optimizer.pg_collection.expt_dp)
+
+    def test_nonpartitioned_expert_params_use_expert_tp_for_stats(self):
+        """ETP replicas are deduplicated without dropping EDP-owned expert parameters."""
+        expert_scale = parallel_state.get_expert_model_parallel_rank() + 1
+        first = nn.Parameter(torch.full((8,), expert_scale, dtype=torch.float32, device="cuda"))
+        second = nn.Parameter(torch.full((8,), expert_scale, dtype=torch.float32, device="cuda"))
+        for param in (first, second):
+            param.tensor_model_parallel = False
+            param.allreduce = False
+        first_grad = torch.tensor([0, 0, 0, 0, 3, 3, 3, 3], device="cuda", dtype=torch.float32)
+        second_grad = torch.tensor([0, 0, 4, 4, 4, 4, 4, 4], device="cuda", dtype=torch.float32)
+        first_grad *= expert_scale
+        second_grad *= expert_scale
+        first.main_grad = first_grad.clone()
+        second.main_grad = second_grad.clone()
+        per_expert_norm_sq = 4 * 3.0**2 + 6 * 4.0**2
+        expert_scale_sq_sum = sum(
+            scale**2 for scale in range(1, self.expert_model_parallel_size + 1)
+        )
+        expected_norm = (expert_scale_sq_sum * per_expert_norm_sq) ** 0.5
+        optimizer = self._make_optimizer([first, second], clip_grad=expected_norm / 2.0)
+
+        local_owner_count = len(optimizer.chained_optimizers[0].get_parameters())
+        global_owner_count = torch.tensor(local_owner_count, dtype=torch.int64, device="cuda")
+        torch.distributed.all_reduce(global_owner_count)
+        expected_owned_params = (
+            2 * self.expert_model_parallel_size * self.expert_tensor_parallel_size
+        )
+        assert global_owner_count.item() == expected_owned_params
+
+        update_successful, grad_norm, num_zeros = optimizer.step()
+
+        assert update_successful
+        assert grad_norm == pytest.approx(expected_norm, rel=1e-6, abs=1e-6)
+        assert num_zeros == 6 * self.expert_model_parallel_size
+        clip_coefficient = (expected_norm / 2.0) / (expected_norm + 1.0e-6)
+        torch.testing.assert_close(
+            first, torch.full_like(first, expert_scale) - 0.1 * first_grad * clip_coefficient
+        )
+        torch.testing.assert_close(
+            second, torch.full_like(second, expert_scale) - 0.1 * second_grad * clip_coefficient
+        )
+        self._assert_group_replicas_equal(first, optimizer.pg_collection.expt_dp)
+        self._assert_group_replicas_equal(second, optimizer.pg_collection.expt_dp)
 
 
 class SimpleModel(nn.Module):
@@ -62,6 +343,7 @@ class TinyModel(nn.Module):
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
+@skip_layerwise_lts
 class TestLayerWiseOptimizer:
     """Test class for LayerWiseDistributedOptimizer with common setup code."""
 

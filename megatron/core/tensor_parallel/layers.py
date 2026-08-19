@@ -27,10 +27,10 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
     prepare_input_tensors_for_wgrad_compute,
 )
+from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
-from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -87,11 +87,17 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def param_is_not_tensor_parallel_duplicate(param, tp_group=None):
-    """Returns true if the passed-in parameter is not a duplicate parameter
-    on another TP rank."""
+def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group=None):
+    """Return whether a parameter contributes a unique model-parallel shard.
+
+    Parameters reduced over expert data-parallel groups use the expert
+    tensor-parallel group for duplicate filtering. Other parameters use the
+    regular tensor-parallel group.
+    """
     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
         return True
+    if not getattr(param, "allreduce", True) and expert_tp_group is not None:
+        tp_group = expert_tp_group
     # Prefer provided tp_group when available (new explicit path).
     if tp_group is not None:
         return tp_group.rank() == 0
@@ -976,6 +982,10 @@ class ColumnParallelLinear(torch.nn.Module):
         world_size = get_pg_size(self.tp_group)
         rank = get_pg_rank(self.tp_group)
         self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
+        use_expert_pgs = self.is_expert and (
+            self.expert_parallel
+            or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+        )
         self.output_size_per_partition = divide(output_size, world_size)
 
         # Parameters.
@@ -1028,7 +1038,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
-            setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(self.weight, "allreduce", not use_expert_pgs)
         else:
             self.weight = None
 
@@ -1050,7 +1060,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(self.bias, "allreduce", not use_expert_pgs)
         else:
             self.register_parameter("bias", None)
 
@@ -1361,7 +1371,11 @@ class RowParallelLinear(torch.nn.Module):
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
-        setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+        use_expert_pgs = self.is_expert and (
+            self.expert_parallel
+            or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+        )
+        setattr(self.weight, "allreduce", not use_expert_pgs)
 
         if bias:
             if config.use_cpu_initialization:
@@ -1379,7 +1393,7 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(self.bias, "allreduce", not use_expert_pgs)
             setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
             self.register_parameter("bias", None)
