@@ -785,8 +785,9 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
-            # Sorting top-k turned off during inference
-            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
+            # Keep the top-k sorted: the scores feed a softmax, whose summation order --
+            # and therefore whose last ulp -- follows the order topk returns them in.
+            return torch.topk(scores, k=topk, dim=1)
 
     # miles rollout routing replay (R3): replays sglang rollout routing in the training
     # engine. This is miles' own mechanism and must take precedence — it is the active
