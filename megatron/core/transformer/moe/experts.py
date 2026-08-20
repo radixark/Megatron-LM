@@ -22,7 +22,11 @@ from megatron.core.dist_checkpointing.mapping import (
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
-from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import (
+    bias_swiglu_impl,
+    weighted_bias_swiglu_impl,
+)
+from megatron.core.fusions.fast_activations import use_fast_activations
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -48,6 +52,7 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import log_single_rank
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -61,6 +66,24 @@ except ImportError:
     HAVE_TE = False
 
 logger = logging.getLogger(__name__)
+_LOGGED_SWIGLU_PATHS: set[tuple[str, str]] = set()
+
+
+def _log_swiglu_path(
+    backend: str, implementation: str, fast_activations_enabled: bool
+) -> None:
+    key = (backend, implementation)
+    if key in _LOGGED_SWIGLU_PATHS:
+        return
+    _LOGGED_SWIGLU_PATHS.add(key)
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        "%s SwiGLU activation path: %s (MILES_USE_FAST_ACTIVATIONS=%d)",
+        backend,
+        implementation,
+        int(fast_activations_enabled),
+    )
 
 
 class GroupedMLP(MegatronModule):
@@ -88,16 +111,34 @@ class GroupedMLP(MegatronModule):
         ), "MoE latent projection not supported in GroupedMLP yet."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
+        use_fast_swiglu = (
+            self.config.gated_linear_unit
+            and self.config.activation_func == F.silu
+            and use_fast_activations()
+        )
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
                 raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
 
-            @jit_fuser
-            def glu(x):
-                x = torch.chunk(x, 2, dim=-1)
-                return self.config.activation_func(x[0]) * x[1]
+            if use_fast_swiglu:
+                self.activation_func = partial(bias_swiglu_impl, bias=None)
+                swiglu_implementation = "flashinfer_fast_swiglu/flashinfer_fast_swiglu_back"
+            else:
 
-            self.activation_func = glu
+                @jit_fuser
+                def glu(x):
+                    x = torch.chunk(x, 2, dim=-1)
+                    return self.config.activation_func(x[0]) * x[1]
+
+                self.activation_func = glu
+                swiglu_implementation = "torch.nn.functional.silu/autograd"
+
+            if self.config.activation_func == F.silu:
+                _log_swiglu_path(
+                    "GroupedMLP",
+                    swiglu_implementation,
+                    use_fast_swiglu,
+                )
         else:
             self.activation_func = self.config.activation_func
         self.activation_recompute = (
@@ -109,11 +150,18 @@ class GroupedMLP(MegatronModule):
                 "moe_act recompute for fp8 or fp4 cannot work with the legacy GroupedMLP."
             )
 
-        @jit_fuser
-        def activation_func_with_probs(x, probs):
-            dtype = x.dtype
-            res = self.activation_func(x) * probs
-            return res.to(dtype)
+        if use_fast_swiglu:
+
+            def activation_func_with_probs(x, probs):
+                return weighted_bias_swiglu_impl(x, None, probs)
+
+        else:
+
+            @jit_fuser
+            def activation_func_with_probs(x, probs):
+                dtype = x.dtype
+                res = self.activation_func(x) * probs
+                return res.to(dtype)
 
         self.activation_func_with_probs = activation_func_with_probs
 
@@ -604,6 +652,25 @@ class TEGroupedMLP(MegatronModule):
             self.activation_func = build_module(submodules.activation_func, config=self.config)
         else:
             self.activation_func = self.config.activation_func
+
+        uses_weighted_swiglu = (
+            not self.config.use_te_activation_func
+            and self.config.bias_activation_fusion
+            and self.activation_func == F.silu
+            and self.config.gated_linear_unit
+        )
+        if uses_weighted_swiglu:
+            fast_activations_enabled = use_fast_activations()
+            swiglu_implementation = (
+                "flashinfer_fast_swiglu/flashinfer_fast_swiglu_back"
+                if fast_activations_enabled
+                else "megatron_swiglu/megatron_swiglu_back"
+            )
+            _log_swiglu_path(
+                "TEGroupedMLP weighted",
+                swiglu_implementation,
+                fast_activations_enabled,
+            )
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
