@@ -307,10 +307,15 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
-        None
-    )
-    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
+    experimental_attention_variant: Optional[
+        Literal['gated_delta_net', 'dsa', 'dsv4_hybrid', 'dsv4']
+    ] = None
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, dsv4_hybrid, and
+    dsv4 (miles' custom DeepSeek-V4 sparse-attention path; see bump_docs/02-deepseek-v4.md)."""
+
+
+
+
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks.
@@ -873,6 +878,12 @@ class TransformerConfig(ModelParallelConfig):
     in a global batch, where the bias is increased for the experts with less assigned tokens
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
+
+    freeze_e_score_correction_bias: bool = False
+    """Freeze expert score correction bias during training (DSv4 RL)."""
+
+    moe_router_freeze_gate: bool = False
+    """Freeze MoE router gate weights during training (DSv4 RL)."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -1754,6 +1765,10 @@ class TransformerConfig(ModelParallelConfig):
                     "DSAttention context parallelism currently supports "
                     "cp_comm_type=allgather only."
                 )
+        elif self.experimental_attention_variant == "dsv4":
+            # miles' DeepSeek-V4 attention (BSHD, sparse CP, tilelang kernels). Hyper-connections
+            # come from the native module; unlike dsv4_hybrid this path allows TP>1 and CP>1.
+            assert self.multi_latent_attention, "dsv4 requires multi_latent_attention."
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
