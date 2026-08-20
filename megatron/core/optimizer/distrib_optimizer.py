@@ -383,14 +383,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_fp32_groups = []
         shard_fp32_from_float16_groups = []
 
-        # Maps each model param to its (group_index, order) using the actual post-allocation
-        # optimizer order (fp32 params first, then fp32-from-float16). _build_optimizer_group_ranges
-        # builds its map from grad-buffer order, which is wrong for models mixing fp32 and bf16/fp16
-        # params (e.g. miles fp32-marked params); rebuild it here to match.
-        model_param_group_index_map = {}
-
         # Allocate (or slice) each group's param shard.
-        for group_index, group_range in enumerate(opt_group_ranges):
+        for group_range in opt_group_ranges:
 
             # Params of this group.
             model_float16_params_this_group = []
@@ -481,10 +475,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
-                    # Keep shard tensors as leaf tensors for torch Optimizer.
-                    shard_model_param = model_param.detach().view(-1)[
-                        param_range.start : param_range.end
-                    ]
+                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
                     tensor_parallel.copy_tensor_model_parallel_attributes(
@@ -513,21 +504,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     *shard_float16_params_this_group,
                 ]
 
-            # Record (group_index, order) in the same order as orig_group["params"] above:
-            # fp32 params first, then the (fp32-from-)float16 params.
-            for new_order, model_param in enumerate(model_fp32_params_this_group):
-                model_param_group_index_map[model_param] = (group_index, new_order)
-            offset = len(model_fp32_params_this_group)
-            for i, model_param in enumerate(model_float16_params_this_group):
-                model_param_group_index_map[model_param] = (group_index, offset + i)
-
         return (
             model_float16_groups,
             model_fp32_groups,
             shard_float16_groups,
             shard_fp32_groups,
             shard_fp32_from_float16_groups,
-            model_param_group_index_map,
         )
 
     @staticmethod
@@ -794,11 +776,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param.main_param = None
                         param.main_param_sharded = True
 
-        # Optimizer ranges. The index map from here is rebuilt below in
-        # _build_model_and_main_param_groups to match the actual optimizer param order
-        # (correct for mixed fp32/bf16 models).
-        (_, self.opt_group_ranges) = self._build_optimizer_group_ranges(
-            self.optimizer.param_groups, self.gbuf_ranges
+        # Optimizer ranges.
+        self.model_param_group_index_map, self.opt_group_ranges = (
+            self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
         )
 
         # Allocate main param shards.
@@ -808,7 +788,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_float16_groups,
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
-            self.model_param_group_index_map,
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
