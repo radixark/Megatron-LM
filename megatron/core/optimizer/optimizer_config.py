@@ -333,6 +333,14 @@ class OptimizerConfig:
     low_memory_resume: bool = False
     """If True, allocate optimizer states on CPU during checkpoint loading to prevent GPU OOM."""
 
+    defer_main_param_initialization: bool = False
+    """Release ordinary mixed-precision main-param shard storage during construction.
+
+    Each FP32 shard is allocated and then its backing storage is immediately released, so peak
+    construction memory still includes the largest individual shard but does not accumulate all
+    shards. External optimizer-state backends must initialize the main params before they are used.
+    """
+
     ################
     # Miscellaneous
     ################
@@ -368,6 +376,18 @@ class OptimizerConfig:
                 or self.optimizer_cpu_offload
             )
         )
+
+        if self.defer_main_param_initialization:
+            assert (
+                self.use_distributed_optimizer
+            ), '--defer-main-param-initialization requires --use-distributed-optimizer'
+            assert (
+                self.fp16 or self.bf16
+            ), '--defer-main-param-initialization requires mixed-precision model parameters'
+            assert not self.use_precision_aware_optimizer, (
+                '--defer-main-param-initialization does not support '
+                '--use-precision-aware-optimizer'
+            )
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:

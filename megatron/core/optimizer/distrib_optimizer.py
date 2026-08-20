@@ -53,10 +53,10 @@ from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_s
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
+from .fused_adam_patch import apply_fused_adam_patch, is_patch_applied
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
-from .fused_adam_patch import apply_fused_adam_patch, is_patch_applied
 
 logger = getLogger(__name__)
 
@@ -399,6 +399,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
                                 ]
+                        elif config.defer_main_param_initialization:
+                            shard_main_param = torch.empty_like(
+                                shard_model_param, dtype=torch.float32
+                            )
+                            # Keep the tensor's identity and logical metadata while allowing an
+                            # external backend to materialize its contents after construction.
+                            shard_main_param.untyped_storage().resize_(0)
                         else:
                             shard_main_param = shard_model_param.clone().float()
 
@@ -429,7 +436,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
                     # Keep shard tensors as leaf tensors for torch Optimizer.
-                    shard_model_param = model_param.detach().view(-1)[param_range.start : param_range.end]
+                    shard_model_param = model_param.detach().view(-1)[
+                        param_range.start : param_range.end
+                    ]
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
                     tensor_parallel.copy_tensor_model_parallel_attributes(
@@ -611,8 +620,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param.main_param_sharded = True
 
         # Optimizer ranges.
-        (_, self.opt_group_ranges) = (
-            self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
+        (_, self.opt_group_ranges) = self._build_optimizer_group_ranges(
+            self.optimizer.param_groups, self.gbuf_ranges
         )
 
         # Allocate main param shards.
@@ -824,8 +833,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             if low_mem_resume and USING_TE_OPTIMIZER and not is_patch_applied():
                                 apply_fused_adam_patch()
                             init_device = 'cpu' if low_mem_resume else torch.cuda.current_device()
-                            init_shard = lambda dtype=torch.float32, _device=init_device: torch.empty(
-                                (numel,), dtype=dtype, device=_device
+                            init_shard = (
+                                lambda dtype=torch.float32, _device=init_device: torch.empty(
+                                    (numel,), dtype=dtype, device=_device
+                                )
                             )
 
                             # For precision_aware_optimizer, the empty tensors should also be
