@@ -852,6 +852,11 @@ class TransformerConfig(ModelParallelConfig):
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
 
+    moe_router_use_torch_mm: bool = False
+    """Compute the router gating GEMM with torch.mm instead of te_general_gemm. TE multiplies
+    in the operand dtype and only accumulates in moe_router_dtype, so on a bf16 model the
+    routing logits stay bf16-accurate; torch.mm upcasts the operands first."""
+
     moe_activation_in_fp32: bool = False
     """Compute the inter-GEMM swiglu in fp32 with one round back to the params dtype."""
 

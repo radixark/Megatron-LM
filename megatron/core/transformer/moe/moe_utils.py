@@ -1345,6 +1345,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
         router_dtype: torch.dtype,
+        use_torch_mm: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass of the RouterGatingLinearFunction function.
@@ -1354,18 +1355,20 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             weight (torch.Tensor): The weight tensor.
             bias (torch.Tensor): The bias tensor. Could be None.
             router_dtype (torch.dtype): The router dtype.
+            use_torch_mm (bool): Multiply through torch instead of te_general_gemm.
 
         Returns:
             torch.Tensor: The output tensor.
         """
         ctx.save_for_backward(inp, weight, bias)
         ctx.router_dtype = router_dtype
+        ctx.use_torch_mm = use_torch_mm
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
+        if te_general_gemm is not None and not use_torch_mm and router_dtype != torch.float64:
             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
         elif bias is None:
@@ -1389,8 +1392,8 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_output (torch.Tensor): The gradient output.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
-                The gradient input, gradient weight, gradient bias, and None.
+            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None, None]:
+                The gradient input, gradient weight, gradient bias, and Nones.
         """
         inp, weight, bias = ctx.saved_tensors
         inp_shape = inp.shape
@@ -1398,7 +1401,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+        if (
+            te_general_gemm is not None
+            and not ctx.use_torch_mm
+            and ctx.router_dtype != torch.float64
+        ):
             grad_input = te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
@@ -1413,11 +1420,15 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
-        return grad_input, grad_weight, grad_bias, None
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 def router_gating_linear(
-    inp: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], router_dtype: torch.dtype
+    inp: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    router_dtype: torch.dtype,
+    use_torch_mm: bool = False,
 ) -> torch.Tensor:
     """
     Customized linear layer for router gating.
@@ -1429,11 +1440,12 @@ def router_gating_linear(
         weight (torch.Tensor): The weight tensor.
         bias (torch.Tensor): The bias tensor. Could be None.
         router_dtype (torch.dtype): The router dtype.
+        use_torch_mm (bool): Multiply through torch instead of te_general_gemm.
 
     Returns:
         torch.Tensor: The output tensor.
     """
-    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype, use_torch_mm)
 
 
 def get_align_size_for_quantization(config: TransformerConfig) -> int:
