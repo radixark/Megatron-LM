@@ -34,6 +34,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
     get_async_strategy,
+    ipc_staging_scope,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
@@ -1147,7 +1148,8 @@ def save_checkpoint(
             wandb_finalize_fn()
 
     if args.async_save:
-        schedule_async_save(async_save_request)
+        with ipc_staging_scope():
+            schedule_async_save(async_save_request)
         print_rank_0(
             f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] scheduled "
             f"an async checkpoint save at iteration {iteration:7d} to {save_dir}"

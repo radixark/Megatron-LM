@@ -590,6 +590,88 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         return super().commit_tensor(read_item, tensor)
 
 
+# (tensor_list, index) pairs of clones made by _restage_gpu_tensors_ipc_shareable, kept only
+# until the async request is scheduled and the ckpt worker has copied them to host.
+_ipc_staged_tensor_slots: List[Tuple[list, int]] = []
+
+
+def _writer_gpu_tensor_lists(writer):
+    for group in (writer.cached_tensor_data, writer.uncached_tensor_data):
+        if group is not None:
+            yield group[1]
+
+
+def _gpu_tensors_are_ipc_shareable(writer) -> bool:
+    """Whether the writer's GPU tensors can cross a process boundary as CUDA IPC handles.
+
+    torch_memory_saver backs colocate training allocations with the CUDA VMM APIs, which
+    cannot export legacy IPC handles, so probe one real tensor rather than guessing from
+    the allocator config.
+    """
+    for tensors in _writer_gpu_tensor_lists(writer):
+        for tensor in tensors:
+            if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                try:
+                    torch.multiprocessing.reductions.reduce_tensor(tensor)
+                    return True
+                except Exception:
+                    return False
+    return True
+
+
+def _restage_gpu_tensors_ipc_shareable(writer):
+    """Clone the writer's GPU tensors into IPC-shareable memory.
+
+    The persistent ckpt worker receives GPU tensors as pickled CUDA IPC handles;
+    torch_memory_saver.disable() routes the clones to plain cudaMalloc, outside VMM
+    management, so the export succeeds.
+    """
+    from torch_memory_saver import torch_memory_saver
+
+    assert not writer.use_cached_data_structure, (
+        "IPC restaging requires --no-ckpt-assume-constant-structure: the worker caches the "
+        "GPU tensors across saves, but the staged clones are freed once each save is scheduled."
+    )
+    with torch_memory_saver.disable():
+        for tensors in _writer_gpu_tensor_lists(writer):
+            for i, tensor in enumerate(tensors):
+                if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                    tensors[i] = tensor.detach().clone()
+                    _ipc_staged_tensor_slots.append((tensors, i))
+    torch.cuda.synchronize()
+
+
+@contextmanager
+def ipc_staging_scope():
+    """Wrap the scheduling of an async save whose tensors were restaged for CUDA IPC.
+
+    sglang swaps torch's tensor reducers for a device-UUID indirection, but only a process
+    that applied that patch can rebuild such a tensor, and the spawned ckpt worker never
+    does. It inherits the trainer's device numbering, so torch's own reducers are correct
+    here.
+
+    Scheduling blocks until the worker has copied the tensors to host, so on exit the
+    staged clones are dropped rather than held until the write finalizes.
+    """
+    from torch.multiprocessing import reductions
+
+    patched = None
+    if _ipc_staged_tensor_slots and hasattr(reductions, "_reduce_tensor_original"):
+        patched = (reductions.reduce_tensor, reductions.rebuild_cuda_tensor)
+        reductions.reduce_tensor = reductions._reduce_tensor_original
+        reductions.rebuild_cuda_tensor = reductions._rebuild_cuda_tensor_original
+        reductions.init_reductions()
+    try:
+        yield
+    finally:
+        if patched is not None:
+            reductions.reduce_tensor, reductions.rebuild_cuda_tensor = patched
+            reductions.init_reductions()
+        for tensors, i in _ipc_staged_tensor_slots:
+            tensors[i] = None
+        _ipc_staged_tensor_slots.clear()
+
+
 class TorchDistSaveShardedStrategy:
     """Async save strategy for the PyT Distributed format.
 
@@ -816,6 +898,8 @@ class TorchDistSaveShardedStrategy:
     def _get_save_and_finalize_callbacks(
         self, writer, save_state_dict_ret, async_strategy
     ) -> AsyncRequest | NVRxAsyncRequest:
+        if async_strategy == "nvrx" and not _gpu_tensors_are_ipc_shareable(writer):
+            _restage_gpu_tensors_ipc_shareable(writer)
         save_fn_args = writer.get_save_function_and_args()
         save_fn, preload_fn, save_args = save_fn_args
 
