@@ -88,6 +88,11 @@ class Router(ABC, MegatronModule):
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
         self.reset_parameters()
 
+        if self.config.moe_router_freeze_gate:
+            self.weight.requires_grad = False
+            if self.bias is not None:
+                self.bias.requires_grad = False
+
     def reset_parameters(self):
         """Reset the router parameters."""
         if self.config.perform_initialization:
@@ -114,6 +119,11 @@ class Router(ABC, MegatronModule):
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
         if self.bias is not None and self.bias.device.type == 'cpu':
             self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
+
+        if self.config.moe_router_freeze_gate:
+            assert not self.weight.requires_grad
+            if self.bias is not None:
+                assert not self.bias.requires_grad
 
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
@@ -244,6 +254,9 @@ class TopKRouter(Router):
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
+
+        if self.config.freeze_e_score_correction_bias and self.enable_expert_bias:
+            self._frozen_expert_bias_snapshot = None
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
@@ -927,6 +940,14 @@ class TopKRouter(Router):
                                                 Defaults to None.
         """
         self._maintain_float32_expert_bias()
+
+        if self.config.freeze_e_score_correction_bias and self.enable_expert_bias:
+            if self._frozen_expert_bias_snapshot is None:
+                self._frozen_expert_bias_snapshot = self.expert_bias.clone()
+            else:
+                assert torch.equal(self.expert_bias, self._frozen_expert_bias_snapshot), (
+                    "expert_bias was modified but freeze_e_score_correction_bias is enabled!"
+                )
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
