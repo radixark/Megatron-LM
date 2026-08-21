@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Literal, Optional
 
 import torch
+import torch.utils.checkpoint
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -45,6 +46,52 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_using_quantization_scales,
 )
+
+
+# --- MTP total-variation (TV) distillation loss for the draft head -----------
+# Paper: "Breaking Entropy Bounds: Accelerating RL Training via MTP with
+# Rejection Sampling" (Bebop). Rejection-sampling accept_rate = 1 - d_TV(p, q),
+# so TV distance is the *direct* training target for the draft head (vs CE,
+# which only bounds it via Pinsker).
+#
+# Selected via TransformerConfig.mtp_loss_type ('ce' default | 'tv') and
+# TransformerConfig.mtp_tv_chunk (sequence-dim chunk for the vocab-sum, 0=off).
+#
+# TP=1 ONLY: with tensor-model-parallel size 1 the full vocab lives on each rank,
+# so softmax + sum_v min(p,q) over the last dim is exact (no vocab-parallel
+# all-reduce). A guard raises if TP>1.
+
+
+def _mtp_tv_per_token(draft_logits: Tensor, target_logits: Tensor, chunk: int = 0) -> Tensor:
+    """Per-position TV distance 1 - sum_v min(softmax(target), softmax(draft)).
+
+    Gradients flow through ``draft_logits`` (the MTP head); ``target_logits``
+    (the main model) must already be detached. Inputs are [s, b, V]; returns
+    [s, b]. Computed in fp32 for numerical stability.
+    """
+    def _overlap(d: Tensor, t: Tensor) -> Tensor:
+        q = torch.softmax(d.float(), dim=-1)
+        p = torch.softmax(t.float(), dim=-1)
+        return torch.minimum(p, q).sum(dim=-1)
+
+    if chunk and chunk > 0:
+        outs = []
+        for i in range(0, draft_logits.shape[0], chunk):
+            d_i = draft_logits[i : i + chunk]
+            t_i = target_logits[i : i + chunk]
+            # Gradient-checkpoint each chunk: keep only the per-token overlap [chunk] in the
+            # forward graph and recompute softmax(draft) in backward. Without this, every chunk's
+            # [chunk,V] softmax graph is retained until backward (~O(T*V) ≈ 12GiB @ T~12k), which
+            # OOMs joint training (full backbone) — chunking the forward alone does NOT fix backward
+            # retention. _overlap is deterministic (no RNG), so recompute is numerically exact.
+            if torch.is_grad_enabled() and d_i.requires_grad:
+                outs.append(torch.utils.checkpoint.checkpoint(_overlap, d_i, t_i, use_reentrant=False))
+            else:
+                outs.append(_overlap(d_i, t_i))
+        overlap = torch.cat(outs, dim=0)
+    else:
+        overlap = _overlap(draft_logits, target_logits)
+    return 1.0 - overlap
 
 
 def apply_true_on_policy_logits_contract(
@@ -747,7 +794,64 @@ class GPTModel(LanguageModule):
                 # Compute mtp loss without storing logits to save memory.
                 # Detach output layer params to prevent MTP gradient flowing
                 # to output layer (for RL training).
-                if self.fuse_linear_cross_entropy:
+                if self.config.mtp_loss_type == "tv":
+                    # --- TV distillation loss (Bebop) -------------------------
+                    # accept_rate = 1 - d_TV(p_main, q_draft); minimize d_TV.
+                    if parallel_state.get_tensor_model_parallel_world_size() != 1:
+                        raise NotImplementedError(
+                            "MTP_LOSS_TYPE=tv supports tensor-model-parallel size 1 "
+                            "only (full vocab per rank); got TP>1."
+                        )
+                    output_layer_params = {
+                        k: v.detach() for k, v in self.output_layer.named_parameters()
+                    }
+                    output_layer_buffers = dict(self.output_layer.named_buffers())
+                    # q: draft-head logits (grads flow through the MTP hidden states)
+                    mtp_logits, _ = torch.func.functional_call(
+                        self.output_layer,
+                        {**output_layer_params, **output_layer_buffers},
+                        (hidden_states_list[mtp_layer_number + 1],),
+                        {
+                            'weight': output_weight.detach() if output_weight is not None else None,
+                            'runtime_gather_output': runtime_gather_output,
+                        },
+                    )
+                    # p: main-model logits, fully detached. Align with mtp_labels
+                    # by left-rolling the main hidden states (k+1) steps along
+                    # seq (main predicts t+1; the k-th MTP target is t+k+2),
+                    # mirroring the roll_tensor label shifts above. Roll hidden
+                    # states (H) rather than logits (V) to save memory; the
+                    # zero-padded boundary position is masked by loss_mask.
+                    with torch.no_grad():
+                        # hidden states are [s, b, H] (seq-first). roll_tensor's
+                        # packed-sequence path requires the seq dim to be LAST
+                        # (it indexes tensor[..., cu_seqlens[i]:...]); the label
+                        # roll above works because labels are [b, s]. So move seq
+                        # to the last dim, roll (k+1) times to match mtp_labels'
+                        # (k+1) in-loop shifts, then move it back.
+                        main_hidden = hidden_states_list[0].movedim(0, -1)  # [b, H, s]
+                        for _ in range(mtp_layer_number + 1):
+                            main_hidden, _ = roll_tensor(
+                                main_hidden,
+                                shifts=-1,
+                                dims=-1,
+                                cp_group=self.cp_group,
+                                packed_seq_params=packed_seq_params,
+                            )
+                        main_hidden = main_hidden.movedim(-1, 0).contiguous()  # [s, b, H]
+                        main_logits, _ = torch.func.functional_call(
+                            self.output_layer,
+                            {**output_layer_params, **output_layer_buffers},
+                            (main_hidden,),
+                            {
+                                'weight': output_weight.detach() if output_weight is not None else None,
+                                'runtime_gather_output': runtime_gather_output,
+                            },
+                        )
+                    # per-token TV [s, b] -> [b, s] to match loss_mask / CE layout
+                    mtp_loss = _mtp_tv_per_token(mtp_logits, main_logits, chunk=self.config.mtp_tv_chunk)
+                    mtp_loss = mtp_loss.transpose(0, 1).contiguous()
+                elif self.fuse_linear_cross_entropy:
                     mtp_loss = self.output_layer(
                         output_cross_entropy_loss=self.fuse_linear_cross_entropy,
                         labels=mtp_labels,
