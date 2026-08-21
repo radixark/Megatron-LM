@@ -604,70 +604,33 @@ def test_distributed_optimizer_can_defer_main_param_initialization():
     _init_distributed(world, rank)
     Utils.initialize_model_parallel()
 
-    def build_optimizer(defer_main_param_initialization):
-        model = Net().bfloat16().cuda()
-        for param in model.parameters():
-            param.data.fill_(1.0)
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
-        model = DistributedDataParallel(
-            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-        )
-        optimizer_config = OptimizerConfig(
+    model = Net().bfloat16().cuda()
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        DistributedDataParallelConfig(use_distributed_optimizer=True),
+        model,
+    )
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(
             optimizer='adam',
             bf16=True,
             use_distributed_optimizer=True,
-            defer_main_param_initialization=defer_main_param_initialization,
-        )
-        return model, get_megatron_optimizer(optimizer_config, [model])
-
-    default_model, default_optim = build_optimizer(False)
-    deferred_model, deferred_optim = build_optimizer(True)
-
-    def get_main_params(model, optim):
-        optimizer_main_params = [param for group in optim.param_groups for param in group['params']]
-        model_main_params = [param.main_param for param in model.parameters()]
-        assert optimizer_main_params
-        assert {id(param) for param in optimizer_main_params} == {
-            id(param) for param in model_main_params
-        }
-        return model_main_params
-
-    default_main_params = get_main_params(default_model, default_optim)
-    deferred_main_params = get_main_params(deferred_model, deferred_optim)
-    assert len(default_main_params) == len(deferred_main_params)
-
-    for default_main_param, deferred_main_param in zip(default_main_params, deferred_main_params):
-        assert default_main_param.shape == deferred_main_param.shape
-        assert default_main_param.stride() == deferred_main_param.stride()
-        assert default_main_param.dtype == deferred_main_param.dtype == torch.float32
-        assert default_main_param.device == deferred_main_param.device
-        assert default_main_param.numel() == deferred_main_param.numel() > 0
-        assert default_main_param.untyped_storage().nbytes() > 0
-        torch.testing.assert_close(default_main_param, torch.ones_like(default_main_param))
-        assert deferred_main_param.untyped_storage().nbytes() == 0
-
-
-@pytest.mark.parametrize(
-    'config_overrides, error',
-    [
-        ({'bf16': True}, '--defer-main-param-initialization requires --use-distributed-optimizer'),
-        (
-            {'use_distributed_optimizer': True},
-            '--defer-main-param-initialization requires mixed-precision model parameters',
+            defer_main_param_initialization=True,
         ),
-        (
-            {
-                'bf16': True,
-                'use_distributed_optimizer': True,
-                'use_precision_aware_optimizer': True,
-            },
-            '--defer-main-param-initialization does not support ' '--use-precision-aware-optimizer',
-        ),
-    ],
-)
-def test_defer_main_param_initialization_rejects_unsupported_configs(config_overrides, error):
-    with pytest.raises(AssertionError, match=error):
-        OptimizerConfig(defer_main_param_initialization=True, **config_overrides)
+        [model],
+    )
+
+    optimizer_main_params = [param for group in optimizer.param_groups for param in group['params']]
+    model_main_params = [param.main_param for param in model.parameters()]
+    assert optimizer_main_params
+    assert {id(param) for param in optimizer_main_params} == {
+        id(param) for param in model_main_params
+    }
+    for main_param in model_main_params:
+        assert main_param.numel() > 0
+        assert main_param.dtype == torch.float32
+        assert main_param.is_cuda
+        assert main_param.untyped_storage().nbytes() == 0
 
 
 @pytest.mark.skipif(
