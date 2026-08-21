@@ -382,6 +382,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         """
         for param, fp32_param in self.param_to_fp32_param.items():
             fp32_param.data.copy_(param)
+        # A param that is already fp32 gets no entry above, so its offloaded copy -- taken
+        # when this optimizer was built -- is never refreshed. Weights loaded afterwards
+        # would then be overwritten by that snapshot on the first step.
+        for param, cpu_copy in self.gpu_params_map_cpu_copy.items():
+            if param not in self.param_to_fp32_param:
+                cpu_copy.data.copy_(param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
