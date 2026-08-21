@@ -223,6 +223,10 @@ class TransformerConfig(ModelParallelConfig):
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu or weighted SwiGLU (MoE only)."""
 
+    activation_func_clamp_shared_expert: bool = True
+    """If False, skip activation_func_clamp_value inside SharedExpertMLP so only routed MoE
+    experts get the clamp."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
