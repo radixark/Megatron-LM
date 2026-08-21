@@ -226,7 +226,10 @@ class TopKRouter(Router):
             tid2eid = torch.stack([(ids + k) % num_experts for k in range(self.topk)], dim=1).to(
                 torch.int32
             )
-            self.register_buffer('tid2eid', tid2eid)
+            # A parameter, not a buffer: miles' weight sync materializes full tensors from the
+            # parameter buffer, and a plain buffer gathers as zeros — which would then overwrite
+            # the inference engine's own table.
+            self.tid2eid = torch.nn.Parameter(tid2eid, requires_grad=False)
         else:
             self.tid2eid = None
 
