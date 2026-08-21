@@ -333,6 +333,12 @@ class OptimizerConfig:
     low_memory_resume: bool = False
     """If True, allocate optimizer states on CPU during checkpoint loading to prevent GPU OOM."""
 
+    defer_main_param_initialization: bool = False
+    """Release each mixed-precision main shard's storage during construction.
+
+    An external backend must initialize the shards before use.
+    """
+
     ################
     # Miscellaneous
     ################

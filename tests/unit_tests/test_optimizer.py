@@ -598,6 +598,41 @@ def test_optimizer_reload_model_params():
             )
 
 
+def test_distributed_optimizer_can_defer_main_param_initialization():
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = Net().bfloat16().cuda()
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        DistributedDataParallelConfig(use_distributed_optimizer=True),
+        model,
+    )
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(
+            optimizer='adam',
+            bf16=True,
+            use_distributed_optimizer=True,
+            defer_main_param_initialization=True,
+        ),
+        [model],
+    )
+
+    optimizer_main_params = [param for group in optimizer.param_groups for param in group['params']]
+    model_main_params = [param.main_param for param in model.parameters()]
+    assert optimizer_main_params
+    assert {id(param) for param in optimizer_main_params} == {
+        id(param) for param in model_main_params
+    }
+    for main_param in model_main_params:
+        assert main_param.numel() > 0
+        assert main_param.dtype == torch.float32
+        assert main_param.is_cuda
+        assert main_param.untyped_storage().nbytes() == 0
+
+
 @pytest.mark.skipif(
     not is_torch_min_version("2.4.0"),
     reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
