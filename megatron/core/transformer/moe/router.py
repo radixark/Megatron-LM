@@ -290,7 +290,10 @@ class TopKRouter(Router):
         # training. No-op (early return) unless miles enables the manager.
         from miles.utils.replay_base import routing_replay_manager
 
-        routing_replay_manager.register_to_module(self, "routing_replay")
+        # Rollout routing replay only records main-decoder MoE layers; an MTP slot would
+        # register a stream nothing ever fills and then pop from it during replay.
+        if not self.is_mtp_layer:
+            routing_replay_manager.register_to_module(self, "routing_replay")
 
     def _maintain_float32_expert_bias(self):
         """
