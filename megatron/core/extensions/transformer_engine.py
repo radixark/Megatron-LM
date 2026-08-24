@@ -9,7 +9,7 @@ import pickle
 import re
 import warnings
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -1558,6 +1558,45 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         return x_out
 
+    def _adapt_packed_nvfp4_qdq_output(
+        grouped_weight: Tensor,
+        member_weights: Sequence[Tensor],
+        grouped_output: Tensor,
+    ) -> List[Tensor]:
+        """Expose packed QDQ output through TE 2.17's rank-2 member-view API."""
+        if grouped_weight.ndim != 3 or grouped_output.ndim != 3:
+            raise RuntimeError(
+                "Packed NVFP4 fake QAT requires rank-3 grouped weight and output tensors."
+            )
+
+        output_views = list(grouped_output.unbind(0))
+        if len(member_weights) != len(output_views) or any(
+            weight.ndim != 2 for weight in member_weights
+        ):
+            raise RuntimeError(
+                "Packed NVFP4 fake QAT requires Transformer Engine to expose "
+                "one rank-2 member view per grouped weight."
+            )
+        if any(weight.shape != output.shape for weight, output in zip(member_weights, output_views)):
+            raise RuntimeError(
+                "Packed NVFP4 fake QAT requires each output view to match its TE member weight."
+            )
+
+        grouped_main_grad = getattr(grouped_weight, "main_grad", None)
+        if grouped_main_grad is not None:
+            if grouped_main_grad.shape != grouped_weight.shape:
+                raise RuntimeError(
+                    "Packed NVFP4 fake QAT requires packed weight and main_grad shapes to match."
+                )
+            for output, main_grad in zip(output_views, grouped_main_grad.unbind(0)):
+                output.main_grad = main_grad
+        else:
+            for weight, output in zip(member_weights, output_views):
+                if hasattr(weight, "main_grad"):
+                    output.main_grad = weight.main_grad
+
+        return output_views
+
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
         Wrapper for the Transformer-Engine's `GroupedLinear` layer.
@@ -1837,23 +1876,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     grouped_output = fake_nvfp4_quantization_ste(
                         grouped_weight, self._nvfp4_qat_config
                     )
-                    output_views = list(grouped_output.unbind(0))
-                    if len(weight_tensors) != len(output_views) or any(
-                        weight.ndim != 2 for weight in weight_tensors
-                    ):
-                        raise RuntimeError(
-                            "Packed NVFP4 fake QAT requires Transformer Engine to expose "
-                            "one rank-2 member view per grouped weight."
-                        )
-                    grouped_main_grad = getattr(grouped_weight, "main_grad", None)
-                    for weight_idx, (weight, output) in enumerate(
-                        zip(weight_tensors, output_views)
-                    ):
-                        if grouped_main_grad is not None:
-                            output.main_grad = grouped_main_grad[weight_idx]
-                        elif hasattr(weight, "main_grad"):
-                            output.main_grad = weight.main_grad
-                    weight_tensors = output_views
+                    weight_tensors = _adapt_packed_nvfp4_qdq_output(
+                        grouped_weight, weight_tensors, grouped_output
+                    )
                 else:
                     quantized_weights = []
                     for weight in weight_tensors:
