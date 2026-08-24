@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import functools
 import os
-from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Optional
@@ -47,7 +46,6 @@ _4OVER6_THREADS = 128
 # below the SM10x 64K-register budget without spills while doubling active CTAs.
 _4OVER6_BLOCKS_PER_SM = 8
 _INT32_MAX = 2**31 - 1
-_MAX_CUDA_GRID_Y = 65535
 
 
 class NVFP4QDQErrorMode(IntEnum):
@@ -964,8 +962,8 @@ def _dequantize_pack_pair(
 
 
 @cute.jit
-def _dequantize_store_base(
-    output_base: Int64,
+def _dequantize_store(
+    output: cute.Tensor,
     offset: Int32,
     lo: Uint32,
     hi: Uint32,
@@ -979,42 +977,19 @@ def _dequantize_store_base(
     final_scale = _fmul_rn(scale_f32, global_amax)
     final_scale = _fmul_rn(final_scale, Float32(1.0 / float(6 * e4m3_max)))
 
-    ptr0 = output_base + Int64(offset) * Int64(2)
+    ptr0 = _get_ptr(output, offset)
     out0 = _dequantize_pack_pair(lo, final_scale, is_bfloat16)
     out1 = _dequantize_pack_pair(lo >> Uint32(8), final_scale, is_bfloat16)
     out2 = _dequantize_pack_pair(lo >> Uint32(16), final_scale, is_bfloat16)
     out3 = _dequantize_pack_pair(lo >> Uint32(24), final_scale, is_bfloat16)
     _store_v4_u32(ptr0, out0, out1, out2, out3)
 
-    ptr1 = ptr0 + Int64(16)
+    ptr1 = _get_ptr(output, offset + Int32(8))
     out4 = _dequantize_pack_pair(hi, final_scale, is_bfloat16)
     out5 = _dequantize_pack_pair(hi >> Uint32(8), final_scale, is_bfloat16)
     out6 = _dequantize_pack_pair(hi >> Uint32(16), final_scale, is_bfloat16)
     out7 = _dequantize_pack_pair(hi >> Uint32(24), final_scale, is_bfloat16)
     _store_v4_u32(ptr1, out4, out5, out6, out7)
-
-
-@cute.jit
-def _dequantize_store(
-    output: cute.Tensor,
-    offset: Int32,
-    lo: Uint32,
-    hi: Uint32,
-    scale: Uint32,
-    global_amax: Float32,
-    e4m3_max: int,
-    is_bfloat16: bool,
-) -> None:
-    _dequantize_store_base(
-        _get_ptr(output, Int32(0)),
-        offset,
-        lo,
-        hi,
-        scale,
-        global_amax,
-        e4m3_max,
-        is_bfloat16,
-    )
 
 
 class _NVFP4QDQKernel:
@@ -1099,92 +1074,6 @@ class _NVFP4QDQKernel:
             block = block + stride
 
 
-class _NVFP4QDQGroupedKernel:
-    """Process a runtime-sized homogeneous tensor group in one launch."""
-
-    def __init__(self, is_bfloat16: bool, config: NVFP4QDQConfig) -> None:
-        self.is_bfloat16 = is_bfloat16
-        self.config = config
-        if config.use_4over6:
-            self.threads = _4OVER6_THREADS
-            self.min_blocks_per_sm = _4OVER6_BLOCKS_PER_SM
-            self.grid_blocks_per_sm = _4OVER6_BLOCKS_PER_SM
-        else:
-            self.threads = _STANDARD_THREADS
-            self.min_blocks_per_sm = _STANDARD_MIN_BLOCKS_PER_SM
-            self.grid_blocks_per_sm = _STANDARD_GRID_BLOCKS_PER_SM
-
-    @cute.jit
-    def __call__(
-        self,
-        input_ptrs: cute.Tensor,
-        output: cute.Tensor,
-        global_amaxes: cute.Tensor,
-        total_blocks: Int32,
-        num_ctas: Int32,
-        group_size: Int32,
-        stream,
-    ) -> None:
-        self.kernel(input_ptrs, output, global_amaxes, total_blocks).launch(
-            grid=[num_ctas, group_size, 1],
-            block=[self.threads, 1, 1],
-            max_number_threads=[self.threads, 1, 1],
-            min_blocks_per_mp=self.min_blocks_per_sm,
-            smem=0,
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(
-        self,
-        input_ptrs: cute.Tensor,
-        output: cute.Tensor,
-        global_amaxes: cute.Tensor,
-        total_blocks: Int32,
-    ) -> None:
-        thread_idx, _, _ = cute.arch.thread_idx()
-        block_idx, tensor_idx, _ = cute.arch.block_idx()
-        grid_dim, _, _ = cute.arch.grid_dim()
-
-        input_base = Int64(input_ptrs[tensor_idx])
-        amax = Float32(global_amaxes[tensor_idx])
-        output_base = _get_ptr(output, Int32(0))
-        output_base = output_base + Int64(tensor_idx) * Int64(total_blocks) * Int64(32)
-        global_encode_scale = _global_encode_scale(amax, self.config.e4m3_max)
-        block = block_idx * Int32(self.threads) + thread_idx
-        stride = grid_dim * Int32(self.threads)
-        while block < total_blocks:
-            offset = block * Int32(_FP4_BLOCK_SIZE)
-            ptr0 = input_base + Int64(offset) * Int64(2)
-            ptr1 = ptr0 + Int64(16)
-            w0, w1, w2, w3 = _load_v4_u32(ptr0)
-            w4, w5, w6, w7 = _load_v4_u32(ptr1)
-            words = (w0, w1, w2, w3, w4, w5, w6, w7)
-            block_amax = _block_amax(words, self.is_bfloat16)
-
-            if cutlass.const_expr(self.config.use_4over6):
-                values = _input_values(words, self.is_bfloat16)
-                scale, lo, hi = _four_over_six_quantize(
-                    values, block_amax, amax, global_encode_scale, self.config
-                )
-            else:
-                scale, lo, hi = _standard_quantize(
-                    words, block_amax, global_encode_scale, self.is_bfloat16
-                )
-
-            _dequantize_store_base(
-                output_base,
-                offset,
-                lo,
-                hi,
-                scale,
-                amax,
-                self.config.e4m3_max,
-                self.is_bfloat16,
-            )
-            block = block + stride
-
-
 @dataclass(frozen=True)
 class _NVFP4QDQSpecialization:
     """Compiled callable and its statically selected launch geometry."""
@@ -1195,20 +1084,6 @@ class _NVFP4QDQSpecialization:
 
 
 _KERNEL_CACHE: dict[tuple[Any, ...], _NVFP4QDQSpecialization] = {}
-_GROUPED_KERNEL_CACHE: dict[tuple[Any, ...], _NVFP4QDQSpecialization] = {}
-
-
-@dataclass(frozen=True)
-class _NVFP4QDQGroupMetadata:
-    """Validated metadata shared by every tensor in a grouped launch."""
-
-    device_index: int
-    capability: tuple[int, int]
-    multiprocessors: int
-    shape: tuple[int, int]
-    dtype: torch.dtype
-    num_elements: int
-    group_size: int
 
 
 @functools.cache
@@ -1220,68 +1095,6 @@ def _device_info(device_index: int) -> tuple[tuple[int, int], int]:
             device_index
         ).multi_processor_count
     return capability, multiprocessors
-
-
-@functools.lru_cache(maxsize=128)
-def _cached_input_pointer_table(
-    device_index: int, pointers: tuple[int, ...]
-) -> torch.Tensor:
-    """Materialize stable parameter addresses once, rebuilding after any rebind."""
-    with torch.cuda.device(device_index):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Warm up grouped fused NVFP4 QDQ before CUDA graph capture.")
-        return torch.tensor(
-            pointers, dtype=torch.int64, device=torch.device("cuda", device_index)
-        )
-
-
-def _group_metadata(
-    weight_tensors: tuple[torch.Tensor, ...],
-) -> Optional[_NVFP4QDQGroupMetadata]:
-    """Return common launch metadata, or None when the scalar fallback is required."""
-    group_size = len(weight_tensors)
-    if group_size < 2 or group_size > _MAX_CUDA_GRID_Y:
-        return None
-
-    first = weight_tensors[0]
-    if (
-        not first.is_cuda
-        or first.dtype not in (torch.bfloat16, torch.float16)
-        or first.ndim != 2
-        or not first.is_contiguous()
-        or first.data_ptr() % 16 != 0
-        or first.shape[1] % _FP4_BLOCK_SIZE != 0
-        or first.numel() == 0
-        or first.numel() > _INT32_MAX
-        or first.device.index is None
-    ):
-        return None
-
-    shape = (first.shape[0], first.shape[1])
-    for weight in weight_tensors[1:]:
-        if (
-            weight.device != first.device
-            or weight.dtype != first.dtype
-            or tuple(weight.shape) != shape
-            or not weight.is_contiguous()
-            or weight.data_ptr() % 16 != 0
-        ):
-            return None
-
-    device_index = first.device.index
-    assert device_index is not None
-    capability, multiprocessors = _device_info(device_index)
-    if capability[0] != 10:
-        return None
-    return _NVFP4QDQGroupMetadata(
-        device_index=device_index,
-        capability=capability,
-        multiprocessors=multiprocessors,
-        shape=shape,
-        dtype=first.dtype,
-        num_elements=first.numel(),
-        group_size=group_size,
-    )
 
 
 def _validate_input(
@@ -1363,44 +1176,6 @@ def _compile_specialization(
     )
 
 
-def _compile_grouped_specialization(
-    dtype: torch.dtype, config: NVFP4QDQConfig
-) -> _NVFP4QDQSpecialization:
-    """Compile a dtype/config specialization whose group count remains runtime-sized."""
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("Warm up grouped fused NVFP4 QDQ before CUDA graph capture.")
-    kernel = _NVFP4QDQGroupedKernel(dtype == torch.bfloat16, config)
-    element_type = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
-    dynamic_elements = cute.sym_int()
-    dynamic_groups = cute.sym_int()
-    pointer_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int64, (dynamic_groups,), assumed_align=8
-    )
-    output_fake = cute.runtime.make_fake_compact_tensor(
-        element_type, (dynamic_elements,), assumed_align=16
-    )
-    amax_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (dynamic_groups,), assumed_align=4
-    )
-    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    compiled = cute.compile(
-        kernel,
-        pointer_fake,
-        output_fake,
-        amax_fake,
-        Int32(1),
-        Int32(1),
-        Int32(1),
-        stream_fake,
-        options="--enable-tvm-ffi",
-    )
-    return _NVFP4QDQSpecialization(
-        launch=compiled,
-        threads=kernel.threads,
-        grid_blocks_per_sm=kernel.grid_blocks_per_sm,
-    )
-
-
 def _launch_fused_nvfp4_qdq(
     x: torch.Tensor,
     amax: torch.Tensor,
@@ -1435,64 +1210,11 @@ def _launch_fused_nvfp4_qdq(
     return output
 
 
-def _launch_grouped_fused_nvfp4_qdq(
-    input_ptrs: torch.Tensor,
-    global_amaxes: torch.Tensor,
-    config: NVFP4QDQConfig,
-    metadata: _NVFP4QDQGroupMetadata,
-) -> tuple[torch.Tensor, ...]:
-    """Launch one QDQ grid over a homogeneous runtime-sized tensor group."""
-    key = (metadata.capability, metadata.dtype, config)
-    specialization = _GROUPED_KERNEL_CACHE.get(key)
-    if specialization is None:
-        specialization = _compile_grouped_specialization(metadata.dtype, config)
-        _GROUPED_KERNEL_CACHE[key] = specialization
-
-    output = torch.empty(
-        (metadata.group_size, *metadata.shape),
-        dtype=metadata.dtype,
-        device=torch.device("cuda", metadata.device_index),
-    )
-    total_blocks = metadata.num_elements // _FP4_BLOCK_SIZE
-    num_ctas = min(
-        (total_blocks + specialization.threads - 1) // specialization.threads,
-        metadata.multiprocessors * specialization.grid_blocks_per_sm,
-    )
-    specialization.launch(
-        input_ptrs.detach().view(-1),
-        output.view(-1),
-        global_amaxes.detach().view(-1),
-        total_blocks,
-        num_ctas,
-        metadata.group_size,
-    )
-    return tuple(output.unbind(0))
-
-
 def compute_nvfp4_amax(x: torch.Tensor) -> torch.Tensor:
     """Compute the TE-compatible FP32 per-tensor amax with PyTorch."""
     if x.numel() == 0:
         raise ValueError("Cannot compute NVFP4 amax for an empty tensor.")
     return torch.linalg.vector_norm(x.detach(), ord=float("inf"), dtype=torch.float32)
-
-
-def _compute_grouped_nvfp4_amaxes(
-    weight_tensors: tuple[torch.Tensor, ...], metadata: _NVFP4QDQGroupMetadata
-) -> torch.Tensor:
-    """Write independent PyTorch FP32 amax reductions into one device vector."""
-    global_amaxes = torch.empty(
-        metadata.group_size,
-        dtype=torch.float32,
-        device=torch.device("cuda", metadata.device_index),
-    )
-    for tensor_idx, weight in enumerate(weight_tensors):
-        torch.linalg.vector_norm(
-            weight.detach(),
-            ord=float("inf"),
-            dtype=torch.float32,
-            out=global_amaxes[tensor_idx],
-        )
-    return global_amaxes
 
 
 def fused_nvfp4_qdq(
@@ -1536,26 +1258,6 @@ class _FusedNVFP4QDQSTE(torch.autograd.Function):
         return grad_output, None, None
 
 
-class _GroupedFusedNVFP4QDQSTE(torch.autograd.Function):
-    """Identity backward for a runtime-sized group of discrete parameters."""
-
-    @staticmethod
-    def forward(ctx: Any, *args: Any) -> tuple[torch.Tensor, ...]:
-        del ctx
-        weight_tensors = args[:-4]
-        input_ptrs, global_amaxes, config, metadata = args[-4:]
-        if len(weight_tensors) != metadata.group_size:
-            raise RuntimeError("Grouped NVFP4 QDQ metadata does not match its inputs.")
-        return _launch_grouped_fused_nvfp4_qdq(
-            input_ptrs, global_amaxes, config, metadata
-        )
-
-    @staticmethod
-    def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[Any, ...]:
-        del ctx
-        return (*grad_outputs, None, None, None, None)
-
-
 def fake_nvfp4_quantization_ste(
     x: torch.Tensor, config: Optional[NVFP4QDQConfig] = None
 ) -> torch.Tensor:
@@ -1569,44 +1271,11 @@ def fake_nvfp4_quantization_ste(
     return output
 
 
-def fake_grouped_nvfp4_quantization_ste(
-    weight_tensors: Sequence[torch.Tensor],
-    config: Optional[NVFP4QDQConfig] = None,
-) -> list[torch.Tensor]:
-    """Apply one grouped launch when inputs are homogeneous, otherwise use scalar QDQ."""
-    if config is None:
-        config = current_nvfp4_qdq_config()
-    weights = tuple(weight_tensors)
-    metadata = _group_metadata(weights)
-    if metadata is None:
-        return [fake_nvfp4_quantization_ste(weight, config) for weight in weights]
-
-    def apply_grouped() -> list[torch.Tensor]:
-        pointers = tuple(weight.data_ptr() for weight in weights)
-        input_ptrs = _cached_input_pointer_table(metadata.device_index, pointers)
-        global_amaxes = _compute_grouped_nvfp4_amaxes(weights, metadata)
-        outputs = list(
-            _GroupedFusedNVFP4QDQSTE.apply(
-                *weights, input_ptrs, global_amaxes, config, metadata
-            )
-        )
-        for weight, output in zip(weights, outputs):
-            if hasattr(weight, "main_grad"):
-                output.main_grad = weight.main_grad
-        return outputs
-
-    if torch.cuda.current_device() == metadata.device_index:
-        return apply_grouped()
-    with torch.cuda.device(metadata.device_index):
-        return apply_grouped()
-
-
 __all__ = [
     "NVFP4QDQConfig",
     "NVFP4QDQErrorMode",
     "compute_nvfp4_amax",
     "current_nvfp4_qdq_config",
-    "fake_grouped_nvfp4_quantization_ste",
     "fake_nvfp4_quantization_ste",
     "fused_nvfp4_qdq",
 ]

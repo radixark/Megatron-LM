@@ -24,7 +24,6 @@ from megatron.core.fusions.fused_nvfp4_qdq import (  # noqa: E402
     NVFP4QDQErrorMode,
     compute_nvfp4_amax,
     current_nvfp4_qdq_config,
-    fake_grouped_nvfp4_quantization_ste,
     fake_nvfp4_quantization_ste,
     fused_nvfp4_qdq,
 )
@@ -192,82 +191,6 @@ def test_fused_nvfp4_qdq_uses_straight_through_gradient_and_preserves_main_grad(
     assert output.main_grad is main_grad
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("config", CONFIGS)
-@torch.inference_mode()
-def test_grouped_fused_nvfp4_qdq_is_bit_exact_with_te(
-    monkeypatch: pytest.MonkeyPatch,
-    dtype: torch.dtype,
-    config: NVFP4QDQConfig,
-) -> None:
-    monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
-    monkeypatch.setenv(
-        "NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH", "1" if config.error_use_fp16 else "0"
-    )
-    torch.manual_seed(42)
-    weights = [
-        torch.randn((3, 32), dtype=dtype, device="cuda") + tensor_idx
-        for tensor_idx in range(3)
-    ]
-    expected = [_te_reference(weight, config)[0] for weight in weights]
-    actual = fake_grouped_nvfp4_quantization_ste(weights, config)
-
-    assert len(actual) == len(expected)
-    for expected_weight, actual_weight in zip(expected, actual):
-        assert torch.equal(
-            actual_weight.view(torch.uint16), expected_weight.view(torch.uint16)
-        )
-        torch.testing.assert_close(actual_weight, expected_weight, rtol=0.0, atol=0.0)
-
-
-def test_grouped_fused_nvfp4_qdq_preserves_discrete_gradients_and_main_grad() -> None:
-    weights = [
-        torch.randn((3, 32), dtype=torch.bfloat16, device="cuda", requires_grad=True)
-        for _ in range(3)
-    ]
-    main_grads = [torch.empty_like(weight) for weight in weights]
-    for weight, main_grad in zip(weights, main_grads):
-        weight.main_grad = main_grad
-
-    outputs = fake_grouped_nvfp4_quantization_ste(weights, NVFP4QDQConfig())
-    output_grads = [torch.full_like(output, idx + 1) for idx, output in enumerate(outputs)]
-    torch.autograd.backward(outputs, output_grads)
-
-    for weight, output, output_grad, main_grad in zip(
-        weights, outputs, output_grads, main_grads
-    ):
-        torch.testing.assert_close(weight.grad, output_grad, rtol=0.0, atol=0.0)
-        assert output.main_grad is main_grad
-
-
-@pytest.mark.parametrize("case", ["singleton", "heterogeneous-shape"])
-def test_grouped_fused_nvfp4_qdq_falls_back_to_scalar(
-    monkeypatch: pytest.MonkeyPatch, case: str
-) -> None:
-    from megatron.core.fusions import fused_nvfp4_qdq as qdq_module
-
-    weights = [torch.randn((2, 16), dtype=torch.bfloat16, device="cuda")]
-    if case == "heterogeneous-shape":
-        weights.extend(
-            [torch.randn((3, 16), dtype=torch.bfloat16, device="cuda")]
-        )
-    expected = [torch.empty_like(weight) for weight in weights]
-    calls = []
-    config = NVFP4QDQConfig()
-
-    def fake_scalar(weight: torch.Tensor, actual_config: NVFP4QDQConfig) -> torch.Tensor:
-        call_idx = len(calls)
-        calls.append((weight, actual_config))
-        return expected[call_idx]
-
-    monkeypatch.setattr(qdq_module, "fake_nvfp4_quantization_ste", fake_scalar)
-    actual = fake_grouped_nvfp4_quantization_ste(weights, config)
-
-    assert all(value is expected_value for value, expected_value in zip(actual, expected))
-    assert all(call[0] is weight for call, weight in zip(calls, weights))
-    assert all(call[1] is config for call in calls)
-
-
 @pytest.mark.parametrize(
     ("four_over_six_scope", "e4m3_256_scope", "expected_enabled", "expected_max"),
     [
@@ -346,19 +269,18 @@ def test_te_grouped_linear_nvfp4_flag_routes_weights_to_fused_helper(
     ]
     expected = [torch.empty_like(weight) for weight in weights]
     calls = []
+    configs = []
     cached_config = NVFP4QDQConfig()
 
     monkeypatch.setattr(te.GroupedLinear, "_get_weight_tensors", lambda _self: weights)
 
-    def fake_grouped_fused_qdq(
-        values: list[torch.Tensor], config: NVFP4QDQConfig
-    ) -> list[torch.Tensor]:
-        calls.append((values, config))
-        return expected
+    def fake_fused_qdq(value: torch.Tensor, config: NVFP4QDQConfig) -> torch.Tensor:
+        weight_idx = len(calls)
+        calls.append(value)
+        configs.append(config)
+        return expected[weight_idx]
 
-    monkeypatch.setattr(
-        qdq_module, "fake_grouped_nvfp4_quantization_ste", fake_grouped_fused_qdq
-    )
+    monkeypatch.setattr(qdq_module, "fake_nvfp4_quantization_ste", fake_fused_qdq)
     monkeypatch.setenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0")
     monkeypatch.setenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "1")
     layer = te_extension.TEGroupedLinear.__new__(te_extension.TEGroupedLinear)
@@ -368,9 +290,8 @@ def test_te_grouped_linear_nvfp4_flag_routes_weights_to_fused_helper(
 
     assert len(actual) == len(expected)
     assert all(value is expected_value for value, expected_value in zip(actual, expected))
-    assert len(calls) == 1
-    assert all(value is weight for value, weight in zip(calls[0][0], weights))
-    assert calls[0][1] is cached_config
+    assert all(value is weight for value, weight in zip(calls, weights))
+    assert all(config is cached_config for config in configs)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

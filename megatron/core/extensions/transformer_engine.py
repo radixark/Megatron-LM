@@ -1796,15 +1796,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             elif os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1":
                 from megatron.core.fusions.fused_nvfp4_qdq import (
                     current_nvfp4_qdq_config,
-                    fake_grouped_nvfp4_quantization_ste,
+                    fake_nvfp4_quantization_ste,
                 )
 
                 if self._nvfp4_qat_config is None:
                     self._nvfp4_qat_config = current_nvfp4_qdq_config()
 
-                weight_tensors = fake_grouped_nvfp4_quantization_ste(
-                    weight_tensors, self._nvfp4_qat_config
-                )
+                weight_tensors = [
+                    fake_nvfp4_quantization_ste(w, self._nvfp4_qat_config)
+                    for w in weight_tensors
+                ]
 
             return weight_tensors
 

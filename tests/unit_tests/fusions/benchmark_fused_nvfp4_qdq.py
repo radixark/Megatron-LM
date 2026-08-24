@@ -9,15 +9,14 @@ so every 1x16 NVFP4 block lies along the first reported dimension. It mirrors
 ``TEGroupedLinear._get_weight_tensors`` with ``num_gemms=8`` and
 ``single_grouped_weight=False`` by timing the complete
 ``for w in weight_tensors`` loop over eight discrete equal-shaped Parameters.
-The primary speedup compares complete user-visible operations:
+The primary speedup compares complete user-visible loops:
 
 * naive: pad + TE quantize + TE dequantize + crop + contiguous;
-* grouped fused: eight PyTorch FP32 per-tensor amax reductions plus one
-  register-resident CuTe DSL QDQ launch over the discrete weight list.
+* fused: PyTorch FP32 per-tensor amax + register-resident CuTe DSL QDQ.
 
-The separately labeled scalar fused loop is the pre-grouping production path and
-attributes the benefit of removing seven QDQ launches without hiding any amax,
-allocation, autograd, or argument-marshalling work.
+The separately labeled precomputed-amax API number still includes output
+allocation, TVM-FFI argument marshalling, and host launch overhead. It is a
+diagnostic and is not used for the primary speedup claim.
 """
 
 from __future__ import annotations
@@ -35,8 +34,9 @@ import transformer_engine.pytorch as te
 from megatron.core.fusions.fused_nvfp4_qdq import (
     NVFP4QDQConfig,
     NVFP4QDQErrorMode,
-    fake_grouped_nvfp4_quantization_ste,
+    compute_nvfp4_amax,
     fake_nvfp4_quantization_ste,
+    fused_nvfp4_qdq,
 )
 
 
@@ -136,24 +136,27 @@ def _benchmark_case(
     ]
     for w in weight_tensors:
         w.main_grad = torch.empty_like(w)
+    amax_tensors = [compute_nvfp4_amax(w) for w in weight_tensors]
     quantizer = _make_te_quantizer(config)
 
     def naive() -> list[torch.Tensor]:
         return [_naive_te_fake_qat(w, quantizer) for w in weight_tensors]
 
-    def grouped_fused() -> list[torch.Tensor]:
-        return fake_grouped_nvfp4_quantization_ste(weight_tensors, config)
-
-    def scalar_fused_loop() -> list[torch.Tensor]:
+    def fused_end_to_end() -> list[torch.Tensor]:
         return [fake_nvfp4_quantization_ste(w, config) for w in weight_tensors]
+
+    def fused_precomputed_amax() -> list[torch.Tensor]:
+        return [
+            fused_nvfp4_qdq(w, amax, config)
+            for w, amax in zip(weight_tensors, amax_tensors)
+        ]
 
     # Warm native TE and every compiled CuTe specialization before timing.
     # Both primary closures retain their production QAT autograd wrappers.
     expected = naive()
-    actual = grouped_fused()
-    scalar = scalar_fused_loop()
-    for weight_idx, (expected_weight, actual_weight, scalar_weight) in enumerate(
-        zip(expected, actual, scalar)
+    actual = fused_end_to_end()
+    for weight_idx, (expected_weight, actual_weight) in enumerate(
+        zip(expected, actual)
     ):
         if not torch.equal(
             expected_weight.detach().view(torch.uint16),
@@ -167,32 +170,27 @@ def _benchmark_case(
                 f"fused QDQ weight {weight_idx} differs from TE in "
                 f"{mismatch_count} elements"
             )
-        if not torch.equal(
-            expected_weight.detach().view(torch.uint16),
-            scalar_weight.detach().view(torch.uint16),
-        ):
-            raise AssertionError(f"scalar fused QDQ weight {weight_idx} differs from TE")
         input_main_grad = weight_tensors[weight_idx].main_grad
         if (
             expected_weight.main_grad is not input_main_grad
             or actual_weight.main_grad is not input_main_grad
-            or scalar_weight.main_grad is not input_main_grad
         ):
             raise AssertionError(f"weight {weight_idx} did not preserve main_grad")
-    del expected, actual, scalar
+    del expected, actual
+    fused_precomputed_amax()
     torch.cuda.synchronize()
 
     naive_us = []
-    grouped_fused_us = []
-    scalar_fused_us = []
+    fused_e2e_us = []
+    precomputed_amax_us = []
     for _ in range(repeats):
         # Interleaved A/B/A guards the primary comparison against clock drift
         # and neighboring-workload interference on a shared GPU node.
         naive_us.append(_median_us(naive, min_run_time))
-        grouped_fused_us.append(_median_us(grouped_fused, min_run_time))
+        fused_e2e_us.append(_median_us(fused_end_to_end, min_run_time))
         naive_us.append(_median_us(naive, min_run_time))
-        scalar_fused_us.append(_median_us(scalar_fused_loop, min_run_time))
-    return naive_us, grouped_fused_us, scalar_fused_us
+        precomputed_amax_us.append(_median_us(fused_precomputed_amax, min_run_time))
+    return naive_us, fused_e2e_us, precomputed_amax_us
 
 
 def _format_samples(samples: list[float]) -> str:
@@ -280,21 +278,21 @@ def main() -> None:
         print(f"in_features={block_axis}")
         print(f"out_features={rows}")
         print(f"stored_weight_shape=[{rows},{block_axis}]")
-    print("primary_order=naive/grouped-fused/naive per repeat")
+    print("primary_order=naive/fused/naive per repeat")
     print("NVTE_USE_FAST_MATH=0")
     print()
     print(
         "| dtype | logical shape (block-axis x rows) | mode | "
         f"naive TE {args.num_weights}-weight loop median [A/B/A raw] (us) | "
-        f"grouped fused QAT one-call median [raw] (us) | "
-        f"scalar fused QAT {args.num_weights}-call loop median [raw] (us) | "
-        "grouped vs naive | grouped vs scalar |"
+        f"fused QAT {args.num_weights}-weight loop median [raw] (us) | "
+        f"precomputed-amax {args.num_weights}-weight loop median [raw] (us) | "
+        "end-to-end speedup |"
     )
-    print("|---|---:|---|---:|---:|---:|---:|---:|")
+    print("|---|---:|---|---:|---:|---:|---:|")
     for dtype in dtypes:
         for shape in shapes:
             for label, config in _configs():
-                naive_us, grouped_fused_us, scalar_fused_us = _benchmark_case(
+                naive_us, fused_e2e_us, precomputed_amax_us = _benchmark_case(
                     shape,
                     dtype,
                     config,
@@ -305,10 +303,9 @@ def main() -> None:
                 print(
                     f"| {str(dtype).removeprefix('torch.')} | {shape[0]}x{shape[1]} | "
                     f"{label} | {_format_samples(naive_us)} | "
-                    f"{_format_samples(grouped_fused_us)} | "
-                    f"{_format_samples(scalar_fused_us)} | "
-                    f"{_sample_median(naive_us) / _sample_median(grouped_fused_us):.3f}x | "
-                    f"{_sample_median(scalar_fused_us) / _sample_median(grouped_fused_us):.3f}x |",
+                    f"{_format_samples(fused_e2e_us)} | "
+                    f"{_format_samples(precomputed_amax_us)} | "
+                    f"{_sample_median(naive_us) / _sample_median(fused_e2e_us):.3f}x |",
                     flush=True,
                 )
 
