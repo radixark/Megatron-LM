@@ -1001,9 +1001,11 @@ class _NVFP4QDQKernel:
         if config.use_4over6:
             self.threads = _4OVER6_THREADS
             self.min_blocks_per_sm = _4OVER6_BLOCKS_PER_SM
+            self.grid_blocks_per_sm = _4OVER6_BLOCKS_PER_SM
         else:
             self.threads = _STANDARD_THREADS
             self.min_blocks_per_sm = _STANDARD_MIN_BLOCKS_PER_SM
+            self.grid_blocks_per_sm = _STANDARD_GRID_BLOCKS_PER_SM
 
     @cute.jit
     def __call__(
@@ -1072,7 +1074,16 @@ class _NVFP4QDQKernel:
             block = block + stride
 
 
-_KERNEL_CACHE: dict[tuple[Any, ...], Any] = {}
+@dataclass(frozen=True)
+class _NVFP4QDQSpecialization:
+    """Compiled callable and its statically selected launch geometry."""
+
+    launch: Any
+    threads: int
+    grid_blocks_per_sm: int
+
+
+_KERNEL_CACHE: dict[tuple[Any, ...], _NVFP4QDQSpecialization] = {}
 
 
 @functools.cache
@@ -1086,7 +1097,9 @@ def _device_info(device_index: int) -> tuple[tuple[int, int], int]:
     return capability, multiprocessors
 
 
-def _validate_input(x: torch.Tensor, amax: torch.Tensor) -> None:
+def _validate_input(
+    x: torch.Tensor, amax: torch.Tensor
+) -> tuple[int, tuple[int, int], int, int]:
     if not x.is_cuda:
         raise ValueError("Fused NVFP4 QDQ requires a CUDA tensor.")
     if x.dtype not in (torch.bfloat16, torch.float16):
@@ -1103,11 +1116,12 @@ def _validate_input(x: torch.Tensor, amax: torch.Tensor) -> None:
         raise ValueError(
             f"Fused NVFP4 QDQ requires K divisible by {_FP4_BLOCK_SIZE}, got {x.shape[1]}."
         )
-    if x.numel() == 0:
+    num_elements = x.numel()
+    if num_elements == 0:
         raise ValueError("Fused NVFP4 QDQ does not support empty tensors.")
-    if x.numel() > _INT32_MAX:
+    if num_elements > _INT32_MAX:
         raise ValueError(
-            f"Fused NVFP4 QDQ supports at most {_INT32_MAX} elements, got {x.numel()}."
+            f"Fused NVFP4 QDQ supports at most {_INT32_MAX} elements, got {num_elements}."
         )
     if not amax.is_cuda or amax.device != x.device:
         raise ValueError(
@@ -1115,11 +1129,85 @@ def _validate_input(x: torch.Tensor, amax: torch.Tensor) -> None:
         )
     if amax.dtype != torch.float32 or amax.numel() != 1:
         raise TypeError("The per-tensor amax must contain exactly one FP32 value.")
-    capability, _ = _device_info(x.device.index)
+    device_index = x.device.index
+    if device_index is None:
+        raise RuntimeError("CUDA tensor does not have a concrete device index.")
+    capability, multiprocessors = _device_info(device_index)
     if capability[0] != 10:
         raise ValueError(
             f"Fused NVFP4 QDQ requires SM10x, got compute capability {capability}."
         )
+    return device_index, capability, multiprocessors, num_elements
+
+
+def _compile_specialization(
+    dtype: torch.dtype, config: NVFP4QDQConfig
+) -> _NVFP4QDQSpecialization:
+    """Compile one dtype/config specialization outside the steady-state path."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Warm up fused NVFP4 QDQ before CUDA graph capture.")
+    kernel = _NVFP4QDQKernel(dtype == torch.bfloat16, config)
+    element_type = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
+    dynamic_elements = cute.sym_int()
+    input_fake = cute.runtime.make_fake_compact_tensor(
+        element_type, (dynamic_elements,), assumed_align=16
+    )
+    output_fake = cute.runtime.make_fake_compact_tensor(
+        element_type, (dynamic_elements,), assumed_align=16
+    )
+    amax_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = cute.compile(
+        kernel,
+        input_fake,
+        output_fake,
+        amax_fake,
+        Int32(1),
+        Int32(1),
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    return _NVFP4QDQSpecialization(
+        launch=compiled,
+        threads=kernel.threads,
+        grid_blocks_per_sm=kernel.grid_blocks_per_sm,
+    )
+
+
+def _launch_fused_nvfp4_qdq(
+    x: torch.Tensor,
+    amax: torch.Tensor,
+    config: NVFP4QDQConfig,
+    capability: tuple[int, int],
+    multiprocessors: int,
+    num_elements: int,
+) -> torch.Tensor:
+    """Launch on the current CUDA device with cached static dispatch."""
+    key = (capability, x.dtype, config)
+    specialization = _KERNEL_CACHE.get(key)
+    if specialization is None:
+        specialization = _compile_specialization(x.dtype, config)
+        _KERNEL_CACHE[key] = specialization
+
+    output = torch.empty_like(x)
+    input_flat = x.detach().view(-1)
+    output_flat = output.view(-1)
+    amax_flat = amax.detach().reshape(1)
+    total_blocks = num_elements // _FP4_BLOCK_SIZE
+    num_ctas = min(
+        (total_blocks + specialization.threads - 1) // specialization.threads,
+        multiprocessors * specialization.grid_blocks_per_sm,
+    )
+    specialization.launch(
+        input_flat,
+        output_flat,
+        amax_flat,
+        total_blocks,
+        num_ctas,
+    )
+    return output
 
 
 def compute_nvfp4_amax(x: torch.Tensor) -> torch.Tensor:
@@ -1137,78 +1225,16 @@ def fused_nvfp4_qdq(
     """Run register-resident NVFP4 QDQ and return a detached high-precision tensor."""
     if config is None:
         config = current_nvfp4_qdq_config()
-    _validate_input(x, amax)
-
-    device_index = x.device.index
-    capability, multiprocessors = _device_info(device_index)
-
-    def launch_on_current_device() -> torch.Tensor:
-        output = torch.empty_like(x)
-        input_flat = x.detach().view(-1)
-        output_flat = output.view(-1)
-        amax_flat = amax.detach().reshape(1)
-        total_blocks = x.numel() // _FP4_BLOCK_SIZE
-        threads = _4OVER6_THREADS if config.use_4over6 else _STANDARD_THREADS
-        grid_blocks_per_sm = (
-            _4OVER6_BLOCKS_PER_SM
-            if config.use_4over6
-            else _STANDARD_GRID_BLOCKS_PER_SM
-        )
-        num_ctas = max(
-            1,
-            min(
-                (total_blocks + threads - 1) // threads,
-                multiprocessors * grid_blocks_per_sm,
-            ),
-        )
-        key = (
-            capability,
-            x.dtype,
-            config,
-        )
-        compiled = _KERNEL_CACHE.get(key)
-        if compiled is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("Warm up fused NVFP4 QDQ before CUDA graph capture.")
-            kernel = _NVFP4QDQKernel(x.dtype == torch.bfloat16, config)
-            element_type = (
-                cutlass.BFloat16 if x.dtype == torch.bfloat16 else cutlass.Float16
-            )
-            dynamic_elements = cute.sym_int()
-            input_fake = cute.runtime.make_fake_compact_tensor(
-                element_type, (dynamic_elements,), assumed_align=16
-            )
-            output_fake = cute.runtime.make_fake_compact_tensor(
-                element_type, (dynamic_elements,), assumed_align=16
-            )
-            amax_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32, (1,), assumed_align=4
-            )
-            stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-            compiled = cute.compile(
-                kernel,
-                input_fake,
-                output_fake,
-                amax_fake,
-                Int32(1),
-                Int32(1),
-                stream_fake,
-                options="--enable-tvm-ffi",
-            )
-            _KERNEL_CACHE[key] = compiled
-        compiled(
-            input_flat,
-            output_flat,
-            amax_flat,
-            total_blocks,
-            num_ctas,
-        )
-        return output
+    device_index, capability, multiprocessors, num_elements = _validate_input(x, amax)
 
     if torch.cuda.current_device() == device_index:
-        return launch_on_current_device()
+        return _launch_fused_nvfp4_qdq(
+            x, amax, config, capability, multiprocessors, num_elements
+        )
     with torch.cuda.device(device_index):
-        return launch_on_current_device()
+        return _launch_fused_nvfp4_qdq(
+            x, amax, config, capability, multiprocessors, num_elements
+        )
 
 
 class _FusedNVFP4QDQSTE(torch.autograd.Function):
