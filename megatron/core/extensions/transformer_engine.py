@@ -9,7 +9,7 @@ import pickle
 import re
 import warnings
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -1558,47 +1558,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         return x_out
 
-    def _adapt_packed_nvfp4_qdq_output(
-        grouped_weight: Tensor,
-        member_weights: Sequence[Tensor],
-        grouped_output: Tensor,
-    ) -> List[Tensor]:
-        """Expose packed QDQ output through TE 2.17's rank-2 member-view API."""
-        if grouped_weight.ndim != 3 or grouped_output.ndim != 3:
-            raise RuntimeError(
-                "Packed NVFP4 fake QAT requires rank-3 grouped weight and output tensors."
-            )
-
-        output_views = list(grouped_output.unbind(0))
-        if len(member_weights) != len(output_views):
-            raise RuntimeError(
-                "Packed NVFP4 fake QAT requires Transformer Engine to expose "
-                "one rank-2 member view per grouped weight."
-            )
-
-        grouped_main_grad = getattr(grouped_weight, "main_grad", None)
-        if grouped_main_grad is not None:
-            if grouped_main_grad.shape != grouped_weight.shape:
-                raise RuntimeError(
-                    "Packed NVFP4 fake QAT requires packed weight and main_grad shapes to match."
-                )
-            main_grad_views = grouped_main_grad.unbind(0)
-        else:
-            main_grad_views = None
-
-        for weight_idx, (weight, output) in enumerate(zip(member_weights, output_views)):
-            if weight.ndim != 2 or weight.shape != output.shape:
-                raise RuntimeError(
-                    "Packed NVFP4 fake QAT requires each TE member weight and output "
-                    "view to be rank-2 with matching shapes."
-                )
-            if main_grad_views is not None:
-                output.main_grad = main_grad_views[weight_idx]
-            elif hasattr(weight, "main_grad"):
-                output.main_grad = weight.main_grad
-
-        return output_views
-
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
         Wrapper for the Transformer-Engine's `GroupedLinear` layer.
@@ -1635,32 +1594,6 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
 
             extra_kwargs = _get_extra_te_kwargs(config)
-            nvfp4_fake_qat = os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1"
-            use_single_grouped_weight = nvfp4_fake_qat and is_te_min_version("2.17.0")
-            if use_single_grouped_weight:
-                if "use_grouped_tensor" in inspect.signature(
-                    te.pytorch.GroupedLinear.__init__
-                ).parameters:
-                    raise RuntimeError(
-                        "Packed NVFP4 fake QAT currently requires Transformer Engine's "
-                        "member-view grouped-weight API, as shipped in the supported Miles "
-                        "TE 2.17 image; the newer native grouped-tensor GEMM API requires a "
-                        "separate integration."
-                    )
-                try:
-                    single_param_enabled = bool(
-                        int(os.getenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0"))
-                    )
-                except ValueError as exc:
-                    raise ValueError(
-                        "NVTE_GROUPED_LINEAR_SINGLE_PARAM must be an integer boolean."
-                    ) from exc
-                if not single_param_enabled:
-                    raise RuntimeError(
-                        "Packed NVFP4 fake QAT requires "
-                        "NVTE_GROUPED_LINEAR_SINGLE_PARAM=1."
-                    )
-                extra_kwargs["single_grouped_weight"] = True
 
             if self.config.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
@@ -1722,7 +1655,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             )
             self.te_quant_params: Optional[TEQuantizationParams] = None
             self._nvfp4_qat_config = None
-            if nvfp4_fake_qat:
+            if os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1":
                 from megatron.core.fusions.fused_nvfp4_qdq import current_nvfp4_qdq_config
 
                 self._nvfp4_qat_config = current_nvfp4_qdq_config()
@@ -1869,29 +1802,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 if self._nvfp4_qat_config is None:
                     self._nvfp4_qat_config = current_nvfp4_qdq_config()
 
-                if getattr(self, "single_grouped_weight", False):
-                    grouped_weight = self.weight
-                    if grouped_weight.ndim != 3:
-                        raise RuntimeError(
-                            "Packed NVFP4 fake QAT requires a [G, M, N] grouped weight."
-                        )
-                    grouped_output = fake_nvfp4_quantization_ste(
-                        grouped_weight, self._nvfp4_qat_config
-                    )
-                    weight_tensors = _adapt_packed_nvfp4_qdq_output(
-                        grouped_weight, weight_tensors, grouped_output
-                    )
-                else:
-                    quantized_weights = []
-                    for weight in weight_tensors:
-                        grouped_output = fake_nvfp4_quantization_ste(
-                            weight.unsqueeze(0), self._nvfp4_qat_config
-                        )
-                        output = grouped_output[0]
-                        if hasattr(weight, "main_grad"):
-                            output.main_grad = weight.main_grad
-                        quantized_weights.append(output)
-                    weight_tensors = quantized_weights
+                weight_tensors = [
+                    fake_nvfp4_quantization_ste(w, self._nvfp4_qat_config)
+                    for w in weight_tensors
+                ]
 
             return weight_tensors
 
