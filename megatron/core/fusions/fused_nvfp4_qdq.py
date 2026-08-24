@@ -38,7 +38,9 @@ _FP4_BLOCK_SIZE = 16
 _STANDARD_THREADS = 256
 _STANDARD_BLOCKS_PER_SM = 4
 _4OVER6_THREADS = 128
-_4OVER6_BLOCKS_PER_SM = 4
+# The largest specialization uses 56 registers/thread, so 8x128 threads stays
+# below the SM10x 64K-register budget without spills while doubling active CTAs.
+_4OVER6_BLOCKS_PER_SM = 8
 _INT32_MAX = 2**31 - 1
 
 
