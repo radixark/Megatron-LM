@@ -6,9 +6,10 @@ The ``torch.utils.benchmark`` methodology follows Transformer Engine commit
 83e230873f00676d4966ca151de22c8bfc68a77f. The benchmark shape is written as
 ``block-axis x rows`` and stored as a contiguous ``[rows, block-axis]`` tensor,
 so every 1x16 NVFP4 block lies along the first reported dimension. It mirrors
-``TEGroupedLinear._get_weight_tensors`` by timing the complete
-``for w in weight_tensors`` loop over eight equal weights. The primary speedup
-compares complete user-visible loops:
+``TEGroupedLinear._get_weight_tensors`` with ``num_gemms=8`` and
+``single_grouped_weight=False`` by timing the complete
+``for w in weight_tensors`` loop over eight discrete equal-shaped Parameters.
+The primary speedup compares complete user-visible loops:
 
 * naive: pad + TE quantize + TE dequantize + crop + contiguous;
 * fused: PyTorch FP32 per-tensor amax + register-resident CuTe DSL QDQ.
@@ -91,6 +92,13 @@ def _naive_te_qdq(x: torch.Tensor, quantizer) -> torch.Tensor:
     return quantizer.quantize(x_padded).dequantize(dtype=x.dtype)[:m, :n].contiguous()
 
 
+def _naive_te_fake_qat(x: torch.Tensor, quantizer) -> torch.Tensor:
+    output = _naive_te_qdq(x, quantizer)
+    if hasattr(x, "main_grad"):
+        output.main_grad = x.main_grad
+    return output
+
+
 def _median_us(function: Callable[[], object], min_run_time: float) -> float:
     timing = benchmark.Timer(
         stmt="function()",
@@ -121,16 +129,18 @@ def _benchmark_case(
     torch.cuda.manual_seed_all(42)
     block_axis, rows = logical_shape
     weight_tensors = [
-        torch.randn(
-            (rows, block_axis), dtype=dtype, device="cuda", requires_grad=True
+        torch.nn.Parameter(
+            torch.randn((rows, block_axis), dtype=dtype, device="cuda")
         )
         for _ in range(num_weights)
     ]
+    for w in weight_tensors:
+        w.main_grad = torch.empty_like(w)
     amax_tensors = [compute_nvfp4_amax(w) for w in weight_tensors]
     quantizer = _make_te_quantizer(config)
 
     def naive() -> list[torch.Tensor]:
-        return [_naive_te_qdq(w, quantizer) for w in weight_tensors]
+        return [_naive_te_fake_qat(w, quantizer) for w in weight_tensors]
 
     def fused_end_to_end() -> list[torch.Tensor]:
         return [fake_nvfp4_quantization_ste(w, config) for w in weight_tensors]
@@ -160,6 +170,13 @@ def _benchmark_case(
                 f"fused QDQ weight {weight_idx} differs from TE in "
                 f"{mismatch_count} elements"
             )
+        input_main_grad = weight_tensors[weight_idx].main_grad
+        if (
+            expected_weight.main_grad is not input_main_grad
+            or actual_weight.main_grad is not input_main_grad
+        ):
+            raise AssertionError(f"weight {weight_idx} did not preserve main_grad")
+    del expected, actual
     fused_precomputed_amax()
     torch.cuda.synchronize()
 
@@ -252,8 +269,15 @@ def main() -> None:
     print(f"min_run_time_s={args.min_run_time}")
     print(f"repeats={args.repeats}")
     print(f"num_weights={args.num_weights}")
+    print(f"num_gemms={args.num_weights}")
+    print("single_grouped_weight=false")
+    print("main_grad_present=true")
     print("shape_contract=logical_block_axis_x_rows")
     print("tensor_layout=contiguous_[rows,block_axis]")
+    for block_axis, rows in shapes:
+        print(f"in_features={block_axis}")
+        print(f"out_features={rows}")
+        print(f"stored_weight_shape=[{rows},{block_axis}]")
     print("primary_order=naive/fused/naive per repeat")
     print("NVTE_USE_FAST_MATH=0")
     print()
