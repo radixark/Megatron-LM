@@ -1654,6 +1654,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 **extra_kwargs,
             )
             self.te_quant_params: Optional[TEQuantizationParams] = None
+            self._nvfp4_qat_config = None
+            if os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1":
+                from megatron.core.fusions.fused_nvfp4_qdq import current_nvfp4_qdq_config
+
+                self._nvfp4_qat_config = current_nvfp4_qdq_config()
             _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
 
             def merge_extra_states(
@@ -1786,6 +1791,19 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
                 weight_tensors = [
                     fake_int4_quantization_ste(w, group_size)
+                    for w in weight_tensors
+                ]
+            elif os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1":
+                from megatron.core.fusions.fused_nvfp4_qdq import (
+                    current_nvfp4_qdq_config,
+                    fake_nvfp4_quantization_ste,
+                )
+
+                if self._nvfp4_qat_config is None:
+                    self._nvfp4_qat_config = current_nvfp4_qdq_config()
+
+                weight_tensors = [
+                    fake_nvfp4_quantization_ste(w, self._nvfp4_qat_config)
                     for w in weight_tensors
                 ]
 
