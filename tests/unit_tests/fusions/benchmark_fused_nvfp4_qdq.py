@@ -1,22 +1,23 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Benchmark fused NVFP4 QDQ against the former fake-QAT TE round trip.
+"""Benchmark grouped fused NVFP4 QDQ against the former TE fake-QAT loop.
 
 The ``torch.utils.benchmark`` methodology follows Transformer Engine commit
 83e230873f00676d4966ca151de22c8bfc68a77f. The benchmark shape is written as
-``block-axis x rows`` and stored as a contiguous ``[rows, block-axis]`` tensor,
-so every 1x16 NVFP4 block lies along the first reported dimension. It mirrors
-``TEGroupedLinear._get_weight_tensors`` with ``num_gemms=8`` and
-``single_grouped_weight=False`` by timing the complete
-``for w in weight_tensors`` loop over eight discrete equal-shaped Parameters.
-The primary speedup compares complete user-visible loops:
+``block-axis x rows`` and stored in one contiguous ``[G, rows, block-axis]``
+Parameter. Every 1x16 NVFP4 block therefore lies along the first reported
+dimension.
 
-* naive: pad + TE quantize + TE dequantize + crop + contiguous;
-* fused: PyTorch FP32 per-tensor amax + register-resident CuTe DSL QDQ.
+The primary comparison times complete user-visible operations:
 
-The separately labeled precomputed-amax API number still includes output
-allocation, TVM-FFI argument marshalling, and host launch overhead. It is a
-diagnostic and is not used for the primary speedup claim.
+* naive TE: the exact pad + quantize + dequantize + crop + contiguous expression
+  over zero-copy 2D unbound weight slices;
+* grouped fused: one rank-3 QAT call, including the vectorized PyTorch FP32 amax,
+  STE wrapper, output allocation, and register-resident CuTe DSL QDQ launch.
+
+The separately labeled singleton fused loop applies the same high-level fused
+API to G zero-copy ``[1, rows, block-axis]`` views. It attributes the benefit of
+the grouped launch and grouped amax without adding a stack to the timed path.
 """
 
 from __future__ import annotations
@@ -34,14 +35,13 @@ import transformer_engine.pytorch as te
 from megatron.core.fusions.fused_nvfp4_qdq import (
     NVFP4QDQConfig,
     NVFP4QDQErrorMode,
-    compute_nvfp4_amax,
     fake_nvfp4_quantization_ste,
-    fused_nvfp4_qdq,
 )
 
 
 DEFAULT_LOGICAL_SHAPES = [(6144, 4096)]
-DEFAULT_NUM_WEIGHTS = 8
+DEFAULT_GROUPS = 8
+MAX_GROUPS = 2048
 
 
 def _configs() -> list[tuple[str, NVFP4QDQConfig]]:
@@ -112,7 +112,7 @@ def _benchmark_case(
     logical_shape: tuple[int, int],
     dtype: torch.dtype,
     config: NVFP4QDQConfig,
-    num_weights: int,
+    groups: int,
     min_run_time: float,
     repeats: int,
 ) -> tuple[list[float], list[float], list[float]]:
@@ -128,36 +128,62 @@ def _benchmark_case(
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     block_axis, rows = logical_shape
-    weight_tensors = [
-        torch.nn.Parameter(
-            torch.randn((rows, block_axis), dtype=dtype, device="cuda")
-        )
-        for _ in range(num_weights)
-    ]
-    for w in weight_tensors:
-        w.main_grad = torch.empty_like(w)
-    amax_tensors = [compute_nvfp4_amax(w) for w in weight_tensors]
+    weight = torch.nn.Parameter(
+        torch.randn((groups, rows, block_axis), dtype=dtype, device="cuda")
+    )
+    weight.main_grad = torch.empty_like(weight)
+
+    # Build only zero-copy views outside the timed paths. The TE baseline consumes
+    # rank-2 slices, while the pre-grouping fused diagnostic consumes G singleton
+    # rank-3 slices. Neither path performs a stack or clone.
+    weight_slices = tuple(weight.unbind(0))
+    main_grad_slices = tuple(weight.main_grad.unbind(0))
+    singleton_weights = tuple(
+        weight_slice.unsqueeze(0) for weight_slice in weight_slices
+    )
+    singleton_main_grads = tuple(
+        main_grad_slice.unsqueeze(0) for main_grad_slice in main_grad_slices
+    )
+    for weight_slice, main_grad_slice in zip(weight_slices, main_grad_slices):
+        weight_slice.main_grad = main_grad_slice
+    for singleton_weight, singleton_main_grad in zip(
+        singleton_weights, singleton_main_grads
+    ):
+        singleton_weight.main_grad = singleton_main_grad
+
     quantizer = _make_te_quantizer(config)
 
     def naive() -> list[torch.Tensor]:
-        return [_naive_te_fake_qat(w, quantizer) for w in weight_tensors]
-
-    def fused_end_to_end() -> list[torch.Tensor]:
-        return [fake_nvfp4_quantization_ste(w, config) for w in weight_tensors]
-
-    def fused_precomputed_amax() -> list[torch.Tensor]:
         return [
-            fused_nvfp4_qdq(w, amax, config)
-            for w, amax in zip(weight_tensors, amax_tensors)
+            _naive_te_fake_qat(weight_slice, quantizer)
+            for weight_slice in weight_slices
+        ]
+
+    def grouped_fused() -> torch.Tensor:
+        return fake_nvfp4_quantization_ste(weight, config)
+
+    def singleton_fused_loop() -> list[torch.Tensor]:
+        return [
+            fake_nvfp4_quantization_ste(singleton_weight, config)
+            for singleton_weight in singleton_weights
         ]
 
     # Warm native TE and every compiled CuTe specialization before timing.
-    # Both primary closures retain their production QAT autograd wrappers.
     expected = naive()
-    actual = fused_end_to_end()
-    for weight_idx, (expected_weight, actual_weight) in enumerate(
-        zip(expected, actual)
+    actual = grouped_fused()
+    singleton_actual = singleton_fused_loop()
+    if tuple(actual.shape) != tuple(weight.shape) or not actual.is_contiguous():
+        raise AssertionError(
+            f"grouped fused QDQ returned shape {tuple(actual.shape)} "
+            f"with contiguous={actual.is_contiguous()}"
+        )
+    if actual.main_grad is not weight.main_grad:
+        raise AssertionError("grouped fused QDQ did not preserve the packed main_grad")
+    for weight_idx, (expected_weight, singleton_weight) in enumerate(
+        zip(expected, singleton_actual)
     ):
+        actual_weight = actual[weight_idx]
+        singleton_weight_2d = singleton_weight[0]
         if not torch.equal(
             expected_weight.detach().view(torch.uint16),
             actual_weight.detach().view(torch.uint16),
@@ -170,27 +196,40 @@ def _benchmark_case(
                 f"fused QDQ weight {weight_idx} differs from TE in "
                 f"{mismatch_count} elements"
             )
-        input_main_grad = weight_tensors[weight_idx].main_grad
-        if (
-            expected_weight.main_grad is not input_main_grad
-            or actual_weight.main_grad is not input_main_grad
+        if not torch.equal(
+            expected_weight.detach().view(torch.uint16),
+            singleton_weight_2d.detach().view(torch.uint16),
         ):
-            raise AssertionError(f"weight {weight_idx} did not preserve main_grad")
-    del expected, actual
-    fused_precomputed_amax()
+            mismatch_count = torch.count_nonzero(
+                expected_weight.detach().view(torch.uint16)
+                != singleton_weight_2d.detach().view(torch.uint16)
+            ).item()
+            raise AssertionError(
+                f"singleton fused QDQ weight {weight_idx} differs from TE in "
+                f"{mismatch_count} elements"
+            )
+        if expected_weight.main_grad is not main_grad_slices[weight_idx]:
+            raise AssertionError(
+                f"naive TE QDQ weight {weight_idx} did not preserve its main_grad"
+            )
+        if singleton_weight.main_grad is not singleton_main_grads[weight_idx]:
+            raise AssertionError(
+                f"singleton fused QDQ weight {weight_idx} did not preserve its main_grad"
+            )
+    del expected, actual, singleton_actual
     torch.cuda.synchronize()
 
     naive_us = []
-    fused_e2e_us = []
-    precomputed_amax_us = []
+    grouped_fused_us = []
+    singleton_fused_us = []
     for _ in range(repeats):
         # Interleaved A/B/A guards the primary comparison against clock drift
         # and neighboring-workload interference on a shared GPU node.
         naive_us.append(_median_us(naive, min_run_time))
-        fused_e2e_us.append(_median_us(fused_end_to_end, min_run_time))
+        grouped_fused_us.append(_median_us(grouped_fused, min_run_time))
         naive_us.append(_median_us(naive, min_run_time))
-        precomputed_amax_us.append(_median_us(fused_precomputed_amax, min_run_time))
-    return naive_us, fused_e2e_us, precomputed_amax_us
+        singleton_fused_us.append(_median_us(singleton_fused_loop, min_run_time))
+    return naive_us, grouped_fused_us, singleton_fused_us
 
 
 def _format_samples(samples: list[float]) -> str:
@@ -221,10 +260,22 @@ def _parse_shape(value: str) -> tuple[int, int]:
     return shape
 
 
+def _parse_groups(value: str) -> int:
+    try:
+        groups = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("groups must be an integer") from exc
+    if groups < 1 or groups > MAX_GROUPS:
+        raise argparse.ArgumentTypeError(
+            f"groups must be between 1 and {MAX_GROUPS}, inclusive"
+        )
+    return groups
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", action="append", type=_parse_shape, dest="shapes")
-    parser.add_argument("--num-weights", type=int, default=DEFAULT_NUM_WEIGHTS)
+    parser.add_argument("--groups", type=_parse_groups, default=DEFAULT_GROUPS)
     parser.add_argument("--dtype", choices=("bf16", "fp16", "both"), default="both")
     parser.add_argument("--min-run-time", type=float, default=1.0)
     parser.add_argument("--repeats", type=int, default=3)
@@ -246,8 +297,6 @@ def main() -> None:
         raise ValueError("--min-run-time must be positive")
     if args.repeats <= 0:
         raise ValueError("--repeats must be positive")
-    if args.num_weights <= 0:
-        raise ValueError("--num-weights must be positive")
     available, reason = te.is_nvfp4_available(return_reason=True)
     if not available:
         raise RuntimeError(reason)
@@ -268,44 +317,56 @@ def main() -> None:
     print(f"cutlass_dsl={getattr(cutlass, '__version__', 'unknown')}")
     print(f"min_run_time_s={args.min_run_time}")
     print(f"repeats={args.repeats}")
-    print(f"num_weights={args.num_weights}")
-    print(f"num_gemms={args.num_weights}")
-    print("single_grouped_weight=false")
+    print(f"groups={args.groups}")
+    print(f"num_gemms={args.groups}")
     print("main_grad_present=true")
     print("shape_contract=logical_block_axis_x_rows")
-    print("tensor_layout=contiguous_[rows,block_axis]")
+    print("primary_tensor_layout=one_contiguous_Parameter_[G,rows,block_axis]")
+    print("naive_te_input_views=zero_copy_unbind_[rows,block_axis]")
+    print("singleton_fused_input_views=zero_copy_unsqueeze_[1,rows,block_axis]")
+    print("no_stack_or_clone_in_timed_paths=true")
+    print(
+        "grouped_timing_includes=vectorized_fp32_amax,STE,output_allocation,QDQ_launch"
+    )
+    print(
+        "timing_excludes=input_initialization,view_creation,quantizer_creation,warmup"
+    )
     for block_axis, rows in shapes:
         print(f"in_features={block_axis}")
         print(f"out_features={rows}")
-        print(f"stored_weight_shape=[{rows},{block_axis}]")
-    print("primary_order=naive/fused/naive per repeat")
+        print(f"stored_weight_shape=[{args.groups},{rows},{block_axis}]")
+    print("primary_order=naive/grouped-fused/naive per repeat")
+    print("diagnostic_order=singleton-fused after primary A/B/A")
     print("NVTE_USE_FAST_MATH=0")
     print()
     print(
-        "| dtype | logical shape (block-axis x rows) | mode | "
-        f"naive TE {args.num_weights}-weight loop median [A/B/A raw] (us) | "
-        f"fused QAT {args.num_weights}-weight loop median [raw] (us) | "
-        f"precomputed-amax {args.num_weights}-weight loop median [raw] (us) | "
-        "end-to-end speedup |"
+        "| dtype | stored shape [G, rows, block-axis] | "
+        "logical shape (block-axis x rows) | mode | "
+        f"naive TE {args.groups}-slice loop median [A/B/A raw] (us) | "
+        "grouped fused QAT one-call median [raw] (us) | "
+        f"singleton fused QAT {args.groups}-call loop diagnostic median [raw] (us) | "
+        "grouped vs naive | grouped vs singleton |"
     )
-    print("|---|---:|---|---:|---:|---:|---:|")
+    print("|---|---|---:|---|---:|---:|---:|---:|---:|")
     for dtype in dtypes:
         for shape in shapes:
             for label, config in _configs():
-                naive_us, fused_e2e_us, precomputed_amax_us = _benchmark_case(
+                naive_us, grouped_fused_us, singleton_fused_us = _benchmark_case(
                     shape,
                     dtype,
                     config,
-                    args.num_weights,
+                    args.groups,
                     args.min_run_time,
                     args.repeats,
                 )
                 print(
-                    f"| {str(dtype).removeprefix('torch.')} | {shape[0]}x{shape[1]} | "
+                    f"| {str(dtype).removeprefix('torch.')} | "
+                    f"[{args.groups},{shape[1]},{shape[0]}] | {shape[0]}x{shape[1]} | "
                     f"{label} | {_format_samples(naive_us)} | "
-                    f"{_format_samples(fused_e2e_us)} | "
-                    f"{_format_samples(precomputed_amax_us)} | "
-                    f"{_sample_median(naive_us) / _sample_median(fused_e2e_us):.3f}x |",
+                    f"{_format_samples(grouped_fused_us)} | "
+                    f"{_format_samples(singleton_fused_us)} | "
+                    f"{_sample_median(naive_us) / _sample_median(grouped_fused_us):.3f}x | "
+                    f"{_sample_median(singleton_fused_us) / _sample_median(grouped_fused_us):.3f}x |",
                     flush=True,
                 )
 
