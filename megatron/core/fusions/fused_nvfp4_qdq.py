@@ -846,62 +846,37 @@ def _standard_quantize(
 
 
 @cute.jit
-def _candidate_errors_fp16(
-    original: tuple,
-    lo4: Uint32,
-    hi4: Uint32,
-    scale4: Uint32,
-    lo6: Uint32,
-    hi6: Uint32,
-    scale6: Uint32,
-    global_encode_scale: Float32,
-    config: NVFP4QDQConfig,
-) -> tuple[Float32, Float32]:
-    """Accumulate both FP16-product candidate errors with one original scaling pass."""
-    error4 = Float32(0.0)
-    error6 = Float32(0.0)
-    for pair_idx in cutlass.range_constexpr(8):
-        if cutlass.const_expr(pair_idx < 4):
-            packed4 = lo4 >> Uint32(8 * pair_idx)
-            packed6 = lo6 >> Uint32(8 * pair_idx)
-        else:
-            packed4 = hi4 >> Uint32(8 * (pair_idx - 4))
-            packed6 = hi6 >> Uint32(8 * (pair_idx - 4))
-        candidate40, candidate41 = _scaled_e2m1x2_e4m3_to_f32x2(packed4, scale4)
-        candidate60, candidate61 = _scaled_e2m1x2_e4m3_to_f32x2(packed6, scale6)
-        original0 = _fmul_rn(original[2 * pair_idx], global_encode_scale)
-        original1 = _fmul_rn(original[2 * pair_idx + 1], global_encode_scale)
-        diff40 = _fsub_rn(candidate40, original0)
-        diff41 = _fsub_rn(candidate41, original1)
-        diff60 = _fsub_rn(candidate60, original0)
-        diff61 = _fsub_rn(candidate61, original1)
-        if cutlass.const_expr(config.error_mode == NVFP4QDQErrorMode.MSE):
-            term40 = _fmul_rn(diff40, diff40)
-            term41 = _fmul_rn(diff41, diff41)
-            term60 = _fmul_rn(diff60, diff60)
-            term61 = _fmul_rn(diff61, diff61)
-        else:
-            term40 = _fabs(diff40)
-            term41 = _fabs(diff41)
-            term60 = _fabs(diff60)
-            term61 = _fabs(diff61)
-        error4 = _fadd_rn(error4, term40)
-        error4 = _fadd_rn(error4, term41)
-        error6 = _fadd_rn(error6, term60)
-        error6 = _fadd_rn(error6, term61)
-    return error4, error6
-
-
-@cute.jit
-def _candidate_error_exact(
+def _candidate_error(
     original: tuple,
     lo: Uint32,
     hi: Uint32,
     scale: Uint32,
     global_amax: Float32,
+    global_encode_scale: Float32,
     config: NVFP4QDQConfig,
 ) -> Float32:
     error = Float32(0.0)
+    if cutlass.const_expr(config.error_use_fp16):
+        for pair_idx in cutlass.range_constexpr(8):
+            if cutlass.const_expr(pair_idx < 4):
+                packed_pair = lo >> Uint32(8 * pair_idx)
+            else:
+                packed_pair = hi >> Uint32(8 * (pair_idx - 4))
+            candidate0, candidate1 = _scaled_e2m1x2_e4m3_to_f32x2(packed_pair, scale)
+            original0 = _fmul_rn(original[2 * pair_idx], global_encode_scale)
+            original1 = _fmul_rn(original[2 * pair_idx + 1], global_encode_scale)
+            diff0 = _fsub_rn(candidate0, original0)
+            diff1 = _fsub_rn(candidate1, original1)
+            if cutlass.const_expr(config.error_mode == NVFP4QDQErrorMode.MSE):
+                term0 = _fmul_rn(diff0, diff0)
+                term1 = _fmul_rn(diff1, diff1)
+            else:
+                term0 = _fabs(diff0)
+                term1 = _fabs(diff1)
+            error = _fadd_rn(error, term0)
+            error = _fadd_rn(error, term1)
+        return error
+
     denominator = Float32(float(6 * config.e4m3_max))
     scale_f32 = _cvt_e4m3_to_f32(scale)
     for pair_idx in cutlass.range_constexpr(8):
@@ -955,25 +930,12 @@ def _four_over_six_quantize(
     inv6 = _candidate_inverse_scale(scale6_f32, global_decode_scale)
     lo4, hi4 = _scale_pack_e2m1(values, inv4)
     lo6, hi6 = _scale_pack_e2m1(values, inv6)
-    if cutlass.const_expr(config.error_use_fp16):
-        error4, error6 = _candidate_errors_fp16(
-            values,
-            lo4,
-            hi4,
-            scale4,
-            lo6,
-            hi6,
-            scale6,
-            global_encode_scale,
-            config,
-        )
-    else:
-        error4 = _candidate_error_exact(
-            values, lo4, hi4, scale4, global_amax, config
-        )
-        error6 = _candidate_error_exact(
-            values, lo6, hi6, scale6, global_amax, config
-        )
+    error4 = _candidate_error(
+        values, lo4, hi4, scale4, global_amax, global_encode_scale, config
+    )
+    error6 = _candidate_error(
+        values, lo6, hi6, scale6, global_amax, global_encode_scale, config
+    )
 
     # Strict comparison is part of the contract: ties select map-to-6.
     selected_scale = scale6
