@@ -2,9 +2,11 @@
 
 """Benchmark fused NVFP4 QDQ against the former fake-QAT TE round trip.
 
-The model-like shape list and ``torch.utils.benchmark`` methodology follow
-Transformer Engine commit 83e230873f00676d4966ca151de22c8bfc68a77f. The
-primary speedup compares complete user-visible expressions:
+The ``torch.utils.benchmark`` methodology follows Transformer Engine commit
+83e230873f00676d4966ca151de22c8bfc68a77f. The benchmark shape is written as
+``block-axis x rows`` and stored as a contiguous ``[rows, block-axis]`` tensor,
+so every 1x16 NVFP4 block lies along the first reported dimension. The primary
+speedup compares complete user-visible expressions:
 
 * naive: pad + TE quantize + TE dequantize + crop + contiguous;
 * fused: PyTorch FP32 per-tensor amax + register-resident CuTe DSL QDQ.
@@ -35,28 +37,7 @@ from megatron.core.fusions.fused_nvfp4_qdq import (
 )
 
 
-BENCHMARK_SHAPES = [
-    (8192, 5120),
-    (8192, 10240),
-    (8192, 2560),
-    (8192, 11328),
-    (8192, 512),
-    (8192, 3584),
-    (5120, 8192),
-    (10240, 8192),
-    (2560, 8192),
-    (11328, 8192),
-    (512, 8192),
-    (3584, 8192),
-    (4096, 16384),
-    (14336, 16384),
-]
-DEFAULT_SHAPES = [
-    (8192, 512),
-    (8192, 3584),
-    (3584, 8192),
-    (4096, 16384),
-]
+DEFAULT_LOGICAL_SHAPES = [(6144, 4096)]
 
 
 def _configs() -> list[tuple[str, NVFP4QDQConfig]]:
@@ -120,7 +101,7 @@ def _median_us(function: Callable[[], torch.Tensor], min_run_time: float) -> flo
 
 
 def _benchmark_case(
-    shape: tuple[int, int],
+    logical_shape: tuple[int, int],
     dtype: torch.dtype,
     config: NVFP4QDQConfig,
     min_run_time: float,
@@ -137,7 +118,10 @@ def _benchmark_case(
     )
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
-    x = torch.randn(shape, dtype=dtype, device="cuda", requires_grad=True)
+    block_axis, rows = logical_shape
+    x = torch.randn(
+        (rows, block_axis), dtype=dtype, device="cuda", requires_grad=True
+    )
     amax = compute_nvfp4_amax(x)
     quantizer = _make_te_quantizer(config)
 
@@ -192,15 +176,15 @@ def _sample_median(samples: list[float]) -> float:
 
 def _parse_shape(value: str) -> tuple[int, int]:
     try:
-        m, n = value.lower().split("x", maxsplit=1)
-        shape = int(m), int(n)
+        block_axis, rows = value.lower().split("x", maxsplit=1)
+        shape = int(block_axis), int(rows)
     except (TypeError, ValueError) as exc:
         raise argparse.ArgumentTypeError(
-            "shapes must use MxN, for example 8192x3584"
+            "shapes must use BLOCK_AXISxROWS, for example 6144x4096"
         ) from exc
-    if shape[0] <= 0 or shape[1] <= 0 or shape[1] % 16 != 0:
+    if shape[0] <= 0 or shape[1] <= 0 or shape[0] % 16 != 0:
         raise argparse.ArgumentTypeError(
-            "M and N must be positive and N must be divisible by 16"
+            "BLOCK_AXIS and ROWS must be positive and BLOCK_AXIS must be divisible by 16"
         )
     return shape
 
@@ -208,7 +192,6 @@ def _parse_shape(value: str) -> tuple[int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", action="append", type=_parse_shape, dest="shapes")
-    parser.add_argument("--full-shapes", action="store_true")
     parser.add_argument("--dtype", choices=("bf16", "fp16", "both"), default="both")
     parser.add_argument("--min-run-time", type=float, default=1.0)
     parser.add_argument("--repeats", type=int, default=3)
@@ -234,7 +217,7 @@ def main() -> None:
     if not available:
         raise RuntimeError(reason)
 
-    shapes = args.shapes or (BENCHMARK_SHAPES if args.full_shapes else DEFAULT_SHAPES)
+    shapes = args.shapes or DEFAULT_LOGICAL_SHAPES
     dtypes = {
         "bf16": [torch.bfloat16],
         "fp16": [torch.float16],
@@ -250,11 +233,14 @@ def main() -> None:
     print(f"cutlass_dsl={getattr(cutlass, '__version__', 'unknown')}")
     print(f"min_run_time_s={args.min_run_time}")
     print(f"repeats={args.repeats}")
+    print("shape_contract=logical_block_axis_x_rows")
+    print("tensor_layout=contiguous_[rows,block_axis]")
     print("primary_order=naive/fused/naive per repeat")
     print("NVTE_USE_FAST_MATH=0")
     print()
     print(
-        "| dtype | shape | mode | naive TE QDQ median [A/B/A raw] (us) | "
+        "| dtype | logical shape (block-axis x rows) | mode | "
+        "naive TE QDQ median [A/B/A raw] (us) | "
         "fused QAT median [raw] (us) | precomputed-amax API median [raw] (us) | "
         "end-to-end speedup |"
     )
