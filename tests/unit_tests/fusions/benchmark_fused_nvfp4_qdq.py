@@ -9,8 +9,9 @@ primary speedup compares complete user-visible expressions:
 * naive: pad + TE quantize + TE dequantize + crop + contiguous;
 * fused: PyTorch FP32 per-tensor amax + register-resident CuTe DSL QDQ.
 
-The separately labeled kernel-only number reuses a precomputed amax and is not
-used for the primary speedup claim.
+The separately labeled precomputed-amax API number still includes output
+allocation, DLPack descriptor construction, and host launch overhead. It is a
+diagnostic and is not used for the primary speedup claim.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from megatron.core.fusions.fused_nvfp4_qdq import (
     NVFP4QDQConfig,
     NVFP4QDQErrorMode,
     compute_nvfp4_amax,
+    fake_nvfp4_quantization_ste,
     fused_nvfp4_qdq,
 )
 
@@ -122,14 +124,20 @@ def _benchmark_case(
     dtype: torch.dtype,
     config: NVFP4QDQConfig,
     min_run_time: float,
-) -> tuple[float, float, float]:
+    repeats: int,
+) -> tuple[list[float], list[float], list[float]]:
     os.environ["NVTE_USE_FAST_MATH"] = "0"
+    os.environ["NVTE_NVFP4_4OVER6"] = "weights" if config.use_4over6 else "none"
+    os.environ["NVTE_NVFP4_4OVER6_E4M3_USE_256"] = (
+        "weights" if config.e4m3_max == 256 else "none"
+    )
+    os.environ["NVTE_NVFP4_4OVER6_ERR_MODE"] = config.error_mode.name
     os.environ["NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH"] = (
         "1" if config.error_use_fp16 else "0"
     )
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
-    x = torch.randn(shape, dtype=dtype, device="cuda")
+    x = torch.randn(shape, dtype=dtype, device="cuda", requires_grad=True)
     amax = compute_nvfp4_amax(x)
     quantizer = _make_te_quantizer(config)
 
@@ -137,20 +145,49 @@ def _benchmark_case(
         return _naive_te_qdq(x, quantizer)
 
     def fused_end_to_end() -> torch.Tensor:
-        return fused_nvfp4_qdq(x, compute_nvfp4_amax(x), config)
+        return fake_nvfp4_quantization_ste(x, config)
 
-    def fused_kernel_only() -> torch.Tensor:
+    def fused_precomputed_amax() -> torch.Tensor:
         return fused_nvfp4_qdq(x, amax, config)
 
     # Warm native TE and every compiled CuTe specialization before timing.
-    naive()
-    fused_end_to_end()
-    fused_kernel_only()
+    # Both primary closures retain their production QAT autograd wrappers.
+    expected = naive()
+    actual = fused_end_to_end()
+    if not torch.equal(
+        expected.detach().view(torch.uint16), actual.detach().view(torch.uint16)
+    ):
+        mismatch_count = torch.count_nonzero(
+            expected.detach().view(torch.uint16) != actual.detach().view(torch.uint16)
+        ).item()
+        raise AssertionError(f"fused QDQ differs from TE in {mismatch_count} elements")
+    fused_precomputed_amax()
     torch.cuda.synchronize()
-    naive_us = _median_us(naive, min_run_time)
-    fused_e2e_us = _median_us(fused_end_to_end, min_run_time)
-    fused_kernel_us = _median_us(fused_kernel_only, min_run_time)
-    return naive_us, fused_e2e_us, fused_kernel_us
+
+    naive_us = []
+    fused_e2e_us = []
+    precomputed_amax_us = []
+    for _ in range(repeats):
+        # Interleaved A/B/A guards the primary comparison against clock drift
+        # and neighboring-workload interference on a shared GPU node.
+        naive_us.append(_median_us(naive, min_run_time))
+        fused_e2e_us.append(_median_us(fused_end_to_end, min_run_time))
+        naive_us.append(_median_us(naive, min_run_time))
+        precomputed_amax_us.append(_median_us(fused_precomputed_amax, min_run_time))
+    return naive_us, fused_e2e_us, precomputed_amax_us
+
+
+def _format_samples(samples: list[float]) -> str:
+    raw = ", ".join(f"{sample:.3f}" for sample in samples)
+    return f"{_sample_median(samples):.3f} [{raw}]"
+
+
+def _sample_median(samples: list[float]) -> float:
+    ordered = sorted(samples)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
 
 
 def _parse_shape(value: str) -> tuple[int, int]:
@@ -174,15 +211,25 @@ def main() -> None:
     parser.add_argument("--full-shapes", action="store_true")
     parser.add_argument("--dtype", choices=("bf16", "fp16", "both"), default="both")
     parser.add_argument("--min-run-time", type=float, default=1.0)
+    parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
         "--image",
         default=os.getenv("MILES_IMAGE", "unknown"),
         help="Explicit Miles image tag or digest for the output metadata.",
     )
+    parser.add_argument(
+        "--commit",
+        default=os.getenv("MEGATRON_COMMIT", "unknown"),
+        help="Tested Megatron commit for output metadata.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if args.min_run_time <= 0.0:
+        raise ValueError("--min-run-time must be positive")
+    if args.repeats <= 0:
+        raise ValueError("--repeats must be positive")
     available, reason = te.is_nvfp4_available(return_reason=True)
     if not available:
         raise RuntimeError(reason)
@@ -195,28 +242,35 @@ def main() -> None:
     }[args.dtype]
 
     print(f"image={args.image}")
+    print(f"megatron_commit={args.commit}")
     print(f"gpu={torch.cuda.get_device_name()}")
     print(f"compute_capability={torch.cuda.get_device_capability()}")
     print(f"torch={torch.__version__} cuda={torch.version.cuda}")
     print(f"transformer_engine={transformer_engine.__version__}")
     print(f"cutlass_dsl={getattr(cutlass, '__version__', 'unknown')}")
     print(f"min_run_time_s={args.min_run_time}")
+    print(f"repeats={args.repeats}")
+    print("primary_order=naive/fused/naive per repeat")
+    print("NVTE_USE_FAST_MATH=0")
     print()
     print(
-        "| dtype | shape | mode | naive TE QDQ (us) | fused end-to-end (us) | "
-        "fused kernel-only (us) | end-to-end speedup |"
+        "| dtype | shape | mode | naive TE QDQ median [A/B/A raw] (us) | "
+        "fused QAT median [raw] (us) | precomputed-amax API median [raw] (us) | "
+        "end-to-end speedup |"
     )
     print("|---|---:|---|---:|---:|---:|---:|")
     for dtype in dtypes:
         for shape in shapes:
             for label, config in _configs():
-                naive_us, fused_e2e_us, fused_kernel_us = _benchmark_case(
-                    shape, dtype, config, args.min_run_time
+                naive_us, fused_e2e_us, precomputed_amax_us = _benchmark_case(
+                    shape, dtype, config, args.min_run_time, args.repeats
                 )
                 print(
                     f"| {str(dtype).removeprefix('torch.')} | {shape[0]}x{shape[1]} | "
-                    f"{label} | {naive_us:.3f} | {fused_e2e_us:.3f} | "
-                    f"{fused_kernel_us:.3f} | {naive_us / fused_e2e_us:.3f}x |",
+                    f"{label} | {_format_samples(naive_us)} | "
+                    f"{_format_samples(fused_e2e_us)} | "
+                    f"{_format_samples(precomputed_amax_us)} | "
+                    f"{_sample_median(naive_us) / _sample_median(fused_e2e_us):.3f}x |",
                     flush=True,
                 )
 

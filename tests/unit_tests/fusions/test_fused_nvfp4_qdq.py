@@ -4,8 +4,10 @@
 
 The data patterns and Four Over Six Cartesian matrix mirror FlashInfer's
 ``tests/utils/test_fp4_quantize.py::test_nvfp4_quantize_te_reference``. The
-oracle is Transformer Engine's native quantize-then-dequantize path because
-FlashInfer's per-tensor path has a different numerical contract.
+oracle follows Transformer Engine's strict
+``tests/pytorch/nvfp4/test_nvfp4_quantize_exact.py`` test and calls TE's native
+quantize-then-dequantize path because FlashInfer's per-tensor path has a
+different numerical contract.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from megatron.core.fusions.fused_nvfp4_qdq import (  # noqa: E402
     NVFP4QDQConfig,
     NVFP4QDQErrorMode,
     compute_nvfp4_amax,
+    current_nvfp4_qdq_config,
     fake_nvfp4_quantization_ste,
     fused_nvfp4_qdq,
 )
@@ -97,7 +100,13 @@ def _make_input(
         row[1::2] = base + eps
         return row.unsqueeze(0).repeat(m, 1).to(dtype=dtype)
     if init_data == "zeros":
-        return torch.zeros(shape, dtype=dtype, device="cuda")
+        # Alternate signed zeros so the integer-view equality below exercises
+        # TE's E2M1 sign-bit contract for zero-amax blocks.
+        return (
+            torch.tensor([-0.0, 0.0], dtype=torch.float32, device="cuda")
+            .repeat(m, n // 2)
+            .to(dtype=dtype)
+        )
     if init_data == "maxes":
         return torch.full(shape, torch.finfo(dtype).max, dtype=dtype, device="cuda")
     raise ValueError(f"Unknown init_data: {init_data}")
@@ -182,6 +191,101 @@ def test_fused_nvfp4_qdq_uses_straight_through_gradient_and_preserves_main_grad(
     assert output.main_grad is main_grad
 
 
+@pytest.mark.parametrize(
+    ("four_over_six_scope", "e4m3_256_scope", "expected_enabled", "expected_max"),
+    [
+        (
+            four_over_six_scope,
+            e4m3_256_scope,
+            four_over_six_scope in ("weights", "all"),
+            expected_max,
+        )
+        for four_over_six_scope in ("none", "activations", "weights", "all")
+        for e4m3_256_scope in ("none", "activations", "weights", "all")
+        for expected_max in [
+            256
+            if four_over_six_scope in ("weights", "all")
+            and e4m3_256_scope in ("weights", "all")
+            else 448
+        ]
+    ],
+)
+@pytest.mark.parametrize(
+    ("error_mode", "error_use_fp16"),
+    [("MAE", False), ("MAE", True), ("MSE", False), ("MSE", True)],
+)
+def test_current_nvfp4_qdq_config_maps_full_latest_te_env_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    four_over_six_scope: str,
+    e4m3_256_scope: str,
+    expected_enabled: bool,
+    expected_max: int,
+    error_mode: str,
+    error_use_fp16: bool,
+) -> None:
+    monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6", four_over_six_scope)
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6_E4M3_USE_256", e4m3_256_scope)
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6_ERR_MODE", error_mode)
+    monkeypatch.setenv(
+        "NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH", "1" if error_use_fp16 else "0"
+    )
+    config = current_nvfp4_qdq_config()
+    assert config.use_4over6 is expected_enabled
+    assert config.e4m3_max == expected_max
+    assert config.error_mode is NVFP4QDQErrorMode[error_mode]
+    # The latest TE meaning is FP16-rounded candidate error, not a general
+    # instruction-level fast-math toggle.
+    assert config.error_use_fp16 is (expected_enabled and error_use_fp16)
+
+
+@pytest.mark.parametrize("legacy_scope", ["inputs", "gradients"])
+def test_current_nvfp4_qdq_config_rejects_stale_te_scopes(
+    monkeypatch: pytest.MonkeyPatch, legacy_scope: str
+) -> None:
+    monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6", legacy_scope)
+    with pytest.raises(ValueError, match="activations"):
+        current_nvfp4_qdq_config()
+
+
+def test_current_nvfp4_qdq_config_rejects_quant_fast_math(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NVTE_USE_FAST_MATH", "1")
+    with pytest.raises(ValueError, match="NVTE_USE_FAST_MATH=0"):
+        current_nvfp4_qdq_config()
+
+
+def test_te_grouped_linear_nvfp4_flag_routes_weights_to_fused_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.core.extensions import transformer_engine as te_extension
+    from megatron.core.fusions import fused_nvfp4_qdq as qdq_module
+
+    weight = torch.randn((2, 16), dtype=torch.bfloat16, device="cuda")
+    expected = torch.empty_like(weight)
+    calls = []
+
+    monkeypatch.setattr(te.GroupedLinear, "_get_weight_tensors", lambda _self: [weight])
+
+    def fake_fused_qdq(value: torch.Tensor, config: NVFP4QDQConfig) -> torch.Tensor:
+        assert config == NVFP4QDQConfig()
+        calls.append(value)
+        return expected
+
+    monkeypatch.setattr(qdq_module, "fake_nvfp4_quantization_ste", fake_fused_qdq)
+    monkeypatch.setenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0")
+    monkeypatch.setenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "1")
+    layer = te_extension.TEGroupedLinear.__new__(te_extension.TEGroupedLinear)
+    layer._nvfp4_qat_config = NVFP4QDQConfig()
+
+    actual = te_extension.TEGroupedLinear._get_weight_tensors(layer)
+
+    assert len(actual) == 1 and actual[0] is expected
+    assert len(calls) == 1 and calls[0] is weight
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_fused_nvfp4_qdq_rejects_unsupported_input_dtype(dtype: torch.dtype) -> None:
     x = torch.randn((2, 16), dtype=dtype, device="cuda")
@@ -192,4 +296,13 @@ def test_fused_nvfp4_qdq_rejects_unsupported_input_dtype(dtype: torch.dtype) -> 
 def test_fused_nvfp4_qdq_rejects_non_block_aligned_k() -> None:
     x = torch.randn((2, 17), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="K divisible by 16"):
+        fused_nvfp4_qdq(x, compute_nvfp4_amax(x), NVFP4QDQConfig())
+
+
+def test_fused_nvfp4_qdq_rejects_misaligned_contiguous_storage() -> None:
+    storage = torch.randn(33, dtype=torch.bfloat16, device="cuda")
+    x = storage[1:].view(2, 16)
+    assert x.is_contiguous()
+    assert x.data_ptr() % 16 != 0
+    with pytest.raises(ValueError, match="16-byte-aligned"):
         fused_nvfp4_qdq(x, compute_nvfp4_amax(x), NVFP4QDQConfig())

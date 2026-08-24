@@ -25,20 +25,21 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Optional
 
-import cuda.bindings.driver as cuda  # type: ignore
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 _FP32_MAX = 3.4028234663852886e38
 _FP4_BLOCK_SIZE = 16
-_THREADS = 512
-_BLOCKS_PER_SM = 4
+_STANDARD_THREADS = 256
+_STANDARD_BLOCKS_PER_SM = 4
+_4OVER6_THREADS = 128
+_4OVER6_BLOCKS_PER_SM = 4
+_INT32_MAX = 2**31 - 1
 
 
 class NVFP4QDQErrorMode(IntEnum):
@@ -77,9 +78,9 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 def _env_applies_to_weights(name: str, default: str) -> bool:
     value = os.getenv(name, default).strip().lower()
-    if value not in ("none", "inputs", "weights", "gradients", "all"):
+    if value not in ("none", "weights", "activations", "all"):
         raise ValueError(
-            f"{name} must be one of none, inputs, weights, gradients, or all; got {value!r}."
+            f"{name} must be one of none, weights, activations, or all; got {value!r}."
         )
     return value in ("weights", "all")
 
@@ -735,60 +736,72 @@ def _block_amax(words: tuple, is_bfloat16: bool) -> Float32:
 
 
 @cute.jit
-def _scale_values(values: tuple, scale: Float32) -> tuple:
-    scaled = ()
-    for i in cutlass.range_constexpr(16):
-        scaled = scaled + (_fmul_rn(values[i], scale),)
-    return scaled
-
-
-@cute.jit
-def _pack_e2m1(values: tuple) -> tuple[Uint32, Uint32]:
+def _scale_pack_e2m1(values: tuple, scale: Float32) -> tuple[Uint32, Uint32]:
+    """Scale and immediately pack each eight-value half to limit live FP32 state."""
     lo = _cvt_e2m1x8(
-        values[0],
-        values[1],
-        values[2],
-        values[3],
-        values[4],
-        values[5],
-        values[6],
-        values[7],
+        _fmul_rn(values[0], scale),
+        _fmul_rn(values[1], scale),
+        _fmul_rn(values[2], scale),
+        _fmul_rn(values[3], scale),
+        _fmul_rn(values[4], scale),
+        _fmul_rn(values[5], scale),
+        _fmul_rn(values[6], scale),
+        _fmul_rn(values[7], scale),
     )
     hi = _cvt_e2m1x8(
-        values[8],
-        values[9],
-        values[10],
-        values[11],
-        values[12],
-        values[13],
-        values[14],
-        values[15],
+        _fmul_rn(values[8], scale),
+        _fmul_rn(values[9], scale),
+        _fmul_rn(values[10], scale),
+        _fmul_rn(values[11], scale),
+        _fmul_rn(values[12], scale),
+        _fmul_rn(values[13], scale),
+        _fmul_rn(values[14], scale),
+        _fmul_rn(values[15], scale),
     )
     return lo, hi
 
 
 @cute.jit
-def _decode_e2m1(lo: Uint32, hi: Uint32) -> tuple:
-    values = ()
+def _scale_pack_input_words(
+    words: tuple, scale: Float32, is_bfloat16: bool
+) -> tuple[Uint32, Uint32]:
+    """Standard-path input conversion with at most eight scaled FP32 values live."""
+    scaled_lo = ()
     for i in cutlass.range_constexpr(4):
-        q0, q1 = _e2m1x2_to_f32x2(lo >> Uint32(8 * i))
-        values = values + (q0, q1)
-    for i in cutlass.range_constexpr(4):
-        q0, q1 = _e2m1x2_to_f32x2(hi >> Uint32(8 * i))
-        values = values + (q0, q1)
-    return values
+        if cutlass.const_expr(is_bfloat16):
+            value0, value1 = _bfloat2_to_f32x2(words[i])
+        else:
+            value0, value1 = _half2_to_f32x2(words[i])
+        scaled_lo = scaled_lo + (_fmul_rn(value0, scale), _fmul_rn(value1, scale))
+    lo = _cvt_e2m1x8(
+        scaled_lo[0],
+        scaled_lo[1],
+        scaled_lo[2],
+        scaled_lo[3],
+        scaled_lo[4],
+        scaled_lo[5],
+        scaled_lo[6],
+        scaled_lo[7],
+    )
 
-
-@cute.jit
-def _decode_scaled_fp16(lo: Uint32, hi: Uint32, scale: Uint32) -> tuple:
-    values = ()
-    for i in cutlass.range_constexpr(4):
-        q0, q1 = _scaled_e2m1x2_e4m3_to_f32x2(lo >> Uint32(8 * i), scale)
-        values = values + (q0, q1)
-    for i in cutlass.range_constexpr(4):
-        q0, q1 = _scaled_e2m1x2_e4m3_to_f32x2(hi >> Uint32(8 * i), scale)
-        values = values + (q0, q1)
-    return values
+    scaled_hi = ()
+    for i in cutlass.range_constexpr(4, 8):
+        if cutlass.const_expr(is_bfloat16):
+            value0, value1 = _bfloat2_to_f32x2(words[i])
+        else:
+            value0, value1 = _half2_to_f32x2(words[i])
+        scaled_hi = scaled_hi + (_fmul_rn(value0, scale), _fmul_rn(value1, scale))
+    hi = _cvt_e2m1x8(
+        scaled_hi[0],
+        scaled_hi[1],
+        scaled_hi[2],
+        scaled_hi[3],
+        scaled_hi[4],
+        scaled_hi[5],
+        scaled_hi[6],
+        scaled_hi[7],
+    )
+    return lo, hi
 
 
 @cute.jit
@@ -804,25 +817,25 @@ def _global_encode_scale(amax: Float32, e4m3_max: int) -> Float32:
 
 @cute.jit
 def _candidate_inverse_scale(
-    scale_f32: Float32, global_encode_scale: Float32, block_amax: Float32
+    scale_f32: Float32, global_decode_scale: Float32
 ) -> Float32:
-    global_decode_scale = _fdiv_rn(Float32(1.0), global_encode_scale)
     product = _fmul_rn(scale_f32, global_decode_scale)
-    inverse = _fmin(_fdiv_rn(Float32(1.0), product), Float32(_FP32_MAX))
-    if block_amax == Float32(0.0):
-        inverse = Float32(0.0)
-    return inverse
+    return _fmin(_fdiv_rn(Float32(1.0), product), Float32(_FP32_MAX))
 
 
 @cute.jit
 def _standard_quantize(
-    values: tuple, block_amax: Float32, global_encode_scale: Float32
+    words: tuple,
+    block_amax: Float32,
+    global_encode_scale: Float32,
+    is_bfloat16: bool,
 ) -> tuple[Uint32, Uint32, Uint32]:
     scale_high_precision = _normal_block_scale(block_amax, global_encode_scale)
     scale = _cvt_f32_to_e4m3(scale_high_precision)
     scale_f32 = _cvt_e4m3_to_f32(scale)
-    inverse = _candidate_inverse_scale(scale_f32, global_encode_scale, block_amax)
-    lo, hi = _pack_e2m1(_scale_values(values, inverse))
+    global_decode_scale = _fdiv_rn(Float32(1.0), global_encode_scale)
+    inverse = _candidate_inverse_scale(scale_f32, global_decode_scale)
+    lo, hi = _scale_pack_input_words(words, inverse, is_bfloat16)
     return scale, lo, hi
 
 
@@ -838,30 +851,54 @@ def _candidate_error(
 ) -> Float32:
     error = Float32(0.0)
     if cutlass.const_expr(config.error_use_fp16):
-        candidate = _decode_scaled_fp16(lo, hi, scale)
-        for i in cutlass.range_constexpr(16):
-            original_scaled = _fmul_rn(original[i], global_encode_scale)
-            diff = _fsub_rn(candidate[i], original_scaled)
-            if cutlass.const_expr(config.error_mode == NVFP4QDQErrorMode.MSE):
-                term = _fmul_rn(diff, diff)
+        for pair_idx in cutlass.range_constexpr(8):
+            if cutlass.const_expr(pair_idx < 4):
+                packed_pair = lo >> Uint32(8 * pair_idx)
             else:
-                term = _fabs(diff)
-            error = _fadd_rn(error, term)
+                packed_pair = hi >> Uint32(8 * (pair_idx - 4))
+            candidate0, candidate1 = _scaled_e2m1x2_e4m3_to_f32x2(packed_pair, scale)
+            original0 = _fmul_rn(original[2 * pair_idx], global_encode_scale)
+            original1 = _fmul_rn(original[2 * pair_idx + 1], global_encode_scale)
+            diff0 = _fsub_rn(candidate0, original0)
+            diff1 = _fsub_rn(candidate1, original1)
+            if cutlass.const_expr(config.error_mode == NVFP4QDQErrorMode.MSE):
+                term0 = _fmul_rn(diff0, diff0)
+                term1 = _fmul_rn(diff1, diff1)
+            else:
+                term0 = _fabs(diff0)
+                term1 = _fabs(diff1)
+            error = _fadd_rn(error, term0)
+            error = _fadd_rn(error, term1)
         return error
 
-    candidate = _decode_e2m1(lo, hi)
     denominator = Float32(float(6 * config.e4m3_max))
     scale_f32 = _cvt_e4m3_to_f32(scale)
-    for i in cutlass.range_constexpr(16):
-        dequant = _fmul_rn(candidate[i], scale_f32)
-        dequant = _fmul_rn(dequant, global_amax)
-        dequant = _fdiv_rn(dequant, denominator)
-        diff = _fsub_rn(dequant, original[i])
-        if cutlass.const_expr(config.error_mode == NVFP4QDQErrorMode.MSE):
-            term = _fmul_rn(diff, diff)
+    for pair_idx in cutlass.range_constexpr(8):
+        if cutlass.const_expr(pair_idx < 4):
+            packed_pair = lo >> Uint32(8 * pair_idx)
         else:
-            term = _fabs(diff)
-        error = _fadd_rn(error, term)
+            packed_pair = hi >> Uint32(8 * (pair_idx - 4))
+        candidate0, candidate1 = _e2m1x2_to_f32x2(packed_pair)
+
+        dequant0 = _fmul_rn(candidate0, scale_f32)
+        dequant0 = _fmul_rn(dequant0, global_amax)
+        dequant0 = _fdiv_rn(dequant0, denominator)
+        diff0 = _fsub_rn(dequant0, original[2 * pair_idx])
+        if cutlass.const_expr(config.error_mode == NVFP4QDQErrorMode.MSE):
+            term0 = _fmul_rn(diff0, diff0)
+        else:
+            term0 = _fabs(diff0)
+        error = _fadd_rn(error, term0)
+
+        dequant1 = _fmul_rn(candidate1, scale_f32)
+        dequant1 = _fmul_rn(dequant1, global_amax)
+        dequant1 = _fdiv_rn(dequant1, denominator)
+        diff1 = _fsub_rn(dequant1, original[2 * pair_idx + 1])
+        if cutlass.const_expr(config.error_mode == NVFP4QDQErrorMode.MSE):
+            term1 = _fmul_rn(diff1, diff1)
+        else:
+            term1 = _fabs(diff1)
+        error = _fadd_rn(error, term1)
     return error
 
 
@@ -873,75 +910,80 @@ def _four_over_six_quantize(
     global_encode_scale: Float32,
     config: NVFP4QDQConfig,
 ) -> tuple[Uint32, Uint32, Uint32]:
-    selected_scale = Uint32(0)
-    selected_lo = Uint32(0)
-    selected_hi = Uint32(0)
+    # TE intentionally associates this differently from standard NVFP4. Keep
+    # the zero-amax path in the same expression stream as TE as well: packing
+    # the candidates is what preserves negative-zero E2M1 sign bits.
+    scale6_hp = _fmul_rn(_fdiv_rn(block_amax, Float32(6.0)), global_encode_scale)
+    scale4_hp = _fmul_rn(scale6_hp, Float32(1.5))
+    scale4 = _cvt_f32_to_e4m3(_fmin(scale4_hp, Float32(448.0)))
+    scale6 = _cvt_f32_to_e4m3(_fmin(scale6_hp, Float32(448.0)))
+    scale4_f32 = _cvt_e4m3_to_f32(scale4)
+    scale6_f32 = _cvt_e4m3_to_f32(scale6)
+    global_decode_scale = _fdiv_rn(Float32(1.0), global_encode_scale)
+    inv4 = _candidate_inverse_scale(scale4_f32, global_decode_scale)
+    inv6 = _candidate_inverse_scale(scale6_f32, global_decode_scale)
+    lo4, hi4 = _scale_pack_e2m1(values, inv4)
+    lo6, hi6 = _scale_pack_e2m1(values, inv6)
+    error4 = _candidate_error(
+        values, lo4, hi4, scale4, global_amax, global_encode_scale, config
+    )
+    error6 = _candidate_error(
+        values, lo6, hi6, scale6, global_amax, global_encode_scale, config
+    )
 
-    if block_amax != Float32(0.0):
-        # TE intentionally associates this differently from standard NVFP4.
-        scale6_hp = _fmul_rn(_fdiv_rn(block_amax, Float32(6.0)), global_encode_scale)
-        scale4_hp = _fmul_rn(scale6_hp, Float32(1.5))
-        scale4 = _cvt_f32_to_e4m3(_fmin(scale4_hp, Float32(448.0)))
-        scale6 = _cvt_f32_to_e4m3(_fmin(scale6_hp, Float32(448.0)))
-        scale4_f32 = _cvt_e4m3_to_f32(scale4)
-        scale6_f32 = _cvt_e4m3_to_f32(scale6)
-        inv4 = _candidate_inverse_scale(scale4_f32, global_encode_scale, block_amax)
-        inv6 = _candidate_inverse_scale(scale6_f32, global_encode_scale, block_amax)
-        lo4, hi4 = _pack_e2m1(_scale_values(values, inv4))
-        lo6, hi6 = _pack_e2m1(_scale_values(values, inv6))
-        error4 = _candidate_error(
-            values, lo4, hi4, scale4, global_amax, global_encode_scale, config
-        )
-        error6 = _candidate_error(
-            values, lo6, hi6, scale6, global_amax, global_encode_scale, config
-        )
-
-        # Strict comparison is part of the contract: ties select map-to-6.
-        selected_scale = scale6
-        selected_lo = lo6
-        selected_hi = hi6
-        if error4 < error6:
-            selected_scale = scale4
-            selected_lo = lo4
-            selected_hi = hi4
+    # Strict comparison is part of the contract: ties select map-to-6.
+    selected_scale = scale6
+    selected_lo = lo6
+    selected_hi = hi6
+    if error4 < error6:
+        selected_scale = scale4
+        selected_lo = lo4
+        selected_hi = hi4
 
     return selected_scale, selected_lo, selected_hi
 
 
 @cute.jit
-def _dequantize(
+def _dequantize_pack_pair(
+    packed_pair: Uint32, final_scale: Float32, is_bfloat16: bool
+) -> Uint32:
+    q0, q1 = _e2m1x2_to_f32x2(packed_pair)
+    out0 = _fmul_rn(q0, final_scale)
+    out1 = _fmul_rn(q1, final_scale)
+    if cutlass.const_expr(is_bfloat16):
+        return _pack_f32x2_to_bfloat2(out0, out1)
+    return _pack_f32x2_to_half2(out0, out1)
+
+
+@cute.jit
+def _dequantize_store(
+    output: cute.Tensor,
+    offset: Int32,
     lo: Uint32,
     hi: Uint32,
     scale: Uint32,
     global_amax: Float32,
     e4m3_max: int,
-) -> tuple:
-    quantized = _decode_e2m1(lo, hi)
+    is_bfloat16: bool,
+) -> None:
+    """Dequantize, cast, and store one half-block at a time."""
     scale_f32 = _cvt_e4m3_to_f32(scale)
     final_scale = _fmul_rn(scale_f32, global_amax)
     final_scale = _fmul_rn(final_scale, Float32(1.0 / float(6 * e4m3_max)))
-    output = ()
-    for i in cutlass.range_constexpr(16):
-        output = output + (_fmul_rn(quantized[i], final_scale),)
-    return output
-
-
-@cute.jit
-def _store_output(
-    output: cute.Tensor, offset: Int32, values: tuple, is_bfloat16: bool
-) -> None:
-    packed = ()
-    for i in cutlass.range_constexpr(8):
-        if cutlass.const_expr(is_bfloat16):
-            pair = _pack_f32x2_to_bfloat2(values[2 * i], values[2 * i + 1])
-        else:
-            pair = _pack_f32x2_to_half2(values[2 * i], values[2 * i + 1])
-        packed = packed + (pair,)
 
     ptr0 = _get_ptr(output, offset)
+    out0 = _dequantize_pack_pair(lo, final_scale, is_bfloat16)
+    out1 = _dequantize_pack_pair(lo >> Uint32(8), final_scale, is_bfloat16)
+    out2 = _dequantize_pack_pair(lo >> Uint32(16), final_scale, is_bfloat16)
+    out3 = _dequantize_pack_pair(lo >> Uint32(24), final_scale, is_bfloat16)
+    _store_v4_u32(ptr0, out0, out1, out2, out3)
+
     ptr1 = _get_ptr(output, offset + Int32(8))
-    _store_v4_u32(ptr0, packed[0], packed[1], packed[2], packed[3])
-    _store_v4_u32(ptr1, packed[4], packed[5], packed[6], packed[7])
+    out4 = _dequantize_pack_pair(hi, final_scale, is_bfloat16)
+    out5 = _dequantize_pack_pair(hi >> Uint32(8), final_scale, is_bfloat16)
+    out6 = _dequantize_pack_pair(hi >> Uint32(16), final_scale, is_bfloat16)
+    out7 = _dequantize_pack_pair(hi >> Uint32(24), final_scale, is_bfloat16)
+    _store_v4_u32(ptr1, out4, out5, out6, out7)
 
 
 class _NVFP4QDQKernel:
@@ -950,6 +992,12 @@ class _NVFP4QDQKernel:
     def __init__(self, is_bfloat16: bool, config: NVFP4QDQConfig) -> None:
         self.is_bfloat16 = is_bfloat16
         self.config = config
+        if config.use_4over6:
+            self.threads = _4OVER6_THREADS
+            self.blocks_per_sm = _4OVER6_BLOCKS_PER_SM
+        else:
+            self.threads = _STANDARD_THREADS
+            self.blocks_per_sm = _STANDARD_BLOCKS_PER_SM
 
     @cute.jit
     def __call__(
@@ -963,9 +1011,9 @@ class _NVFP4QDQKernel:
     ) -> None:
         self.kernel(input_tensor, output_tensor, global_amax, total_blocks).launch(
             grid=[num_ctas, 1, 1],
-            block=[_THREADS, 1, 1],
-            max_number_threads=[_THREADS, 1, 1],
-            min_blocks_per_mp=1,
+            block=[self.threads, 1, 1],
+            max_number_threads=[self.threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm,
             smem=0,
             stream=stream,
         )
@@ -984,8 +1032,8 @@ class _NVFP4QDQKernel:
 
         amax = Float32(global_amax[Int32(0)])
         global_encode_scale = _global_encode_scale(amax, self.config.e4m3_max)
-        block = block_idx * Int32(_THREADS) + thread_idx
-        stride = grid_dim * Int32(_THREADS)
+        block = block_idx * Int32(self.threads) + thread_idx
+        stride = grid_dim * Int32(self.threads)
         while block < total_blocks:
             offset = block * Int32(_FP4_BLOCK_SIZE)
             ptr0 = _get_ptr(input_tensor, offset)
@@ -993,20 +1041,28 @@ class _NVFP4QDQKernel:
             w0, w1, w2, w3 = _load_v4_u32(ptr0)
             w4, w5, w6, w7 = _load_v4_u32(ptr1)
             words = (w0, w1, w2, w3, w4, w5, w6, w7)
-            values = _input_values(words, self.is_bfloat16)
             block_amax = _block_amax(words, self.is_bfloat16)
 
             if cutlass.const_expr(self.config.use_4over6):
+                values = _input_values(words, self.is_bfloat16)
                 scale, lo, hi = _four_over_six_quantize(
                     values, block_amax, amax, global_encode_scale, self.config
                 )
             else:
                 scale, lo, hi = _standard_quantize(
-                    values, block_amax, global_encode_scale
+                    words, block_amax, global_encode_scale, self.is_bfloat16
                 )
 
-            dequantized = _dequantize(lo, hi, scale, amax, self.config.e4m3_max)
-            _store_output(output_tensor, offset, dequantized, self.is_bfloat16)
+            _dequantize_store(
+                output_tensor,
+                offset,
+                lo,
+                hi,
+                scale,
+                amax,
+                self.config.e4m3_max,
+                self.is_bfloat16,
+            )
             block = block + stride
 
 
@@ -1024,12 +1080,18 @@ def _validate_input(x: torch.Tensor, amax: torch.Tensor) -> None:
         )
     if not x.is_contiguous():
         raise ValueError("Fused NVFP4 QDQ requires a contiguous tensor.")
+    if x.data_ptr() % 16 != 0:
+        raise ValueError("Fused NVFP4 QDQ requires a 16-byte-aligned input tensor.")
     if x.shape[1] % _FP4_BLOCK_SIZE != 0:
         raise ValueError(
             f"Fused NVFP4 QDQ requires K divisible by {_FP4_BLOCK_SIZE}, got {x.shape[1]}."
         )
     if x.numel() == 0:
         raise ValueError("Fused NVFP4 QDQ does not support empty tensors.")
+    if x.numel() > _INT32_MAX:
+        raise ValueError(
+            f"Fused NVFP4 QDQ supports at most {_INT32_MAX} elements, got {x.numel()}."
+        )
     if not amax.is_cuda or amax.device != x.device:
         raise ValueError(
             "The FP32 per-tensor amax must be on the input tensor's CUDA device."
@@ -1047,7 +1109,7 @@ def compute_nvfp4_amax(x: torch.Tensor) -> torch.Tensor:
     """Compute the TE-compatible FP32 per-tensor amax with PyTorch."""
     if x.numel() == 0:
         raise ValueError("Cannot compute NVFP4 amax for an empty tensor.")
-    return x.detach().abs().amax().to(torch.float32)
+    return torch.linalg.vector_norm(x.detach(), ord=float("inf"), dtype=torch.float32)
 
 
 def fused_nvfp4_qdq(
@@ -1064,23 +1126,20 @@ def fused_nvfp4_qdq(
         output = torch.empty_like(x)
         input_flat = x.detach().view(-1)
         output_flat = output.view(-1)
-        input_packed = from_dlpack(
-            input_flat, assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0)
-        output_packed = from_dlpack(
-            output_flat, assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0)
-        amax_packed = from_dlpack(amax.detach().reshape(1), assumed_align=4)
-        stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+        amax_flat = amax.detach().reshape(1)
         total_blocks = x.numel() // _FP4_BLOCK_SIZE
         multiprocessors = torch.cuda.get_device_properties(
             x.device
         ).multi_processor_count
+        threads = _4OVER6_THREADS if config.use_4over6 else _STANDARD_THREADS
+        blocks_per_sm = (
+            _4OVER6_BLOCKS_PER_SM if config.use_4over6 else _STANDARD_BLOCKS_PER_SM
+        )
         num_ctas = max(
             1,
             min(
-                (total_blocks + _THREADS - 1) // _THREADS,
-                multiprocessors * _BLOCKS_PER_SM,
+                (total_blocks + threads - 1) // threads,
+                multiprocessors * blocks_per_sm,
             ),
         )
         key = (
@@ -1094,23 +1153,37 @@ def fused_nvfp4_qdq(
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm up fused NVFP4 QDQ before CUDA graph capture.")
             kernel = _NVFP4QDQKernel(x.dtype == torch.bfloat16, config)
+            element_type = (
+                cutlass.BFloat16 if x.dtype == torch.bfloat16 else cutlass.Float16
+            )
+            dynamic_elements = cute.sym_int()
+            input_fake = cute.runtime.make_fake_compact_tensor(
+                element_type, (dynamic_elements,), assumed_align=16
+            )
+            output_fake = cute.runtime.make_fake_compact_tensor(
+                element_type, (dynamic_elements,), assumed_align=16
+            )
+            amax_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (1,), assumed_align=4
+            )
+            stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
             compiled = cute.compile(
                 kernel,
-                input_packed,
-                output_packed,
-                amax_packed,
-                total_blocks,
-                num_ctas,
-                stream,
+                input_fake,
+                output_fake,
+                amax_fake,
+                Int32(1),
+                Int32(1),
+                stream_fake,
+                options="--enable-tvm-ffi",
             )
             _KERNEL_CACHE[key] = compiled
         compiled(
-            input_packed,
-            output_packed,
-            amax_packed,
+            input_flat,
+            output_flat,
+            amax_flat,
             total_blocks,
             num_ctas,
-            stream,
         )
         return output
 
