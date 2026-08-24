@@ -5,14 +5,16 @@
 The ``torch.utils.benchmark`` methodology follows Transformer Engine commit
 83e230873f00676d4966ca151de22c8bfc68a77f. The benchmark shape is written as
 ``block-axis x rows`` and stored as a contiguous ``[rows, block-axis]`` tensor,
-so every 1x16 NVFP4 block lies along the first reported dimension. The primary
-speedup compares complete user-visible expressions:
+so every 1x16 NVFP4 block lies along the first reported dimension. It mirrors
+``TEGroupedLinear._get_weight_tensors`` by timing the complete
+``for w in weight_tensors`` loop over eight equal weights. The primary speedup
+compares complete user-visible loops:
 
 * naive: pad + TE quantize + TE dequantize + crop + contiguous;
 * fused: PyTorch FP32 per-tensor amax + register-resident CuTe DSL QDQ.
 
 The separately labeled precomputed-amax API number still includes output
-allocation, DLPack descriptor construction, and host launch overhead. It is a
+allocation, TVM-FFI argument marshalling, and host launch overhead. It is a
 diagnostic and is not used for the primary speedup claim.
 """
 
@@ -38,6 +40,7 @@ from megatron.core.fusions.fused_nvfp4_qdq import (
 
 
 DEFAULT_LOGICAL_SHAPES = [(6144, 4096)]
+DEFAULT_NUM_WEIGHTS = 8
 
 
 def _configs() -> list[tuple[str, NVFP4QDQConfig]]:
@@ -88,7 +91,7 @@ def _naive_te_qdq(x: torch.Tensor, quantizer) -> torch.Tensor:
     return quantizer.quantize(x_padded).dequantize(dtype=x.dtype)[:m, :n].contiguous()
 
 
-def _median_us(function: Callable[[], torch.Tensor], min_run_time: float) -> float:
+def _median_us(function: Callable[[], object], min_run_time: float) -> float:
     timing = benchmark.Timer(
         stmt="function()",
         globals={"function": function},
@@ -101,6 +104,7 @@ def _benchmark_case(
     logical_shape: tuple[int, int],
     dtype: torch.dtype,
     config: NVFP4QDQConfig,
+    num_weights: int,
     min_run_time: float,
     repeats: int,
 ) -> tuple[list[float], list[float], list[float]]:
@@ -116,32 +120,46 @@ def _benchmark_case(
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     block_axis, rows = logical_shape
-    x = torch.randn(
-        (rows, block_axis), dtype=dtype, device="cuda", requires_grad=True
-    )
-    amax = compute_nvfp4_amax(x)
+    weight_tensors = [
+        torch.randn(
+            (rows, block_axis), dtype=dtype, device="cuda", requires_grad=True
+        )
+        for _ in range(num_weights)
+    ]
+    amax_tensors = [compute_nvfp4_amax(w) for w in weight_tensors]
     quantizer = _make_te_quantizer(config)
 
-    def naive() -> torch.Tensor:
-        return _naive_te_qdq(x, quantizer)
+    def naive() -> list[torch.Tensor]:
+        return [_naive_te_qdq(w, quantizer) for w in weight_tensors]
 
-    def fused_end_to_end() -> torch.Tensor:
-        return fake_nvfp4_quantization_ste(x, config)
+    def fused_end_to_end() -> list[torch.Tensor]:
+        return [fake_nvfp4_quantization_ste(w, config) for w in weight_tensors]
 
-    def fused_precomputed_amax() -> torch.Tensor:
-        return fused_nvfp4_qdq(x, amax, config)
+    def fused_precomputed_amax() -> list[torch.Tensor]:
+        return [
+            fused_nvfp4_qdq(w, amax, config)
+            for w, amax in zip(weight_tensors, amax_tensors)
+        ]
 
     # Warm native TE and every compiled CuTe specialization before timing.
     # Both primary closures retain their production QAT autograd wrappers.
     expected = naive()
     actual = fused_end_to_end()
-    if not torch.equal(
-        expected.detach().view(torch.uint16), actual.detach().view(torch.uint16)
+    for weight_idx, (expected_weight, actual_weight) in enumerate(
+        zip(expected, actual)
     ):
-        mismatch_count = torch.count_nonzero(
-            expected.detach().view(torch.uint16) != actual.detach().view(torch.uint16)
-        ).item()
-        raise AssertionError(f"fused QDQ differs from TE in {mismatch_count} elements")
+        if not torch.equal(
+            expected_weight.detach().view(torch.uint16),
+            actual_weight.detach().view(torch.uint16),
+        ):
+            mismatch_count = torch.count_nonzero(
+                expected_weight.detach().view(torch.uint16)
+                != actual_weight.detach().view(torch.uint16)
+            ).item()
+            raise AssertionError(
+                f"fused QDQ weight {weight_idx} differs from TE in "
+                f"{mismatch_count} elements"
+            )
     fused_precomputed_amax()
     torch.cuda.synchronize()
 
@@ -189,6 +207,7 @@ def _parse_shape(value: str) -> tuple[int, int]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", action="append", type=_parse_shape, dest="shapes")
+    parser.add_argument("--num-weights", type=int, default=DEFAULT_NUM_WEIGHTS)
     parser.add_argument("--dtype", choices=("bf16", "fp16", "both"), default="both")
     parser.add_argument("--min-run-time", type=float, default=1.0)
     parser.add_argument("--repeats", type=int, default=3)
@@ -210,6 +229,8 @@ def main() -> None:
         raise ValueError("--min-run-time must be positive")
     if args.repeats <= 0:
         raise ValueError("--repeats must be positive")
+    if args.num_weights <= 0:
+        raise ValueError("--num-weights must be positive")
     available, reason = te.is_nvfp4_available(return_reason=True)
     if not available:
         raise RuntimeError(reason)
@@ -230,6 +251,7 @@ def main() -> None:
     print(f"cutlass_dsl={getattr(cutlass, '__version__', 'unknown')}")
     print(f"min_run_time_s={args.min_run_time}")
     print(f"repeats={args.repeats}")
+    print(f"num_weights={args.num_weights}")
     print("shape_contract=logical_block_axis_x_rows")
     print("tensor_layout=contiguous_[rows,block_axis]")
     print("primary_order=naive/fused/naive per repeat")
@@ -237,8 +259,9 @@ def main() -> None:
     print()
     print(
         "| dtype | logical shape (block-axis x rows) | mode | "
-        "naive TE QDQ median [A/B/A raw] (us) | "
-        "fused QAT median [raw] (us) | precomputed-amax API median [raw] (us) | "
+        f"naive TE {args.num_weights}-weight loop median [A/B/A raw] (us) | "
+        f"fused QAT {args.num_weights}-weight loop median [raw] (us) | "
+        f"precomputed-amax {args.num_weights}-weight loop median [raw] (us) | "
         "end-to-end speedup |"
     )
     print("|---|---:|---|---:|---:|---:|---:|")
@@ -246,7 +269,12 @@ def main() -> None:
         for shape in shapes:
             for label, config in _configs():
                 naive_us, fused_e2e_us, precomputed_amax_us = _benchmark_case(
-                    shape, dtype, config, args.min_run_time, args.repeats
+                    shape,
+                    dtype,
+                    config,
+                    args.num_weights,
+                    args.min_run_time,
+                    args.repeats,
                 )
                 print(
                     f"| {str(dtype).removeprefix('torch.')} | {shape[0]}x{shape[1]} | "
