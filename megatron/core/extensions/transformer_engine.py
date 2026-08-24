@@ -1570,16 +1570,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             )
 
         output_views = list(grouped_output.unbind(0))
-        if len(member_weights) != len(output_views) or any(
-            weight.ndim != 2 for weight in member_weights
-        ):
+        if len(member_weights) != len(output_views):
             raise RuntimeError(
                 "Packed NVFP4 fake QAT requires Transformer Engine to expose "
                 "one rank-2 member view per grouped weight."
-            )
-        if any(weight.shape != output.shape for weight, output in zip(member_weights, output_views)):
-            raise RuntimeError(
-                "Packed NVFP4 fake QAT requires each output view to match its TE member weight."
             )
 
         grouped_main_grad = getattr(grouped_weight, "main_grad", None)
@@ -1588,12 +1582,20 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 raise RuntimeError(
                     "Packed NVFP4 fake QAT requires packed weight and main_grad shapes to match."
                 )
-            for output, main_grad in zip(output_views, grouped_main_grad.unbind(0)):
-                output.main_grad = main_grad
+            main_grad_views = grouped_main_grad.unbind(0)
         else:
-            for weight, output in zip(member_weights, output_views):
-                if hasattr(weight, "main_grad"):
-                    output.main_grad = weight.main_grad
+            main_grad_views = None
+
+        for weight_idx, (weight, output) in enumerate(zip(member_weights, output_views)):
+            if weight.ndim != 2 or weight.shape != output.shape:
+                raise RuntimeError(
+                    "Packed NVFP4 fake QAT requires each TE member weight and output "
+                    "view to be rank-2 with matching shapes."
+                )
+            if main_grad_views is not None:
+                output.main_grad = main_grad_views[weight_idx]
+            elif hasattr(weight, "main_grad"):
+                output.main_grad = weight.main_grad
 
         return output_views
 

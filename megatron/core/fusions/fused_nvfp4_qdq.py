@@ -44,8 +44,8 @@ _STANDARD_THREADS = 256
 _STANDARD_MIN_BLOCKS_PER_SM = 4
 _STANDARD_GRID_BLOCKS_PER_SM = 96
 _4OVER6_THREADS = 128
-# The largest 4over6 specialization uses 56 registers/thread, so 8x128 threads
-# stays below the SM10x 64K-register budget without spills.
+# The widest B300 4over6 specialization is allocated 64 registers/thread, so
+# 8x128 threads exactly fits the SM10x 64K-register budget without spills.
 _4OVER6_MIN_BLOCKS_PER_SM = 8
 _4OVER6_GRID_BLOCKS_PER_SM = 64
 _INT32_MAX = 2**31 - 1
