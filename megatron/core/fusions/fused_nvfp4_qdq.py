@@ -37,7 +37,10 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 _FP32_MAX = 3.4028234663852886e38
 _FP4_BLOCK_SIZE = 16
 _STANDARD_THREADS = 256
-_STANDARD_BLOCKS_PER_SM = 4
+# Preserve the 4-CTA compile launch bound while using a deeper runtime grid to
+# reduce each thread's grid-stride work on model-sized tensors.
+_STANDARD_MIN_BLOCKS_PER_SM = 4
+_STANDARD_GRID_BLOCKS_PER_SM = 24
 _4OVER6_THREADS = 128
 # The largest specialization uses 56 registers/thread, so 8x128 threads stays
 # below the SM10x 64K-register budget without spills while doubling active CTAs.
@@ -997,10 +1000,10 @@ class _NVFP4QDQKernel:
         self.config = config
         if config.use_4over6:
             self.threads = _4OVER6_THREADS
-            self.blocks_per_sm = _4OVER6_BLOCKS_PER_SM
+            self.min_blocks_per_sm = _4OVER6_BLOCKS_PER_SM
         else:
             self.threads = _STANDARD_THREADS
-            self.blocks_per_sm = _STANDARD_BLOCKS_PER_SM
+            self.min_blocks_per_sm = _STANDARD_MIN_BLOCKS_PER_SM
 
     @cute.jit
     def __call__(
@@ -1016,7 +1019,7 @@ class _NVFP4QDQKernel:
             grid=[num_ctas, 1, 1],
             block=[self.threads, 1, 1],
             max_number_threads=[self.threads, 1, 1],
-            min_blocks_per_mp=self.blocks_per_sm,
+            min_blocks_per_mp=self.min_blocks_per_sm,
             smem=0,
             stream=stream,
         )
@@ -1146,14 +1149,16 @@ def fused_nvfp4_qdq(
         amax_flat = amax.detach().reshape(1)
         total_blocks = x.numel() // _FP4_BLOCK_SIZE
         threads = _4OVER6_THREADS if config.use_4over6 else _STANDARD_THREADS
-        blocks_per_sm = (
-            _4OVER6_BLOCKS_PER_SM if config.use_4over6 else _STANDARD_BLOCKS_PER_SM
+        grid_blocks_per_sm = (
+            _4OVER6_BLOCKS_PER_SM
+            if config.use_4over6
+            else _STANDARD_GRID_BLOCKS_PER_SM
         )
         num_ctas = max(
             1,
             min(
                 (total_blocks + threads - 1) // threads,
-                multiprocessors * blocks_per_sm,
+                multiprocessors * grid_blocks_per_sm,
             ),
         )
         key = (
