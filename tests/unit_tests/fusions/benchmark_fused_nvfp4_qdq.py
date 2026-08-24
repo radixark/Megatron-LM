@@ -41,25 +41,22 @@ DEFAULT_LOGICAL_SHAPES = [(6144, 4096)]
 
 
 def _configs() -> list[tuple[str, NVFP4QDQConfig]]:
+    # Exact-error remains in the zero-tolerance correctness matrix, but the
+    # performance target is standard NVFP4 plus TE's current FP16-error path.
     configs = [("nvfp4", NVFP4QDQConfig())]
     for error_mode in (NVFP4QDQErrorMode.MAE, NVFP4QDQErrorMode.MSE):
         for e4m3_max in (448, 256):
-            for error_use_fp16 in (False, True):
-                label = (
-                    f"4over6-{error_mode.name.lower()}-e4m3-{e4m3_max}-"
-                    f"{'fp16-error' if error_use_fp16 else 'exact-error'}"
+            configs.append(
+                (
+                    f"4over6-{error_mode.name.lower()}-e4m3-{e4m3_max}-fp16-error",
+                    NVFP4QDQConfig(
+                        use_4over6=True,
+                        e4m3_max=e4m3_max,
+                        error_mode=error_mode,
+                        error_use_fp16=True,
+                    ),
                 )
-                configs.append(
-                    (
-                        label,
-                        NVFP4QDQConfig(
-                            use_4over6=True,
-                            e4m3_max=e4m3_max,
-                            error_mode=error_mode,
-                            error_use_fp16=error_use_fp16,
-                        ),
-                    )
-                )
+            )
     return configs
 
 
