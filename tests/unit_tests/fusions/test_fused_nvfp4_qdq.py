@@ -306,3 +306,18 @@ def test_fused_nvfp4_qdq_rejects_misaligned_contiguous_storage() -> None:
     assert x.data_ptr() % 16 != 0
     with pytest.raises(ValueError, match="16-byte-aligned"):
         fused_nvfp4_qdq(x, compute_nvfp4_amax(x), NVFP4QDQConfig())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_fused_nvfp4_qdq_uses_and_restores_non_current_device() -> None:
+    with torch.cuda.device(0):
+        with torch.cuda.device(1):
+            x = _make_input((3, 32), torch.bfloat16, "boundary")
+            amax = compute_nvfp4_amax(x)
+            expected, _ = _te_reference(x, NVFP4QDQConfig())
+
+        assert torch.cuda.current_device() == 0
+        actual = fused_nvfp4_qdq(x, amax, NVFP4QDQConfig())
+        assert torch.cuda.current_device() == 0
+
+    assert torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))

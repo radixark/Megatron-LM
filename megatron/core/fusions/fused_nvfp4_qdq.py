@@ -20,6 +20,7 @@ Supported contract:
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
 from enum import IntEnum
@@ -1071,6 +1072,17 @@ class _NVFP4QDQKernel:
 _KERNEL_CACHE: dict[tuple[Any, ...], Any] = {}
 
 
+@functools.cache
+def _device_info(device_index: int) -> tuple[tuple[int, int], int]:
+    """Cache immutable capability and SM-count metadata outside the QAT hot path."""
+    with torch.cuda.device(device_index):
+        capability = torch.cuda.get_device_capability(device_index)
+        multiprocessors = torch.cuda.get_device_properties(
+            device_index
+        ).multi_processor_count
+    return capability, multiprocessors
+
+
 def _validate_input(x: torch.Tensor, amax: torch.Tensor) -> None:
     if not x.is_cuda:
         raise ValueError("Fused NVFP4 QDQ requires a CUDA tensor.")
@@ -1100,7 +1112,7 @@ def _validate_input(x: torch.Tensor, amax: torch.Tensor) -> None:
         )
     if amax.dtype != torch.float32 or amax.numel() != 1:
         raise TypeError("The per-tensor amax must contain exactly one FP32 value.")
-    capability = torch.cuda.get_device_capability(x.device)
+    capability, _ = _device_info(x.device.index)
     if capability[0] != 10:
         raise ValueError(
             f"Fused NVFP4 QDQ requires SM10x, got compute capability {capability}."
@@ -1124,15 +1136,15 @@ def fused_nvfp4_qdq(
         config = current_nvfp4_qdq_config()
     _validate_input(x, amax)
 
-    with torch.cuda.device(x.device):
+    device_index = x.device.index
+    capability, multiprocessors = _device_info(device_index)
+
+    def launch_on_current_device() -> torch.Tensor:
         output = torch.empty_like(x)
         input_flat = x.detach().view(-1)
         output_flat = output.view(-1)
         amax_flat = amax.detach().reshape(1)
         total_blocks = x.numel() // _FP4_BLOCK_SIZE
-        multiprocessors = torch.cuda.get_device_properties(
-            x.device
-        ).multi_processor_count
         threads = _4OVER6_THREADS if config.use_4over6 else _STANDARD_THREADS
         blocks_per_sm = (
             _4OVER6_BLOCKS_PER_SM if config.use_4over6 else _STANDARD_BLOCKS_PER_SM
@@ -1145,8 +1157,7 @@ def fused_nvfp4_qdq(
             ),
         )
         key = (
-            x.device.index,
-            torch.cuda.get_device_capability(x.device),
+            capability,
             x.dtype,
             config,
         )
@@ -1188,6 +1199,11 @@ def fused_nvfp4_qdq(
             num_ctas,
         )
         return output
+
+    if torch.cuda.current_device() == device_index:
+        return launch_on_current_device()
+    with torch.cuda.device(device_index):
+        return launch_on_current_device()
 
 
 class _FusedNVFP4QDQSTE(torch.autograd.Function):
