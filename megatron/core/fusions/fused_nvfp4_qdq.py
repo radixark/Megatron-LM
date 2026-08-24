@@ -38,15 +38,16 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 _FP32_MAX = 3.4028234663852886e38
 _FP4_BLOCK_SIZE = 16
 _STANDARD_THREADS = 256
-# Keep compile-time occupancy bounds separate from runtime persistent-grid
-# targets so the latter can be divided across an arbitrary group count.
+# Compile-time occupancy bounds describe simultaneously resident CTAs. The
+# deeper runtime grids span multiple waves to shorten each thread's persistent
+# grid-stride chain on model-sized packed weights.
 _STANDARD_MIN_BLOCKS_PER_SM = 4
-_STANDARD_GRID_BLOCKS_PER_SM = 24
+_STANDARD_GRID_BLOCKS_PER_SM = 96
 _4OVER6_THREADS = 128
 # The largest 4over6 specialization uses 56 registers/thread, so 8x128 threads
 # stays below the SM10x 64K-register budget without spills.
 _4OVER6_MIN_BLOCKS_PER_SM = 8
-_4OVER6_GRID_BLOCKS_PER_SM = 8
+_4OVER6_GRID_BLOCKS_PER_SM = 64
 _INT32_MAX = 2**31 - 1
 _MAX_GROUP_COUNT = 2048
 
