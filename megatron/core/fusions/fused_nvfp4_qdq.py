@@ -219,6 +219,40 @@ def _fmul_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def _scale_f32x2_rn(
+    value0: Float32, value1: Float32, scale: Float32, *, loc=None, ip=None
+) -> tuple[Float32, Float32]:
+    """Multiply two FP32 values by one common scale with packed RN arithmetic."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [
+            Float32(value0).ir_value(loc=loc, ip=ip),
+            Float32(value1).ir_value(loc=loc, ip=ip),
+            Float32(scale).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b64 values, scales;
+            mov.b64 values, {$2, $3};
+            mov.b64 scales, {$4, $4};
+            mul.f32x2 values, values, scales;
+            mov.b64 {$0, $1}, values;
+        }
+        """,
+        "=f,=f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def _square_f32x2_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
     """Square two FP32 values with the packed RN instruction used by TE."""
     result = llvm.inline_asm(
@@ -756,25 +790,34 @@ def _block_amax(words: tuple, is_bfloat16: bool) -> Float32:
 @cute.jit
 def _scale_pack_e2m1(values: tuple, scale: Float32) -> tuple[Uint32, Uint32]:
     """Scale and immediately pack each eight-value half to limit live FP32 state."""
+    scaled_lo = ()
+    for pair_idx in cutlass.range_constexpr(4):
+        value0, value1 = _scale_f32x2_rn(values[2 * pair_idx], values[2 * pair_idx + 1], scale)
+        scaled_lo = scaled_lo + (value0, value1)
     lo = _cvt_e2m1x8(
-        _fmul_rn(values[0], scale),
-        _fmul_rn(values[1], scale),
-        _fmul_rn(values[2], scale),
-        _fmul_rn(values[3], scale),
-        _fmul_rn(values[4], scale),
-        _fmul_rn(values[5], scale),
-        _fmul_rn(values[6], scale),
-        _fmul_rn(values[7], scale),
+        scaled_lo[0],
+        scaled_lo[1],
+        scaled_lo[2],
+        scaled_lo[3],
+        scaled_lo[4],
+        scaled_lo[5],
+        scaled_lo[6],
+        scaled_lo[7],
     )
+
+    scaled_hi = ()
+    for pair_idx in cutlass.range_constexpr(4, 8):
+        value0, value1 = _scale_f32x2_rn(values[2 * pair_idx], values[2 * pair_idx + 1], scale)
+        scaled_hi = scaled_hi + (value0, value1)
     hi = _cvt_e2m1x8(
-        _fmul_rn(values[8], scale),
-        _fmul_rn(values[9], scale),
-        _fmul_rn(values[10], scale),
-        _fmul_rn(values[11], scale),
-        _fmul_rn(values[12], scale),
-        _fmul_rn(values[13], scale),
-        _fmul_rn(values[14], scale),
-        _fmul_rn(values[15], scale),
+        scaled_hi[0],
+        scaled_hi[1],
+        scaled_hi[2],
+        scaled_hi[3],
+        scaled_hi[4],
+        scaled_hi[5],
+        scaled_hi[6],
+        scaled_hi[7],
     )
     return lo, hi
 
@@ -790,7 +833,8 @@ def _scale_pack_input_words(
             value0, value1 = _bfloat2_to_f32x2(words[i])
         else:
             value0, value1 = _half2_to_f32x2(words[i])
-        scaled_lo = scaled_lo + (_fmul_rn(value0, scale), _fmul_rn(value1, scale))
+        value0, value1 = _scale_f32x2_rn(value0, value1, scale)
+        scaled_lo = scaled_lo + (value0, value1)
     lo = _cvt_e2m1x8(
         scaled_lo[0],
         scaled_lo[1],
@@ -808,7 +852,8 @@ def _scale_pack_input_words(
             value0, value1 = _bfloat2_to_f32x2(words[i])
         else:
             value0, value1 = _half2_to_f32x2(words[i])
-        scaled_hi = scaled_hi + (_fmul_rn(value0, scale), _fmul_rn(value1, scale))
+        value0, value1 = _scale_f32x2_rn(value0, value1, scale)
+        scaled_hi = scaled_hi + (value0, value1)
     hi = _cvt_e2m1x8(
         scaled_hi[0],
         scaled_hi[1],
@@ -873,8 +918,9 @@ def _candidate_error(
             else:
                 packed_pair = hi >> Uint32(8 * (pair_idx - 4))
             candidate0, candidate1 = _scaled_e2m1x2_e4m3_to_f32x2(packed_pair, scale)
-            original0 = _fmul_rn(original[2 * pair_idx], global_encode_scale)
-            original1 = _fmul_rn(original[2 * pair_idx + 1], global_encode_scale)
+            original0, original1 = _scale_f32x2_rn(
+                original[2 * pair_idx], original[2 * pair_idx + 1], global_encode_scale
+            )
             diff0 = _fsub_rn(candidate0, original0)
             diff1 = _fsub_rn(candidate1, original1)
             if cutlass.const_expr(config.error_mode == NVFP4QDQErrorMode.MSE):
@@ -957,8 +1003,7 @@ def _four_over_six_quantize(
 @cute.jit
 def _dequantize_pack_pair(packed_pair: Uint32, final_scale: Float32, is_bfloat16: bool) -> Uint32:
     q0, q1 = _e2m1x2_to_f32x2(packed_pair)
-    out0 = _fmul_rn(q0, final_scale)
-    out1 = _fmul_rn(q1, final_scale)
+    out0, out1 = _scale_f32x2_rn(q0, q1, final_scale)
     if cutlass.const_expr(is_bfloat16):
         return _pack_f32x2_to_bfloat2(out0, out1)
     return _pack_f32x2_to_half2(out0, out1)
