@@ -298,29 +298,47 @@ def test_te_grouped_linear_real_discrete_weight_qdq_and_backward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from megatron.core.extensions import transformer_engine as te_extension
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
     group_count, rows, columns = 3, 2, 32
     monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6", "none")
+    monkeypatch.delenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", raising=False)
+    # Enabling TE's gate alone must not opt Megatron into its experimental
+    # packed-parameter layout. The wrapper should retain discrete parameters.
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
     monkeypatch.setenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0")
     monkeypatch.setenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "1")
-    layer = te_extension.TEGroupedLinear.__new__(te_extension.TEGroupedLinear)
-    te.GroupedLinear.__init__(
-        layer,
-        num_gemms=group_count,
-        in_features=columns,
-        out_features=rows,
-        bias=False,
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=columns,
+        num_attention_heads=1,
         params_dtype=torch.bfloat16,
-        device="cuda",
+        gradient_accumulation_fusion=True,
     )
-    layer.disable_parameter_transpose_cache = True
-    layer.is_first_microbatch = True
-    layer.te_quant_params = None
-    layer.te_return_bias = False
-    layer._nvfp4_qat_config = NVFP4QDQConfig()
+    layer = te_extension.TEGroupedLinear(
+        num_gemms=group_count,
+        input_size=columns,
+        output_size=rows,
+        parallel_mode=None,
+        config=config,
+        init_method=config.init_method,
+        bias=False,
+        skip_bias_add=False,
+        is_expert=True,
+        pg_collection=ProcessGroupCollection(expt_tp=None),
+    )
 
+    assert layer.fuse_wgrad_accumulation is True
+    assert not getattr(layer, "single_grouped_weight", False)
+    assert getattr(layer, "weight", None) is None
     weights = [getattr(layer, f"weight{group_idx}") for group_idx in range(group_count)]
-    main_grads = [torch.empty_like(weight) for weight in weights]
+    assert set(dict(layer.named_parameters())) == {
+        f"weight{group_idx}" for group_idx in range(group_count)
+    }
+
+    main_grads = [torch.zeros_like(weight, dtype=torch.float32) for weight in weights]
     for weight, main_grad in zip(weights, main_grads):
         weight.main_grad = main_grad
 
@@ -341,7 +359,7 @@ def test_te_grouped_linear_real_discrete_weight_qdq_and_backward(
     )
 
     m_splits = [2, 1, 3]
-    inp = torch.randn(
+    inp = torch.ones(
         (sum(m_splits), columns),
         dtype=torch.bfloat16,
         device="cuda",
@@ -353,8 +371,13 @@ def test_te_grouped_linear_real_discrete_weight_qdq_and_backward(
     assert bias is None
     assert tuple(output.shape) == (sum(m_splits), rows)
     assert inp.grad is not None and torch.isfinite(inp.grad).all()
-    assert all(weight.grad is not None for weight in weights)
-    assert all(torch.count_nonzero(weight.grad).item() > 0 for weight in weights)
+    for main_grad, m_split in zip(main_grads, m_splits):
+        torch.testing.assert_close(
+            main_grad,
+            torch.full_like(main_grad, m_split),
+            rtol=0,
+            atol=0,
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
