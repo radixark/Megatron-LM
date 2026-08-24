@@ -219,6 +219,33 @@ def _fmul_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def _square_f32x2_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
+    """Square two FP32 values with the packed RN instruction used by TE."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b64 values;
+            mov.b64 values, {$2, $3};
+            mul.f32x2 values, values, values;
+            mov.b64 {$0, $1}, values;
+        }
+        """,
+        "=f,=f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def _fdiv_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
     return Float32(
         llvm.inline_asm(
@@ -851,8 +878,7 @@ def _candidate_error(
             diff0 = _fsub_rn(candidate0, original0)
             diff1 = _fsub_rn(candidate1, original1)
             if cutlass.const_expr(config.error_mode == NVFP4QDQErrorMode.MSE):
-                term0 = _fmul_rn(diff0, diff0)
-                term1 = _fmul_rn(diff1, diff1)
+                term0, term1 = _square_f32x2_rn(diff0, diff1)
             else:
                 term0 = _fabs(diff0)
                 term1 = _fabs(diff1)
