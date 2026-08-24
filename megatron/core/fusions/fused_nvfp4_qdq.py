@@ -834,12 +834,12 @@ def _standard_quantize(
     words: tuple,
     block_amax: Float32,
     global_encode_scale: Float32,
+    global_decode_scale: Float32,
     is_bfloat16: bool,
 ) -> tuple[Uint32, Uint32, Uint32]:
     scale_high_precision = _normal_block_scale(block_amax, global_encode_scale)
     scale = _cvt_f32_to_e4m3(scale_high_precision)
     scale_f32 = _cvt_e4m3_to_f32(scale)
-    global_decode_scale = _fdiv_rn(Float32(1.0), global_encode_scale)
     inverse = _candidate_inverse_scale(scale_f32, global_decode_scale)
     lo, hi = _scale_pack_input_words(words, inverse, is_bfloat16)
     return scale, lo, hi
@@ -914,6 +914,7 @@ def _four_over_six_quantize(
     block_amax: Float32,
     global_amax: Float32,
     global_encode_scale: Float32,
+    global_decode_scale: Float32,
     config: NVFP4QDQConfig,
 ) -> tuple[Uint32, Uint32, Uint32]:
     # TE intentionally associates this differently from standard NVFP4. Keep
@@ -925,7 +926,6 @@ def _four_over_six_quantize(
     scale6 = _cvt_f32_to_e4m3(_fmin(scale6_hp, Float32(448.0)))
     scale4_f32 = _cvt_e4m3_to_f32(scale4)
     scale6_f32 = _cvt_e4m3_to_f32(scale6)
-    global_decode_scale = _fdiv_rn(Float32(1.0), global_encode_scale)
     inv4 = _candidate_inverse_scale(scale4_f32, global_decode_scale)
     inv6 = _candidate_inverse_scale(scale6_f32, global_decode_scale)
     lo4, hi4 = _scale_pack_e2m1(values, inv4)
@@ -1040,6 +1040,7 @@ class _NVFP4QDQKernel:
 
         amax = Float32(global_amax[Int32(0)])
         global_encode_scale = _global_encode_scale(amax, self.config.e4m3_max)
+        global_decode_scale = _fdiv_rn(Float32(1.0), global_encode_scale)
         block = block_idx * Int32(self.threads) + thread_idx
         stride = grid_dim * Int32(self.threads)
         while block < total_blocks:
@@ -1054,11 +1055,20 @@ class _NVFP4QDQKernel:
             if cutlass.const_expr(self.config.use_4over6):
                 values = _input_values(words, self.is_bfloat16)
                 scale, lo, hi = _four_over_six_quantize(
-                    values, block_amax, amax, global_encode_scale, self.config
+                    values,
+                    block_amax,
+                    amax,
+                    global_encode_scale,
+                    global_decode_scale,
+                    self.config,
                 )
             else:
                 scale, lo, hi = _standard_quantize(
-                    words, block_amax, global_encode_scale, self.is_bfloat16
+                    words,
+                    block_amax,
+                    global_encode_scale,
+                    global_decode_scale,
+                    self.is_bfloat16,
                 )
 
             _dequantize_store(
