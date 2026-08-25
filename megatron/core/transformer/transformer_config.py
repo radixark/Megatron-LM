@@ -2913,14 +2913,22 @@ class TransformerConfig(ModelParallelConfig):
                 self.actual_vocab_size is not None
             ), "actual_vocab_size must be set when moe_n_hash_layers > 0."
             if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
-                assert self.pipeline_model_parallel_layout is not None, (
-                    "pipeline_model_parallel_layout must be set when using hash MoE "
-                    "layers with pipeline parallelism (PP > 1)."
-                )
-                # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
-                # All hash MoE layers must be in the same virtual pipeline stage.
-                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
-                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                # Hash routing reads input_ids, which only reaches the stage that owns the
+                # embedding, so every hash layer has to be built there. An explicit layout is
+                # one way to spell that stage's size; uneven first/last stages and the even
+                # split are others, so ask the layer distribution rather than the layout.
+                if self.pipeline_model_parallel_layout is not None:
+                    # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
+                    embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                    n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                else:
+                    from megatron.core.transformer.transformer_block import (
+                        get_num_layers_to_build,
+                    )
+
+                    n_decoders_with_embedding = get_num_layers_to_build(
+                        self, vp_stage=0, pp_rank=0
+                    )
                 assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
                     f"Currently, All hash MoE layers must be in the same virtual pipeline stage "
                     f"as the embedding. The embedding stage has "
