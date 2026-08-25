@@ -229,10 +229,21 @@ class TransformerBlockSubmodules:
             defines a complete transformer layer (e.g., self-attention, feed-forward network).
         layer_norm (Optional[Union[ModuleSpec, torch.nn.Module]], optional): Specification
             or instance of the layer normalization to be applied.
+        hc_head_contraction (Optional[Union[ModuleSpec, type]], optional): Model-specific
+            mHC output contraction, contracting ``[s, b, n*C] -> [s, b, C]`` before the
+            final layer norm. Leave as ``None`` to keep the built-in DeepSeek-V4
+            contraction (``learned_output_contract`` over block-owned ``hc_head_*``
+            parameters); that path, and its parameter names, are untouched by this field.
+            Supply a spec when a model's contraction is a different function of
+            differently shaped parameters -- Qwen3.8-Next, for instance, uses the same
+            low-rank gated mean as its per-layer hyper-connections, with the RMS taken
+            per stream rather than over the whole ``n*C`` vector. The module owns its own
+            parameters and is called as ``module(hidden_states)``.
     """
 
     layer_specs: Optional[List[ModuleSpec]] = None
     layer_norm: LayerNormBuilder | None = None
+    hc_head_contraction: Optional[Union[ModuleSpec, type]] = None
 
 
 def _get_block_submodules(
@@ -398,18 +409,34 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
             if self.config.enable_hyper_connections:
-                hc_mult = self.config.num_residual_streams
-                hc_dim = self.config.hidden_size * hc_mult
-                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-                nn.init.xavier_uniform_(self.hc_head_fn)
-                if self.config.sequence_parallel:
-                    setattr(self.hc_head_fn, 'sequence_parallel', True)
-                    setattr(self.hc_head_base, 'sequence_parallel', True)
-                    setattr(self.hc_head_scale, 'sequence_parallel', True)
+                # A model whose contraction is not DeepSeek-V4's supplies its own module,
+                # which owns its own parameters. The default path below is left exactly
+                # as it was, parameter names included, so existing checkpoints keep
+                # loading against `decoder.hc_head_*`.
+                self.hc_head_contraction = (
+                    build_module(self.submodules.hc_head_contraction, config=self.config)
+                    if self.submodules.hc_head_contraction is not None
+                    else None
+                )
+                if self.hc_head_contraction is None:
+                    hc_mult = self.config.num_residual_streams
+                    hc_dim = self.config.hidden_size * hc_mult
+                    self.hc_head_fn = mark_keep_in_fp32(
+                        nn.Parameter(torch.randn(hc_mult, hc_dim))
+                    )
+                    self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                    self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                    nn.init.xavier_uniform_(self.hc_head_fn)
+                    if self.config.sequence_parallel:
+                        setattr(self.hc_head_fn, 'sequence_parallel', True)
+                        setattr(self.hc_head_base, 'sequence_parallel', True)
+                        setattr(self.hc_head_scale, 'sequence_parallel', True)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
+            # forward() only reaches the contraction under
+            # has_final_layernorm_in_this_stage(), but keep the attribute defined on
+            # every stage so nothing has to guard an AttributeError.
+            self.hc_head_contraction = None
 
         if self.config.inference_fuse_tp_communication:
             self._setup_fused_tp_communication()
@@ -520,16 +547,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         len(extract_layer_indices) == 0
                     ), "Feature extraction is not supported with mHC + MTP."
                 mhc_multistream = hidden_states
-            # DSv4 introduced the new output contraction for mHC.
-            # [s, b, n*C] -> [s, b, C]
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            # [s, b, n*C] -> [s, b, C]. DSv4 introduced the built-in contraction;
+            # a model with different contraction math supplies its own module through
+            # TransformerBlockSubmodules.hc_head_contraction.
+            if self.hc_head_contraction is not None:
+                hidden_states = self.hc_head_contraction(hidden_states)
+            else:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
 
         # Final layer norm.
         if self.final_layernorm is not None:
