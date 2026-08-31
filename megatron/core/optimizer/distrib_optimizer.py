@@ -449,6 +449,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
                                 ]
+                        elif config.defer_main_param_initialization:
+                            shard_main_param = torch.empty_like(
+                                shard_model_param, dtype=torch.float32
+                            )
+                            # Preserve tensor identity and metadata for the external backend.
+                            shard_main_param.untyped_storage().resize_(0)
                         else:
                             shard_main_param = shard_model_param.clone().float()
 
