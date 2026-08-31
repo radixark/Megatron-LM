@@ -899,8 +899,9 @@ class TestDistributedOptimizer:
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp', 'src_bucket_pad_divisor', 'dest_bucket_pad_divisor'),
         [
+            # Large bucket padding can leave some DP ranks with no unpadded slice.
+            ((1, 1), (1, 1), 8 * 1024, 8 * 1024),
             # PP must be decreasing
-            # Note: PP must be > 1 if TP <= 2 because of empty buckets otherwise
             ((1, 2), (1, 2), 8 * 7, 8 * 5),
             ((2, 4), (2, 4), 128, 128),
             ((8, 1), (8, 1), 8, 4 * 11),

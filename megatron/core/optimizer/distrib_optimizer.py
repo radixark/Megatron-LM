@@ -1945,6 +1945,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_world_size = self.data_parallel_group.size()
 
         state = self.get_parameter_state_dp_reshardable()
+        padding_state_template = next(
+            (
+                {k: v for k, v in tensors.items() if isinstance(v, torch.Tensor)}
+                for other_gbuf_idx in range(len(self.gbuf_ranges))
+                for other_dtype_state in state[other_gbuf_idx].values()
+                for other_bucket_state in other_dtype_state
+                for tensors in other_bucket_state
+            ),
+            None,
+        )
         # per_bucket_numel metadata is saved separately for each TPxPP domain.
         for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
             key = (
@@ -1976,9 +1986,31 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
                     )
 
-                    # The global ckpt tensors must be fully covered.
-                    # We add extra empty padding if necessary
-                    assert bucket_state, 'empty bucket encountered'
+                    if not bucket_state:
+                        world_start = data_parallel_rank * gbuf_local_numel
+                        padding_numel = min(
+                            gbuf_local_numel, max(0, gbuf_world_numel_unpadded - world_start)
+                        )
+                        if padding_numel == 0:
+                            # Preserve an empty terminal shard through checkpoint loading.
+                            gbuf_range_map_for_all_buckets[bucket_idx] = LocalNonpersistentObject(
+                                bucket_state
+                            )
+                            continue
+                        assert (
+                            padding_state_template
+                        ), 'empty bucket has no optimizer state template'
+                        bucket_state.append(
+                            {
+                                **{
+                                    k: torch.empty(padding_numel, dtype=v.dtype, device=v.device)
+                                    for k, v in padding_state_template.items()
+                                },
+                                'gbuf_local_start': 0,
+                                'gbuf_local_end': padding_numel,
+                                'padding': True,
+                            }
+                        )
 
                     # Insert padding between parameter tensors to ensure full coverage as needed.
                     all_pad_tensors = {}
