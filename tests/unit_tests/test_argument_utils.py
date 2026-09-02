@@ -11,6 +11,7 @@ import pytest
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
@@ -130,6 +131,24 @@ class TestArgumentGroupFactoryBasic:
         assert args.learning_rate == 0.001
         assert args.enabled == False
         assert args.disabled_feature == True
+
+    def test_dsv4_freeze_arguments_map_to_transformer_config(self):
+        """DSV4 freeze flags must remain accepted by the dataclass-generated CLI."""
+        parser = ArgumentParser()
+        factory = ArgumentGroupFactory(TransformerConfig)
+        factory.build_group(parser, title="Transformer configuration")
+
+        args = parser.parse_args(
+            [
+                "--no-activation-func-clamp-shared-expert",
+                "--moe-router-freeze-gate",
+                "--freeze-e-score-correction-bias",
+            ]
+        )
+
+        assert args.activation_func_clamp_shared_expert is False
+        assert args.moe_router_freeze_gate is True
+        assert args.freeze_e_score_correction_bias is True
 
     def test_argument_types(self):
         """Test that argument types are correctly inferred."""

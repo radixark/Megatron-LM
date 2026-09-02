@@ -88,6 +88,11 @@ class Router(ABC, MegatronModule):
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
         self.reset_parameters()
 
+        if self.config.moe_router_freeze_gate:
+            self.weight.requires_grad = False
+            if self.bias is not None:
+                self.bias.requires_grad = False
+
     def reset_parameters(self):
         """Reset the router parameters."""
         if self.config.perform_initialization:

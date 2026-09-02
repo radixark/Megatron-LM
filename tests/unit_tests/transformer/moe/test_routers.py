@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+import dataclasses
 from typing import cast
 
 import pytest
@@ -65,6 +66,24 @@ class TestTop2Router:
 
         num_weights = sum([p.numel() for p in self.router.parameters()])
         assert num_weights == 12 * 4, num_weights
+
+    @pytest.mark.internal
+    def test_freeze_gate_disables_router_gradients(self):
+        """A frozen router gate must exclude its weight and bias from optimization."""
+        config = dataclasses.replace(
+            self.transformer_config, add_bias_linear=True, moe_router_freeze_gate=True
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(
+                num_experts=config.num_moe_experts, moe_grouped_gemm=False
+            ).mlp
+        )
+
+        router = cast(Router, MoELayer(config, submodules).router)
+
+        assert router.weight.requires_grad is False
+        assert router.bias is not None
+        assert router.bias.requires_grad is False
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

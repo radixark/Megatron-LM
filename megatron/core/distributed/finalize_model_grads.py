@@ -540,7 +540,7 @@ def finalize_model_grads(
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 
-    if config.moe_router_enable_expert_bias:
+    if config.moe_router_enable_expert_bias and not config.freeze_e_score_correction_bias:
         if pg_collection is None:
             tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
                 with_context_parallel=True

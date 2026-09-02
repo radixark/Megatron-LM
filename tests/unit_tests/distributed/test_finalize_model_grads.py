@@ -36,8 +36,8 @@ class _RouterExpertBiasModel(torch.nn.Module):
         self.finish_grad_sync_calls += 1
 
 
-def _router_expert_bias_config():
-    return TransformerConfig(
+def _router_expert_bias_config(**overrides: object) -> TransformerConfig:
+    defaults: dict[str, object] = dict(
         num_layers=1,
         hidden_size=8,
         num_attention_heads=1,
@@ -47,6 +47,8 @@ def _router_expert_bias_config():
         moe_router_bias_update_rate=0.25,
         moe_router_load_balancing_type="none",
     )
+    defaults.update(overrides)
+    return TransformerConfig(**defaults)
 
 
 _NO_TP_DP_CP = object()
@@ -97,6 +99,20 @@ class TestFinalizeModelGradsMoEExpertBias:
         torch.testing.assert_close(
             model.router.local_tokens_per_expert, torch.zeros_like(local_tokens)
         )
+        assert model.finish_grad_sync_calls == 1
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_finalize_model_grads_preserves_frozen_router_expert_bias(self):
+        """Frozen expert correction bias must not be updated during gradient finalization."""
+        config = _router_expert_bias_config(freeze_e_score_correction_bias=True)
+        device = torch.device("cuda", torch.cuda.current_device())
+        model = _RouterExpertBiasModel(config, torch.tensor([0.0, 2.0], device=device))
+
+        finalize_model_grads(
+            [model], pg_collection=_router_bias_pg_collection(tp_dp_cp=dist.group.WORLD)
+        )
+
+        torch.testing.assert_close(model.router.expert_bias, torch.zeros(2, device=device))
         assert model.finish_grad_sync_calls == 1
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

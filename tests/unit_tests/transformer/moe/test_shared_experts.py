@@ -337,6 +337,20 @@ class TestSharedExperts:
         moe_layer.cuda()
         return moe_layer
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_shared_expert_clamp_can_be_disabled(self):
+        """The DSV4 opt-out must leave routed experts clamped but shared experts unclamped."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+
+        moe_layer = self.get_moe_layer(
+            activation_func_clamp_value=1.0, activation_func_clamp_shared_expert=False
+        )
+
+        assert moe_layer.config.activation_func_clamp_value == 1.0
+        assert moe_layer.shared_experts is not None
+        assert moe_layer.shared_experts.config.activation_func_clamp_value is None
+
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 

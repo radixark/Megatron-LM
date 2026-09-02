@@ -223,6 +223,8 @@ class TransformerConfig(ModelParallelConfig):
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu or weighted SwiGLU (MoE only)."""
 
+    activation_func_clamp_shared_expert: bool = True
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -867,6 +869,10 @@ class TransformerConfig(ModelParallelConfig):
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
     The routing decision is based on the sum of the routing scores and the expert bias.
     See https://arxiv.org/abs/2408.15664 for details."""
+
+    freeze_e_score_correction_bias: bool = False
+
+    moe_router_freeze_gate: bool = False
 
     moe_router_bias_update_rate: float = 1e-3
     """The expert bias is updated based on the number of assigned tokens to each expert
