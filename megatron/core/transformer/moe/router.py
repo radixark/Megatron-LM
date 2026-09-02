@@ -226,9 +226,7 @@ class TopKRouter(Router):
             tid2eid = torch.stack([(ids + k) % num_experts for k in range(self.topk)], dim=1).to(
                 torch.int32
             )
-            # A parameter, not a buffer: miles' weight sync materializes full tensors from the
-            # parameter buffer, and a plain buffer gathers as zeros — which would then overwrite
-            # the inference engine's own table.
+            # parameter, not buffer: the sync gathers buffers as zeros, clobbering the engine table
             self.tid2eid = torch.nn.Parameter(tid2eid, requires_grad=False)
         else:
             self.tid2eid = None
@@ -290,8 +288,7 @@ class TopKRouter(Router):
         # training. No-op (early return) unless miles enables the manager.
         from miles.utils.replay_base import routing_replay_manager
 
-        # Rollout routing replay only records main-decoder MoE layers; an MTP slot would
-        # register a stream nothing ever fills and then pop from it during replay.
+        # replay only records main-decoder MoE layers; an MTP router would pop from an empty stream
         if not self.is_mtp_layer:
             routing_replay_manager.register_to_module(self, "routing_replay")
 

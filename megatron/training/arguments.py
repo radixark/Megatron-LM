@@ -2237,9 +2237,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
-    # Hash-MoE routing (consumes actual_vocab_size for the tid2eid table) needs the TRUE unpadded
-    # vocab so the table size is TP-independent and matches the checkpoint. Fall back to padded
-    # when --vocab-size is not given. (actual_vocab_size is only read by hash routing.)
+    # tid2eid is sized from the unpadded vocab (TP-independent); only miles passes --vocab-size
     kw_args['actual_vocab_size'] = (
         args.vocab_size if getattr(args, 'vocab_size', None) else args.padded_vocab_size
     )

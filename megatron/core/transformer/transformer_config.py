@@ -315,11 +315,7 @@ class TransformerConfig(ModelParallelConfig):
         Literal['gated_delta_net', 'dsa', 'dsv4_hybrid', 'dsv4']
     ] = None
     """Type of attention variant to use. Currently support gated_delta_net, dsa, dsv4_hybrid, and
-    dsv4 (miles' custom DeepSeek-V4 sparse-attention path; see bump_docs/02-deepseek-v4.md)."""
-
-
-
-
+    dsv4 (miles' DeepSeek-V4 sparse-attention path)."""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks.
@@ -1770,8 +1766,6 @@ class TransformerConfig(ModelParallelConfig):
                     "cp_comm_type=allgather only."
                 )
         elif self.experimental_attention_variant == "dsv4":
-            # miles' DeepSeek-V4 attention (BSHD, sparse CP, tilelang kernels). Hyper-connections
-            # come from the native module; unlike dsv4_hybrid this path allows TP>1 and CP>1.
             assert self.multi_latent_attention, "dsv4 requires multi_latent_attention."
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
@@ -2913,10 +2907,8 @@ class TransformerConfig(ModelParallelConfig):
                 self.actual_vocab_size is not None
             ), "actual_vocab_size must be set when moe_n_hash_layers > 0."
             if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
-                # Hash routing reads input_ids, which only reaches the stage that owns the
-                # embedding, so every hash layer has to be built there. An explicit layout is
-                # one way to spell that stage's size; uneven first/last stages and the even
-                # split are others, so ask the layer distribution rather than the layout.
+                # hash layers read input_ids, which only the embedding stage has, so all live there;
+                # the stage size may come from a layout, uneven first/last, or the even split
                 if self.pipeline_model_parallel_layout is not None:
                     # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
                     embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]

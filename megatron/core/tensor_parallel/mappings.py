@@ -20,13 +20,7 @@ except:
 
 
 def _reduce(input_, group, fp32=False):
-    """All-reduce the input tensor across model parallel group.
-
-    Args:
-        input_: Input tensor.
-        group: Process group for all-reduce.
-        fp32: If True, cast to FP32 before all-reduce, then cast back.
-    """
+    """All-reduce across the model parallel group; `fp32` reduces in fp32 and casts back."""
     assert group is not None, "group should not be None"
 
     # Bypass the function if we are using only 1 GPU.
@@ -70,9 +64,7 @@ def _split_along_last_dim(input_, group):
 
 
 def split_along_nth_dim(input_, dim, group):
-    """Split the tensor along the specified dimension and keep the corresponding
-    slice. Pure function (no autograd). Used to scatter hash-routing input_ids
-    across the sequence dimension under sequence parallelism (miles dsv4)."""
+    """Keep this rank's slice of `input_` along `dim` (no autograd)."""
     assert group is not None, "group should not be None"
 
     world_size = group.size()
@@ -524,13 +516,7 @@ class _AllToAll(torch.autograd.Function):
 
 
 def copy_to_tensor_model_parallel_region(input_, group=None, all_reduce_grad_fp32=False):
-    """Wrapper for autograd function: forward: copy, backward allreduce
-
-    Args:
-        input_: Input tensor.
-        group: Process group for all-reduce. If None, uses default TP group.
-        all_reduce_grad_fp32: If True, cast gradients to FP32 before all-reduce, then cast back.
-    """
+    """Wrapper for autograd function: forward: copy, backward allreduce (fp32 if requested)"""
     group = get_tensor_model_parallel_group_if_none(group)
     return _CopyToModelParallelRegion.apply(input_, group, all_reduce_grad_fp32)
 
