@@ -14,6 +14,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import split_along_nth_dim
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -460,6 +461,9 @@ class MoELayer(BaseMoELayer):
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
+        # sequence parallelism scatters hidden states along seq, so scatter input_ids to match
+        if input_ids is not None and self.config.sequence_parallel:
+            input_ids = split_along_nth_dim(input_ids, dim=1, group=self.tp_group)
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids, packed_seq_params
         )

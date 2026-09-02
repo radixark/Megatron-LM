@@ -223,6 +223,10 @@ class TransformerConfig(ModelParallelConfig):
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu or weighted SwiGLU (MoE only)."""
 
+    activation_func_clamp_shared_expert: bool = True
+    """If False, skip activation_func_clamp_value inside SharedExpertMLP so only routed MoE
+    experts get the clamp."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -307,10 +311,11 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
-        None
-    )
-    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
+    experimental_attention_variant: Optional[
+        Literal['gated_delta_net', 'dsa', 'dsv4_hybrid', 'dsv4']
+    ] = None
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, dsv4_hybrid, and
+    dsv4 (miles' DeepSeek-V4 sparse-attention path)."""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks.
@@ -873,6 +878,12 @@ class TransformerConfig(ModelParallelConfig):
     in a global batch, where the bias is increased for the experts with less assigned tokens
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
+
+    freeze_e_score_correction_bias: bool = False
+    """Freeze expert score correction bias during training (DSv4 RL)."""
+
+    moe_router_freeze_gate: bool = False
+    """Freeze MoE router gate weights during training (DSv4 RL)."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -1754,6 +1765,8 @@ class TransformerConfig(ModelParallelConfig):
                     "DSAttention context parallelism currently supports "
                     "cp_comm_type=allgather only."
                 )
+        elif self.experimental_attention_variant == "dsv4":
+            assert self.multi_latent_attention, "dsv4 requires multi_latent_attention."
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -2894,14 +2907,16 @@ class TransformerConfig(ModelParallelConfig):
                 self.actual_vocab_size is not None
             ), "actual_vocab_size must be set when moe_n_hash_layers > 0."
             if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
-                assert self.pipeline_model_parallel_layout is not None, (
-                    "pipeline_model_parallel_layout must be set when using hash MoE "
-                    "layers with pipeline parallelism (PP > 1)."
-                )
-                # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
-                # All hash MoE layers must be in the same virtual pipeline stage.
-                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
-                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                # hash layers read input_ids, which only the embedding stage has, so all live there;
+                # the stage size may come from a layout, uneven first/last, or the even split
+                if self.pipeline_model_parallel_layout is not None:
+                    # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
+                    embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                    n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                else:
+                    from megatron.core.transformer.transformer_block import get_num_layers_to_build
+
+                    n_decoders_with_embedding = get_num_layers_to_build(self, vp_stage=0, pp_rank=0)
                 assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
                     f"Currently, All hash MoE layers must be in the same virtual pipeline stage "
                     f"as the embedding. The embedding stage has "

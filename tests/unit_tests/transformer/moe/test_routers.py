@@ -761,3 +761,41 @@ class TestHashRouting:
         output.sum().backward()
         assert hidden_states.grad is not None
         assert not torch.isnan(hidden_states.grad).any()
+
+
+class TestHashRoutingPipelineValidation:
+    """Hash layers read input_ids, so they must all land on the embedding's stage.
+
+    The stage's size can be spelled three ways; the check has to read all of them.
+    """
+
+    # 8 layers over PP4, each spelling giving the embedding stage 2 decoder layers.
+    SPELLINGS = [
+        pytest.param(dict(pipeline_model_parallel_layout="Ett|tt|tt|ttL"), id="layout"),
+        pytest.param(
+            dict(num_layers_in_first_pipeline_stage=2, num_layers_in_last_pipeline_stage=2),
+            id="uneven_first_last",
+        ),
+        pytest.param({}, id="even_split"),
+    ]
+
+    @staticmethod
+    def _config(n_hash_layers, **overrides):
+        return _hash_routing_config(
+            num_layers=8,
+            pipeline_model_parallel_size=4,
+            pipeline_dtype=torch.bfloat16,
+            moe_n_hash_layers=n_hash_layers,
+            **overrides,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("spelling", SPELLINGS)
+    def test_hash_layers_fitting_the_embedding_stage_are_accepted(self, spelling):
+        self._config(2, **spelling)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("spelling", SPELLINGS)
+    def test_hash_layers_spilling_past_the_embedding_stage_are_rejected(self, spelling):
+        with pytest.raises(AssertionError, match="same virtual pipeline stage"):
+            self._config(3, **spelling)
