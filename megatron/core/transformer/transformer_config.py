@@ -2914,13 +2914,9 @@ class TransformerConfig(ModelParallelConfig):
                     embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
                     n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
                 else:
-                    from megatron.core.transformer.transformer_block import (
-                        get_num_layers_to_build,
-                    )
+                    from megatron.core.transformer.transformer_block import get_num_layers_to_build
 
-                    n_decoders_with_embedding = get_num_layers_to_build(
-                        self, vp_stage=0, pp_rank=0
-                    )
+                    n_decoders_with_embedding = get_num_layers_to_build(self, vp_stage=0, pp_rank=0)
                 assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
                     f"Currently, All hash MoE layers must be in the same virtual pipeline stage "
                     f"as the embedding. The embedding stage has "
