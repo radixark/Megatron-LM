@@ -314,7 +314,9 @@ class MLP(MegatronModule):
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
-            if self.config.gated_linear_unit:
+            if self.config.gated_activation_func is not None:
+                intermediate_parallel = self.config.gated_activation_func(intermediate_parallel)
+            elif self.config.gated_linear_unit:
 
                 def glu(x):
                     x_glu, x_linear = torch.chunk(x, 2, dim=-1)

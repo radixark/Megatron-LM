@@ -887,7 +887,13 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel, permuted_probs
                 )
             else:
-                if self.config.gated_linear_unit:
+                if self.config.gated_activation_func is not None:
+                    if with_glu_interleaving:
+                        intermediate_parallel = self._remove_glu_interleaving(
+                            intermediate_parallel, self.config.moe_mlp_glu_interleave_size
+                        )
+                    intermediate_parallel = self.config.gated_activation_func(intermediate_parallel)
+                elif self.config.gated_linear_unit:
 
                     def glu(x):
                         if with_glu_interleaving:
