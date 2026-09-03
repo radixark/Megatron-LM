@@ -211,6 +211,10 @@ class TransformerConfig(ModelParallelConfig):
     activation_func: Callable[[torch.Tensor], torch.Tensor] = F.gelu
     """Activation function to use for the non-linearity in the MLP."""
 
+    gated_activation_func: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    """Activation that consumes the packed [gate | linear] GLU input itself (Kimi K3's situ);
+    None keeps the activation_func(gate) * linear form."""
+
     activation_func_fp8_input_store: bool = False
     """Store the input of MLP activation function in FP8 for backprop to save memory.
     The stored input is casted back to the original precision before backprop compuatation."""
@@ -1026,6 +1030,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
+
+    moe_latent_use_norm: bool = False
+    """RMSNorm the combined routed output in latent space before fc2_latent_proj (Kimi K3)."""
 
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
