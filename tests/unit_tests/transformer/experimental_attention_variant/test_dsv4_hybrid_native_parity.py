@@ -1208,6 +1208,108 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
+    def test_thd_fused_indexer_forward_mode_parity(self, monkeypatch, request):
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
+
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        deterministic_algorithms = torch.are_deterministic_algorithms_enabled()
+        deterministic_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        cudnn_benchmark = torch.backends.cudnn.benchmark
+        cudnn_deterministic = torch.backends.cudnn.deterministic
+
+        def restore_deterministic_settings():
+            torch.use_deterministic_algorithms(
+                deterministic_algorithms, warn_only=deterministic_warn_only
+            )
+            torch.backends.cudnn.benchmark = cudnn_benchmark
+            torch.backends.cudnn.deterministic = cudnn_deterministic
+
+        request.addfinalizer(restore_deterministic_settings)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=False)
+
+        config = _make_config(
+            "flash",
+            4,
+            use_fused_kernels=True,
+            calculate_per_token_loss=False,
+            dsa_indexer_use_sparse_loss=False,
+        )
+        config.deterministic_mode = True
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "cp"]
+        )
+        spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
+        layer = build_module(
+            spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=pg_collection
+        ).cuda()
+        layer.train()
+
+        seqlen = 4096
+        hidden_states = torch.randn(
+            seqlen, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        packed = _make_thd_packed_seq_params([seqlen])
+
+        captured_core_inputs = {}
+
+        def capture_core_inputs(_module, args, kwargs):
+            def detach_clone(value):
+                return value.detach().clone() if isinstance(value, torch.Tensor) else value
+
+            captured_core_inputs["args"] = tuple(detach_clone(value) for value in args)
+            captured_core_inputs["kwargs"] = {
+                key: detach_clone(value) for key, value in kwargs.items()
+            }
+
+        hook = layer.core_attention.register_forward_pre_hook(
+            capture_core_inputs, with_kwargs=True
+        )
+        with torch.no_grad():
+            outer_out, _ = layer(
+                hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed
+            )
+        hook.remove()
+        core_args = captured_core_inputs["args"]
+        core_kwargs = captured_core_inputs["kwargs"]
+
+        with torch.no_grad():
+            inference_warmup = layer.core_attention(*core_args, **core_kwargs)
+        training_warmup = layer.core_attention(*core_args, **core_kwargs)
+        torch.cuda.synchronize()
+        del outer_out, inference_warmup, training_warmup
+
+        with torch.no_grad():
+            inference_out_1 = layer.core_attention(*core_args, **core_kwargs)
+            inference_out_2 = layer.core_attention(*core_args, **core_kwargs)
+        training_out_1 = layer.core_attention(*core_args, **core_kwargs)
+        training_out_2 = layer.core_attention(*core_args, **core_kwargs)
+        torch.cuda.synchronize()
+
+        def report_mismatch(label, actual, expected):
+            abs_diff = (actual.float() - expected.float()).abs()
+            mismatch_count = torch.count_nonzero(abs_diff).item()
+            print(
+                f"{label}: mismatches={mismatch_count}/{actual.numel()} "
+                f"({mismatch_count / actual.numel():.6%}), "
+                f"mean_abs={abs_diff.mean().item():.9g}, max_abs={abs_diff.max().item():.9g}"
+            )
+
+        report_mismatch("inference-vs-inference", inference_out_1, inference_out_2)
+        report_mismatch("training-vs-training", training_out_1, training_out_2)
+        report_mismatch("inference-vs-training", inference_out_1, training_out_1)
+
+        torch.testing.assert_close(inference_out_1, inference_out_2, rtol=0, atol=0)
+        torch.testing.assert_close(training_out_1, training_out_2, rtol=0, atol=0)
+        torch.testing.assert_close(inference_out_1, training_out_1, rtol=0, atol=0)
+
+        del layer, hidden_states, packed, core_args, core_kwargs, captured_core_inputs
+        del inference_out_1, inference_out_2, training_out_1, training_out_2
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash"])
     @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
