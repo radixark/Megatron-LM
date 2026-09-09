@@ -1363,6 +1363,13 @@ class TestDSv4HybridNativeParity:
                 norm_inference = _q_rms_norm(norm_input, config.layernorm_epsilon)
             norm_training = _q_rms_norm(norm_input, config.layernorm_epsilon)
             report_mismatch("q-rms-norm-isolated", norm_inference, norm_training)
+            with torch.no_grad():
+                norm_eager = norm_input * torch.rsqrt(
+                    norm_input.square().mean(-1, keepdim=True) + config.layernorm_epsilon
+                )
+            report_mismatch("q-rms-norm-vs-eager", norm_inference, norm_eager)
+            torch.testing.assert_close(norm_inference, norm_training, rtol=0, atol=0)
+            torch.testing.assert_close(norm_inference, norm_eager, rtol=0, atol=0)
 
             full_training_1.backward(torch.randn_like(full_training_1))
             for name, param in layer.named_parameters():
