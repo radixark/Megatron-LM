@@ -1987,7 +1987,7 @@ class CompressedSparseAttention(MegatronModule):
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + offset, -1)
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            window_idxs, compress_topk_idxs, batch_size=b, compact=True
+            compress_topk_idxs, window_idxs, batch_size=b, compact=True
         )
         nvtx_range_pop("compressed_indices")
 
@@ -2423,8 +2423,8 @@ class CompressedSparseAttention(MegatronModule):
             compress_topk_idxs = topk_indices_cmp
 
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            window_idxs,
             compress_topk_idxs,
+            window_idxs,
             batch_size=-1,
             compact=True,
             cu_seqlens_q=cu_seqlens_q,
