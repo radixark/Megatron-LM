@@ -1208,7 +1208,8 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def test_thd_fused_indexer_forward_mode_parity(self, monkeypatch, request):
+    @pytest.mark.parametrize("stable_topk", [False, True])
+    def test_thd_fused_indexer_forward_mode_parity(self, monkeypatch, request, stable_topk):
         _skip_if_real_kernels_unavailable(need_flash_mla=True)
 
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
@@ -1237,7 +1238,7 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=False,
             dsa_indexer_use_sparse_loss=False,
         )
-        config.deterministic_mode = True
+        config.deterministic_mode = stable_topk
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=["tp", "cp"]
         )
@@ -1292,7 +1293,7 @@ class TestDSv4HybridNativeParity:
             abs_diff = (actual.float() - expected.float()).abs()
             mismatch_count = torch.count_nonzero(abs_diff).item()
             print(
-                f"{label}: mismatches={mismatch_count}/{actual.numel()} "
+                f"stable_topk={stable_topk} {label}: mismatches={mismatch_count}/{actual.numel()} "
                 f"({mismatch_count / actual.numel():.6%}), "
                 f"mean_abs={abs_diff.mean().item():.9g}, max_abs={abs_diff.max().item():.9g}"
             )
@@ -1301,9 +1302,29 @@ class TestDSv4HybridNativeParity:
         report_mismatch("training-vs-training", training_out_1, training_out_2)
         report_mismatch("inference-vs-training", inference_out_1, training_out_1)
 
-        torch.testing.assert_close(inference_out_1, inference_out_2, rtol=0, atol=0)
-        torch.testing.assert_close(training_out_1, training_out_2, rtol=0, atol=0)
-        torch.testing.assert_close(inference_out_1, training_out_1, rtol=0, atol=0)
+        if stable_topk:
+            torch.testing.assert_close(inference_out_1, inference_out_2, rtol=0, atol=0)
+            torch.testing.assert_close(training_out_1, training_out_2, rtol=0, atol=0)
+            torch.testing.assert_close(inference_out_1, training_out_1, rtol=0, atol=0)
+
+            with torch.no_grad():
+                full_inference_1, _ = layer(hidden_states, None, packed_seq_params=packed)
+                full_inference_2, _ = layer(hidden_states, None, packed_seq_params=packed)
+            full_training_1, _ = layer(hidden_states, None, packed_seq_params=packed)
+            full_training_2, _ = layer(hidden_states, None, packed_seq_params=packed)
+            report_mismatch("full-inference-vs-inference", full_inference_1, full_inference_2)
+            report_mismatch("full-training-vs-training", full_training_1, full_training_2)
+            report_mismatch("full-inference-vs-training", full_inference_1, full_training_1)
+            torch.testing.assert_close(full_inference_1, full_inference_2, rtol=0, atol=0)
+            torch.testing.assert_close(full_training_1, full_training_2, rtol=0, atol=0)
+            torch.testing.assert_close(full_inference_1, full_training_1, rtol=0, atol=0)
+
+            full_training_1.backward(torch.randn_like(full_training_1))
+            for name, param in layer.named_parameters():
+                assert param.grad is not None, f"Missing gradient for {name}"
+                assert torch.isfinite(param.grad).all(), f"Non-finite gradient for {name}"
+            print("stable_topk=True backward: all parameter gradients present and finite")
+            del full_inference_1, full_inference_2, full_training_1, full_training_2
 
         del layer, hidden_states, packed, core_args, core_kwargs, captured_core_inputs
         del inference_out_1, inference_out_2, training_out_1, training_out_2
