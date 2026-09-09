@@ -1307,24 +1307,73 @@ class TestDSv4HybridNativeParity:
             torch.testing.assert_close(training_out_1, training_out_2, rtol=0, atol=0)
             torch.testing.assert_close(inference_out_1, training_out_1, rtol=0, atol=0)
 
+            traces = {"no_grad": {}, "grad": {}}
+            phase = "no_grad"
+
+            def capture_tensors(value, prefix):
+                if isinstance(value, torch.Tensor):
+                    traces[phase][prefix] = value.detach().clone()
+                elif isinstance(value, (tuple, list)):
+                    for index, item in enumerate(value):
+                        capture_tensors(item, f"{prefix}.{index}")
+                elif isinstance(value, dict):
+                    for key, item in value.items():
+                        capture_tensors(item, f"{prefix}.{key}")
+
+            def activation_hook(name):
+                def capture(_module, args, kwargs, output):
+                    capture_tensors(args, f"{name}.input")
+                    capture_tensors(kwargs, f"{name}.kwargs")
+                    capture_tensors(output, f"{name}.output")
+
+                return capture
+
+            hooks = []
+            for name in (
+                "linear_q_down_proj", "q_layernorm", "linear_q_up_proj",
+                "linear_kv_proj", "kv_layernorm", "core_attention", "linear_proj",
+            ):
+                hooks.append(
+                    getattr(layer, name).register_forward_hook(
+                        activation_hook(name), with_kwargs=True
+                    )
+                )
             with torch.no_grad():
                 full_inference_1, _ = layer(hidden_states, None, packed_seq_params=packed)
                 full_inference_2, _ = layer(hidden_states, None, packed_seq_params=packed)
+            phase = "grad"
             full_training_1, _ = layer(hidden_states, None, packed_seq_params=packed)
             full_training_2, _ = layer(hidden_states, None, packed_seq_params=packed)
+            for hook in hooks:
+                hook.remove()
             report_mismatch("full-inference-vs-inference", full_inference_1, full_inference_2)
             report_mismatch("full-training-vs-training", full_training_1, full_training_2)
             report_mismatch("full-inference-vs-training", full_inference_1, full_training_1)
-            torch.testing.assert_close(full_inference_1, full_inference_2, rtol=0, atol=0)
-            torch.testing.assert_close(full_training_1, full_training_2, rtol=0, atol=0)
-            torch.testing.assert_close(full_inference_1, full_training_1, rtol=0, atol=0)
+            for name, value in traces["no_grad"].items():
+                report_mismatch(f"trace.{name}", value, traces["grad"][name])
+
+            from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+                _q_rms_norm,
+            )
+
+            norm_input = traces["grad"]["linear_q_up_proj.output.0"].reshape(
+                seqlen, config.num_attention_heads, config.v_head_dim
+            ).requires_grad_(True)
+            with torch.no_grad():
+                norm_inference = _q_rms_norm(norm_input, config.layernorm_epsilon)
+            norm_training = _q_rms_norm(norm_input, config.layernorm_epsilon)
+            report_mismatch("q-rms-norm-isolated", norm_inference, norm_training)
 
             full_training_1.backward(torch.randn_like(full_training_1))
             for name, param in layer.named_parameters():
                 assert param.grad is not None, f"Missing gradient for {name}"
                 assert torch.isfinite(param.grad).all(), f"Non-finite gradient for {name}"
             print("stable_topk=True backward: all parameter gradients present and finite")
+            torch.testing.assert_close(full_inference_1, full_inference_2, rtol=0, atol=0)
+            torch.testing.assert_close(full_training_1, full_training_2, rtol=0, atol=0)
+            torch.testing.assert_close(full_inference_1, full_training_1, rtol=0, atol=0)
             del full_inference_1, full_inference_2, full_training_1, full_training_2
+            del traces, norm_input, norm_inference, norm_training
 
         del layer, hidden_states, packed, core_args, core_kwargs, captured_core_inputs
         del inference_out_1, inference_out_2, training_out_1, training_out_2
