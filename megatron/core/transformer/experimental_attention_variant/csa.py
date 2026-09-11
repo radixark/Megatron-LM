@@ -1987,6 +1987,11 @@ class CompressedSparseAttention(MegatronModule):
             deterministic=self.config.deterministic_mode,
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + offset, -1)
+        # Same lowering as ``FusedCSAIndexerSparseAttnFunc.forward`` (the
+        # grad-enabled path): compressed ids, then window ids, globalized and
+        # compacted. FlashMLA's online softmax accumulates in key order, so a
+        # forward-only pass reproduces the training forward only if it hands
+        # the kernel the same id sequence.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
             compress_topk_idxs, window_idxs, batch_size=b, compact=True
         )
@@ -2425,6 +2430,9 @@ class CompressedSparseAttention(MegatronModule):
         else:
             compress_topk_idxs = topk_indices_cmp
 
+        # Same group order as ``FusedCSAIndexerSparseAttnFunc.forward``:
+        # compressed ids first, then window ids, before globalizing and
+        # compacting, so both grad modes hand FlashMLA an identical id sequence.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
             compress_topk_idxs,
             window_idxs,

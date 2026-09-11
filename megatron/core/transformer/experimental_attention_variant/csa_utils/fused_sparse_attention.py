@@ -792,7 +792,23 @@ def csa_sparse_attn(
 
 
 def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tensor:
-    """Select highest-scoring valid keys, resolving ties toward the smallest key id."""
+    """Select the ``topk_k`` highest-scoring key ids per row with a fixed tie order.
+
+    Rows may only draw from their first ``seq_lens[row]`` key columns; a row with
+    fewer valid keys than ``topk_k`` is padded with ``-1``. Exact score ties are
+    resolved toward the smallest key id and the selected ids are returned in
+    descending-score order, so identical inputs always yield identical ids. The
+    radix Top-K kernel does not order equal scores, which matters for ReLU-scored
+    indexers where many keys share a score of exactly zero.
+
+    Args:
+        scores: ``(rows, sk)`` fp32 indexer scores; masked positions hold ``-inf``.
+        seq_lens: ``(rows,)`` int32 number of candidate key columns per row.
+        topk_k: number of ids to select, at most ``sk``.
+
+    Returns:
+        ``(rows, topk_k)`` int32 key ids, ``-1`` where a row has no more valid keys.
+    """
     columns = torch.arange(scores.shape[-1], device=scores.device, dtype=seq_lens.dtype)
     candidates = scores.masked_fill(columns.unsqueeze(0) >= seq_lens.unsqueeze(1), float("-inf"))
     sorted_scores, order = torch.sort(candidates, dim=-1, descending=True, stable=True)
@@ -979,8 +995,9 @@ def indexer_topk(
         max_seqlen_kv: THD only — per-batch max KV length.
         q_causal_offsets: THD only — optional ``(B,)`` int32 CUDA tensor. Entry
             ``b`` is the sequence-relative position of that segment's first Q.
-        deterministic: select keys in descending-score order, resolving exact
-            ties toward the smallest local KV id.
+        deterministic: select the Top-K from the dense scores with a stable sort
+            instead of the radix kernel. Ids come back in descending-score order
+            and exact-value ties resolve toward the smallest local KV id.
 
     Returns:
         SBHD: ``(topk_indices (b, sq, topk),  topk_length (b, sq))`` int32
@@ -2266,8 +2283,9 @@ def fused_csa_indexer_sparse_attn(
             so padding rows are excluded from the indexer KL loss and
             backward gradients.  Ignored when ``None`` or when it equals
             ``cu_seqlens_q``.
-        deterministic: select keys in descending-score order, resolving exact
-            ties toward the smallest local KV id.
+        deterministic: select the Top-K from the dense scores with a stable sort
+            instead of the radix kernel. Ids come back in descending-score order
+            and exact-value ties resolve toward the smallest local KV id.
     """
     if cu_seqlens_q is not None:
         missing = [
