@@ -1208,8 +1208,7 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.parametrize("stable_topk", [False, True])
-    def test_thd_fused_indexer_forward_mode_parity(self, monkeypatch, request, stable_topk):
+    def test_thd_fused_indexer_forward_mode_parity(self, monkeypatch, request):
         _skip_if_real_kernels_unavailable(need_flash_mla=True)
 
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
@@ -1238,10 +1237,8 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=False,
             dsa_indexer_use_sparse_loss=False,
         )
-        config.deterministic_mode = stable_topk
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["tp", "cp"]
-        )
+        config.deterministic_mode = True
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
         layer = build_module(
             spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=pg_collection
@@ -1265,9 +1262,7 @@ class TestDSv4HybridNativeParity:
                 key: detach_clone(value) for key, value in kwargs.items()
             }
 
-        hook = layer.core_attention.register_forward_pre_hook(
-            capture_core_inputs, with_kwargs=True
-        )
+        hook = layer.core_attention.register_forward_pre_hook(capture_core_inputs, with_kwargs=True)
         with torch.no_grad():
             outer_out, _ = layer(
                 hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed
@@ -1293,7 +1288,7 @@ class TestDSv4HybridNativeParity:
             abs_diff = (actual.float() - expected.float()).abs()
             mismatch_count = torch.count_nonzero(abs_diff).item()
             print(
-                f"stable_topk={stable_topk} {label}: mismatches={mismatch_count}/{actual.numel()} "
+                f"{label}: mismatches={mismatch_count}/{actual.numel()} "
                 f"({mismatch_count / actual.numel():.6%}), "
                 f"mean_abs={abs_diff.mean().item():.9g}, max_abs={abs_diff.max().item():.9g}"
             )
@@ -1302,85 +1297,89 @@ class TestDSv4HybridNativeParity:
         report_mismatch("training-vs-training", training_out_1, training_out_2)
         report_mismatch("inference-vs-training", inference_out_1, training_out_1)
 
-        if stable_topk:
-            torch.testing.assert_close(inference_out_1, inference_out_2, rtol=0, atol=0)
-            torch.testing.assert_close(training_out_1, training_out_2, rtol=0, atol=0)
-            torch.testing.assert_close(inference_out_1, training_out_1, rtol=0, atol=0)
+        torch.testing.assert_close(inference_out_1, inference_out_2, rtol=0, atol=0)
+        torch.testing.assert_close(training_out_1, training_out_2, rtol=0, atol=0)
+        torch.testing.assert_close(inference_out_1, training_out_1, rtol=0, atol=0)
 
-            traces = {"no_grad": {}, "grad": {}}
-            phase = "no_grad"
+        traces = {"no_grad": {}, "grad": {}}
+        phase = "no_grad"
 
-            def capture_tensors(value, prefix):
-                if isinstance(value, torch.Tensor):
-                    traces[phase][prefix] = value.detach().clone()
-                elif isinstance(value, (tuple, list)):
-                    for index, item in enumerate(value):
-                        capture_tensors(item, f"{prefix}.{index}")
-                elif isinstance(value, dict):
-                    for key, item in value.items():
-                        capture_tensors(item, f"{prefix}.{key}")
+        def capture_tensors(value, prefix):
+            if isinstance(value, torch.Tensor):
+                traces[phase][prefix] = value.detach().clone()
+            elif isinstance(value, (tuple, list)):
+                for index, item in enumerate(value):
+                    capture_tensors(item, f"{prefix}.{index}")
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    capture_tensors(item, f"{prefix}.{key}")
 
-            def activation_hook(name):
-                def capture(_module, args, kwargs, output):
-                    capture_tensors(args, f"{name}.input")
-                    capture_tensors(kwargs, f"{name}.kwargs")
-                    capture_tensors(output, f"{name}.output")
+        def activation_hook(name):
+            def capture(_module, args, kwargs, output):
+                capture_tensors(args, f"{name}.input")
+                capture_tensors(kwargs, f"{name}.kwargs")
+                capture_tensors(output, f"{name}.output")
 
-                return capture
+            return capture
 
-            hooks = []
-            for name in (
-                "linear_q_down_proj", "q_layernorm", "linear_q_up_proj",
-                "linear_kv_proj", "kv_layernorm", "core_attention", "linear_proj",
-            ):
-                hooks.append(
-                    getattr(layer, name).register_forward_hook(
-                        activation_hook(name), with_kwargs=True
-                    )
-                )
-            with torch.no_grad():
-                full_inference_1, _ = layer(hidden_states, None, packed_seq_params=packed)
-                full_inference_2, _ = layer(hidden_states, None, packed_seq_params=packed)
-            phase = "grad"
-            full_training_1, _ = layer(hidden_states, None, packed_seq_params=packed)
-            full_training_2, _ = layer(hidden_states, None, packed_seq_params=packed)
-            for hook in hooks:
-                hook.remove()
-            report_mismatch("full-inference-vs-inference", full_inference_1, full_inference_2)
-            report_mismatch("full-training-vs-training", full_training_1, full_training_2)
-            report_mismatch("full-inference-vs-training", full_inference_1, full_training_1)
-            for name, value in traces["no_grad"].items():
-                report_mismatch(f"trace.{name}", value, traces["grad"][name])
-
-            from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
-                _q_rms_norm,
+        hooks = []
+        for name in (
+            "linear_q_down_proj",
+            "q_layernorm",
+            "linear_q_up_proj",
+            "linear_kv_proj",
+            "kv_layernorm",
+            "core_attention",
+            "linear_proj",
+        ):
+            hooks.append(
+                getattr(layer, name).register_forward_hook(activation_hook(name), with_kwargs=True)
             )
+        with torch.no_grad():
+            full_inference_1, _ = layer(hidden_states, None, packed_seq_params=packed)
+            full_inference_2, _ = layer(hidden_states, None, packed_seq_params=packed)
+        phase = "grad"
+        full_training_1, _ = layer(hidden_states, None, packed_seq_params=packed)
+        full_training_2, _ = layer(hidden_states, None, packed_seq_params=packed)
+        for hook in hooks:
+            hook.remove()
+        report_mismatch("full-inference-vs-inference", full_inference_1, full_inference_2)
+        report_mismatch("full-training-vs-training", full_training_1, full_training_2)
+        report_mismatch("full-inference-vs-training", full_inference_1, full_training_1)
+        for name, value in traces["no_grad"].items():
+            report_mismatch(f"trace.{name}", value, traces["grad"][name])
 
-            norm_input = traces["grad"]["linear_q_up_proj.output.0"].reshape(
-                seqlen, config.num_attention_heads, config.v_head_dim
-            ).requires_grad_(True)
-            with torch.no_grad():
-                norm_inference = _q_rms_norm(norm_input, config.layernorm_epsilon)
-            norm_training = _q_rms_norm(norm_input, config.layernorm_epsilon)
-            report_mismatch("q-rms-norm-isolated", norm_inference, norm_training)
-            with torch.no_grad():
-                norm_eager = norm_input * torch.rsqrt(
-                    norm_input.square().mean(-1, keepdim=True) + config.layernorm_epsilon
-                )
-            report_mismatch("q-rms-norm-vs-eager", norm_inference, norm_eager)
-            torch.testing.assert_close(norm_inference, norm_training, rtol=0, atol=0)
-            torch.testing.assert_close(norm_inference, norm_eager, rtol=0, atol=0)
+        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+            _q_rms_norm,
+        )
 
-            full_training_1.backward(torch.randn_like(full_training_1))
-            for name, param in layer.named_parameters():
-                assert param.grad is not None, f"Missing gradient for {name}"
-                assert torch.isfinite(param.grad).all(), f"Non-finite gradient for {name}"
-            print("stable_topk=True backward: all parameter gradients present and finite")
-            torch.testing.assert_close(full_inference_1, full_inference_2, rtol=0, atol=0)
-            torch.testing.assert_close(full_training_1, full_training_2, rtol=0, atol=0)
-            torch.testing.assert_close(full_inference_1, full_training_1, rtol=0, atol=0)
-            del full_inference_1, full_inference_2, full_training_1, full_training_2
-            del traces, norm_input, norm_inference, norm_training
+        norm_input = (
+            traces["grad"]["linear_q_up_proj.output.0"]
+            .reshape(seqlen, config.num_attention_heads, config.v_head_dim)
+            .requires_grad_(True)
+        )
+        with torch.no_grad():
+            norm_inference = _q_rms_norm(norm_input, config.layernorm_epsilon)
+        norm_training = _q_rms_norm(norm_input, config.layernorm_epsilon)
+        report_mismatch("q-rms-norm-isolated", norm_inference, norm_training)
+        with torch.no_grad():
+            norm_eager = norm_input * torch.rsqrt(
+                norm_input.square().mean(-1, keepdim=True) + config.layernorm_epsilon
+            )
+        report_mismatch("q-rms-norm-vs-eager", norm_inference, norm_eager)
+        torch.testing.assert_close(norm_inference, norm_training, rtol=0, atol=0)
+        torch.testing.assert_close(norm_inference, norm_eager, rtol=0, atol=0)
+
+        full_training_1.backward(torch.randn_like(full_training_1))
+        for name, param in layer.named_parameters():
+            assert param.grad is not None, f"Missing gradient for {name}"
+            assert torch.isfinite(param.grad).all(), f"Non-finite gradient for {name}"
+        print("backward: all parameter gradients present and finite")
+        torch.testing.assert_close(full_inference_1, full_inference_2, rtol=0, atol=0)
+        torch.testing.assert_close(full_training_1, full_training_2, rtol=0, atol=0)
+        torch.testing.assert_close(full_inference_1, full_training_1, rtol=0, atol=0)
+        del full_inference_1, full_inference_2, full_training_1, full_training_2
+        del traces, norm_input, norm_inference, norm_training
 
         del layer, hidden_states, packed, core_args, core_kwargs, captured_core_inputs
         del inference_out_1, inference_out_2, training_out_1, training_out_2
