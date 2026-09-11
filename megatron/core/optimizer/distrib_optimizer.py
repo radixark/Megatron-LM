@@ -1999,24 +1999,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             cur_param_end = 0
                         else:
                             cur_param_end = bucket_state[i]['gbuf_local_end']
-                        world_param_end = data_parallel_rank * gbuf_local_numel + cur_param_end
-                        # Insert padding if there is a gap between next param,
-                        # but not exceeding unpadded gbuf size
-                        if (
-                            next_param_start != cur_param_end
-                            and world_param_end < gbuf_world_numel_unpadded
-                        ):
+                        rank_world_offset = data_parallel_rank * gbuf_local_numel
+                        world_param_end = rank_world_offset + cur_param_end
+                        world_next_param_start = rank_world_offset + next_param_start
+                        world_padding_end = min(world_next_param_start, gbuf_world_numel_unpadded)
+                        padding_numel = world_padding_end - world_param_end
+                        # Insert padding if there is a gap between parameters, but exclude
+                        # any bucket-end padding beyond the unpadded checkpoint tensor.
+                        if padding_numel > 0:
+                            local_padding_end = cur_param_end + padding_numel
                             pad_tensors = {
-                                k: torch.empty(
-                                    next_param_start - cur_param_end, dtype=v.dtype, device=v.device
-                                )
+                                k: torch.empty(padding_numel, dtype=v.dtype, device=v.device)
                                 for k, v in bucket_state[i].items()
                                 if isinstance(v, torch.Tensor)
                             }
                             all_pad_tensors[i + 1] = {
                                 **pad_tensors,
                                 'gbuf_local_start': cur_param_end,
-                                'gbuf_local_end': next_param_start,
+                                'gbuf_local_end': local_padding_end,
                                 'padding': True,
                             }
 

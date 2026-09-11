@@ -25,7 +25,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import (
+    ChainedOptimizer,
+    DistributedOptimizer,
+    OptimizerConfig,
+    get_megatron_optimizer,
+)
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -605,6 +610,46 @@ class TestDistributedOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_bucket_space_optimizer_omits_outer_bucket_padding(self):
+        """Checkpoint padding must stop at the unpadded global tensor boundary."""
+        optimizer = mock.MagicMock()
+        optimizer.data_parallel_group.rank.return_value = 1
+        optimizer.data_parallel_group.size.return_value = 2
+        optimizer.data_parallel_group_idx = 0
+        optimizer.distributed_optimizer_instance_id = 0
+        optimizer.gbuf_ranges = [None]
+
+        bucket = mock.MagicMock()
+        bucket.numel_unpadded = 192
+        bucket.grad_data.numel.return_value = 256
+        buffer = mock.MagicMock()
+        buffer.buckets = [bucket]
+        optimizer.buffers = [buffer]
+
+        bucket_state = [
+            {
+                'param': torch.empty(32),
+                'exp_avg': torch.empty(32),
+                'exp_avg_sq': torch.empty(32),
+                'gbuf_local_start': 0,
+                'gbuf_local_end': 32,
+            }
+        ]
+        optimizer.get_parameter_state_dp_reshardable.return_value = {
+            'per_bucket_numel': [[256]],
+            'per_bucket_numel_unpadded': [[192]],
+            0: {torch.bfloat16: [bucket_state]},
+        }
+
+        state = DistributedOptimizer.sharded_param_state_dp_reshardable(optimizer, {})
+        padding_state = state[0][torch.bfloat16][0][-1]
+
+        for key in ('param', 'exp_avg', 'exp_avg_sq'):
+            padding_tensor = padding_state[key]
+            assert padding_tensor.local_shape == (32,)
+            assert padding_tensor.global_offset == (160,)
+            assert padding_tensor.global_shape == (192,)
 
     @pytest.mark.parametrize(
         ("source_offload", "destination_offload"), [(False, True), (True, False)]
