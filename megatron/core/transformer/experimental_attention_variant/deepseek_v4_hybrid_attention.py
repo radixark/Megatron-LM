@@ -36,8 +36,7 @@ else:
     (TEColumnParallelLinear, TELinear, set_save_original_input) = (None, None, None)
 
 
-# Preserve eager BF16 rounding in both autograd and forward-only graphs.
-@torch.compile(options={"emulate_precision_casts": True})
+@torch.compile
 def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Fused RMS normalization for query tensor (no learnable weight)."""
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
