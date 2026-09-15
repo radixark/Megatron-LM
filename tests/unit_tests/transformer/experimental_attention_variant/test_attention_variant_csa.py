@@ -2153,6 +2153,8 @@ class TestCompressedSparseAttentionThd:
             "dsa_kernel_backend": "cudnn",
             "deterministic_mode": True,
             "dsa_indexer_loss_coeff": 0.0,
+            "dsa_indexer_n_heads": 64,
+            "dsa_indexer_head_dim": 128,
             "dsa_indexer_use_sparse_loss": False,
         }
         saved = {name: getattr(self.config, name) for name in overrides}
@@ -2212,7 +2214,13 @@ class TestCompressedSparseAttentionThd:
 
         # FlashMLA's sparse kernel is built for the 512-wide DSA value head.
         config = _make_mla_config(
-            v_head_dim=512, csa_compress_ratios=[4], dsa_indexer_loss_coeff=0.0
+            num_layers=1,
+            num_attention_heads=64,
+            v_head_dim=512,
+            csa_compress_ratios=[4],
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_loss_coeff=0.0,
         )
         config.dsa_kernel_backend = "cudnn"
         config.deterministic_mode = True
