@@ -71,6 +71,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.offload_fraction = offload_fraction
         self.cpu_optimizer_cls = cpu_optimizer_cls
         self.gpu_optimizer_cls = gpu_optimizer_cls
+        self.omit_exp_avg = cpu_optimizer_cls is torch.optim.AdamW and all(
+            group.get("betas", (0.9, 0.999))[0] == 0.0 for group in self.param_groups
+        )
+        if self.omit_exp_avg and offload_fraction != 1.0:
+            raise ValueError("beta1=0 CPU Adam supports only full optimizer offload")
         self.pin_cpu_grads = pin_cpu_grads
         self.pin_cpu_params = pin_cpu_params
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
@@ -94,6 +99,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     fp32_param.requires_grad = True
                 else:
                     fp32_param.requires_grad = False
+                    fp32_param.grad = None
 
         # Sync the grads from GPU to CPU.
         for optimizer in self.cpu_optimizers:
@@ -102,6 +108,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 grad = getattr(gpu_param, "decoupled_grad", gpu_param.grad)
                 if grad is None:
                     param.requires_grad = False
+                    param.grad = None
                     continue
 
                 param.requires_grad = False
@@ -109,8 +116,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     self.cpu_copy_map_grad[param] = torch.empty(
                         param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
                     )
-                    param.grad = self.cpu_copy_map_grad[param]
-
+                param.grad = self.cpu_copy_map_grad[param]
                 self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
 
@@ -167,11 +173,18 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if self.gpu_optimizer:
             self.gpu_optimizer.step(closure)
 
+        if self.omit_exp_avg:
+            # Import at runtime because MegatronOptimizer also imports HDO.
+            from ..optimizer import _step_with_adam_beta1_zero
+
         for cpu_optimizer in self.cpu_optimizers:
             d2h_event = self._cpu_optimizer_map_data_event.pop(cpu_optimizer, None)
             if d2h_event is not None:
                 d2h_event.synchronize()
-            cpu_optimizer.step(closure)
+            if self.omit_exp_avg:
+                _step_with_adam_beta1_zero(cpu_optimizer, closure)
+            else:
+                cpu_optimizer.step(closure)
 
         # Sync state and param_groups to HDO after each step.
         # NOTE: It is possible for the optimizer to change the properties
@@ -207,6 +220,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             )
         elif len(self.cpu_param_groups) > 0:
             self.cpu_optimizers = [self.cpu_optimizer_cls(self.cpu_param_groups)]
+
+        if self.omit_exp_avg:
+            for optimizer in self.cpu_optimizers:
+                optimizer.omit_exp_avg = True
+                optimizer.defaults.update(fused=True, foreach=False)
+                for group in optimizer.param_groups:
+                    group.update(fused=True, foreach=False)
 
         if len(self.gpu_param_groups) > 0:
             self.gpu_optimizer = self.gpu_optimizer_cls(self.gpu_param_groups)
@@ -371,8 +391,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             return
         for param, v in self.state.items():
             # Native FP32 params do not need a separate master parameter and are
-            # intentionally absent from param_to_fp32_param.
-            fp32_param = self.param_to_fp32_param.get(param)
+            # absent from param_to_fp32_param, but still have an offloaded copy.
+            fp32_param = self.param_to_fp32_param.get(
+                param, self.gpu_params_map_cpu_copy.get(param)
+            )
             if fp32_param is not None:
                 fp32_param.data.copy_(v["master_param"])
 
@@ -406,6 +428,17 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             Returns:
                 dict: The modified state dictionary with `float32` parameters.
             """
+            if self.omit_exp_avg:
+                for group in state_dict["param_groups"]:
+                    if group["betas"][0] != 0.0:
+                        raise ValueError("beta1=0 CPU Adam cannot restore nonzero beta1")
+                state_dict = {
+                    **state_dict,
+                    "state": {
+                        key: {name: value for name, value in state.items() if name != "exp_avg"}
+                        for key, state in state_dict["state"].items()
+                    },
+                }
             if not self.param_update_in_fp32:
                 return state_dict
 

@@ -56,6 +56,136 @@ from .optimizer_config import OptimizerConfig
 logger = getLogger(__name__)
 
 
+@torch.no_grad()
+def _initialize_adam_beta1_zero_state(
+    optimizer: torch.optim.Optimizer, param: torch.Tensor
+) -> None:
+    """Initialize stock Adam's retained state without allocating its first moment."""
+    state = optimizer.state[param]
+    state.pop("exp_avg", None)
+    if isinstance(optimizer, torch.optim.AdamW):
+        if param.device.type != "cpu" or param.dtype != torch.float32 or not param.is_contiguous():
+            raise ValueError("beta1=0 CPU Adam requires contiguous CPU FP32 parameters")
+        if "exp_avg_sq" not in state:
+            state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+        if "step" not in state:
+            state["step"] = torch.zeros((), dtype=torch.float32, device="cpu")
+        return
+
+    # TE's public initializer unconditionally allocates both moments. Its
+    # per-state initializer preserves the existing precision and remainder rules.
+    if "exp_avg_sq" not in state:
+        optimizer._initialize_state(param, "exp_avg_sq", zero_buffer=True)
+    if optimizer.master_weights and "master_param" not in state:
+        store_remainders = optimizer.store_param_remainders and param.dtype == torch.bfloat16
+        optimizer._initialize_state(
+            param, "master_param", zero_buffer=False, store_param_remainders=store_remainders
+        )
+        if not store_remainders:
+            master = (
+                param.dequantize(dtype=torch.float32).clone().detach()
+                if is_float8tensor(param)
+                else param.clone().detach().float()
+            )
+            optimizer.set_scaled_state(param, "master_param", master)
+
+
+def _strip_adam_beta1_zero_state(optimizer: torch.optim.Optimizer, state_dict: dict) -> dict:
+    """Filter legacy momentum before a stock optimizer can cast or allocate it."""
+    if not getattr(optimizer, "omit_exp_avg", False):
+        return state_dict
+    if any(group["betas"][0] != 0.0 for group in state_dict["param_groups"]):
+        raise ValueError("beta1=0 Adam cannot restore nonzero beta1")
+    return {
+        **state_dict,
+        "state": {
+            key: (
+                {name: value for name, value in state.items() if name != "exp_avg"}
+                if isinstance(state, dict)
+                else state
+            )
+            for key, state in state_dict["state"].items()
+        },
+    }
+
+
+@torch.no_grad()
+def _step_with_adam_beta1_zero(
+    optimizer: torch.optim.Optimizer, closure: Callable | None = None
+) -> Any:
+    """Borrow current gradients for stock Adam's first moment only during its update."""
+    if not getattr(optimizer, "omit_exp_avg", False) or hasattr(optimizer, "cpu_optimizers"):
+        return optimizer.step() if closure is None else optimizer.step(closure)
+
+    cpu_adam = isinstance(optimizer, torch.optim.AdamW)
+    if not cpu_adam:
+        if optimizer.capturable or not optimizer.adam_w_mode:
+            raise ValueError("beta1=0 GPU Adam requires noncapturable AdamW")
+        if optimizer.exp_avg_dtype != torch.float32 or optimizer.exp_avg_sq_dtype != torch.float32:
+            raise ValueError("beta1=0 GPU Adam requires FP32 moments")
+    attached_states = []
+
+    def prepare_state() -> None:
+        for group in optimizer.param_groups:
+            if group["betas"][0] != 0.0:
+                raise ValueError("beta1=0 Adam requires beta1=0.0 in every parameter group")
+            if cpu_adam:
+                if any(
+                    group.get(option, False)
+                    for option in ("amsgrad", "maximize", "capturable", "differentiable")
+                ) or not group.get("bias_correction", True):
+                    raise ValueError("beta1=0 CPU Adam requires ordinary fused AdamW")
+                group.update(fused=True, foreach=False)
+            for param in group["params"]:
+                grad = (
+                    getattr(param, "decoupled_grad", None)
+                    if getattr(optimizer, "use_decoupled_grad", False)
+                    else param.grad
+                )
+                if cpu_adam and grad is None:
+                    continue
+                # TE initializes even parameters without gradients before checking
+                # for grad=None. Keep their retained state nonempty to avoid that
+                # unconditional allocation of both moments in its stock step.
+                state = optimizer.state[param]
+                if (not cpu_adam or grad is not None) and (
+                    "exp_avg_sq" not in state
+                    or (cpu_adam and "step" not in state)
+                    or (getattr(optimizer, "master_weights", False) and "master_param" not in state)
+                ):
+                    _initialize_adam_beta1_zero_state(optimizer, param)
+                if grad is None:
+                    continue
+                device_type = "cpu" if cpu_adam else "cuda"
+                if (
+                    type(grad) is not torch.Tensor
+                    or grad.device.type != device_type
+                    or grad.dtype != torch.float32
+                    or grad.layout != torch.strided
+                    or not grad.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"beta1=0 Adam requires contiguous {device_type.upper()} FP32 gradients"
+                    )
+                state["exp_avg"] = grad
+                attached_states.append(state)
+
+    def prepare_after_closure():
+        with torch.enable_grad():
+            loss = closure()
+        prepare_state()
+        return loss
+
+    try:
+        if closure is not None:
+            return optimizer.step(prepare_after_closure)
+        prepare_state()
+        return optimizer.step()
+    finally:
+        for state in attached_states:
+            state.pop("exp_avg", None)
+
+
 def _zero_grad_group_helper(
     group: List[torch.nn.Parameter], set_to_none: bool, use_decoupled_grad: bool = False
 ):
@@ -208,6 +338,7 @@ class MegatronOptimizer(ABC):
             optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
             d2h_stream=d2h_stream,
             h2d_stream=h2d_stream,
+            step_fn=lambda: _step_with_adam_beta1_zero(self.optimizer),
         )
 
     def set_optimizer_state_offload_deferred_lifecycle(
@@ -867,7 +998,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             )
         if not self.is_stub_optimizer:
             if self._optimizer_state_offloader is None:
-                self.optimizer.step()
+                _step_with_adam_beta1_zero(self.optimizer)
             else:
                 self._optimizer_state_offloader.step()
         if timers is not None:
@@ -1259,6 +1390,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
             self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
         )
+        state_dict[optimizer_key] = _strip_adam_beta1_zero_state(
+            self.optimizer, state_dict[optimizer_key]
+        )
         if self._optimizer_state_offloader is None:
             self.optimizer.load_state_dict(state_dict[optimizer_key])
         else:
@@ -1360,7 +1494,7 @@ class FP32Optimizer(MegatronOptimizer):
             timers('optimizer-inner-step', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        self.optimizer.step()
+        _step_with_adam_beta1_zero(self.optimizer)
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
@@ -1417,6 +1551,7 @@ class FP32Optimizer(MegatronOptimizer):
         state_dict['param_groups'] = self._filter_and_reorder_param_groups(
             self.optimizer.param_groups, state_dict['param_groups']
         )
+        state_dict = _strip_adam_beta1_zero_state(self.optimizer, state_dict)
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(

@@ -236,7 +236,8 @@ class OptimizerConfig:
     # Adam.
     adam_beta1: float = 0.9
     """First coefficient for computing running averages of gradient and its square in Adam
-    optimizer.
+    optimizer. Exactly zero selects AdamW without persistent first-moment state,
+    using TE on GPU or a direct update with full CPU optimizer offload.
     """
 
     adam_beta2: float = 0.999
@@ -424,6 +425,25 @@ class OptimizerConfig:
     def __post_init__(self):
         """Check the validity of the config."""
 
+        if self.optimizer == 'adam' and self.adam_beta1 == 0.0:
+            assert self.decoupled_weight_decay, "beta1=0 Adam requires decoupled weight decay"
+            assert (
+                not self.optimizer_cuda_graph
+            ), "beta1=0 Adam does not support optimizer CUDA graphs"
+            assert (
+                self.exp_avg_dtype == self.exp_avg_sq_dtype == torch.float32
+            ), "beta1=0 Adam requires FP32 moments"
+            if self.optimizer_cpu_offload:
+                assert (
+                    self.optimizer_offload_fraction == 1.0
+                ), "beta1=0 CPU Adam supports only full optimizer offload"
+                assert (
+                    not self.low_memory_resume
+                ), "beta1=0 CPU Adam does not support low_memory_resume"
+            else:
+                assert (
+                    self.main_grads_dtype == torch.float32
+                ), "beta1=0 GPU Adam requires FP32 main gradients"
         used_deprecated_optimizer_state_offload = self.offload_optimizer_states
         if self.offload_optimizer_states:
             warnings.warn(
