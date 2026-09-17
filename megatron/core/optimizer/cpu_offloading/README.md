@@ -41,10 +41,6 @@ New checkpoints omit `exp_avg`, so resuming them requires this implementation.
 With FP32 moments this saves four persistent bytes per locally owned parameter
 element (half the moment storage), on the device that owns the optimizer state.
 
-The persistent [optimizer benchmark](../../../../tests/benchmarks/optimizer/README.md)
-compares this path with fused CPU AdamW or TE FusedAdam and includes a full GLM-5
-MoE-layer preset, numerical checks, raw timings, and state-memory accounting.
-
 ## Chunked GPU optimizer-state offload
 
 `--chunked-optimizer-state-offload` keeps a configurable fraction of optimizer tensor state and

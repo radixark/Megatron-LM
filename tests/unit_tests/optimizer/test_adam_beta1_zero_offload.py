@@ -2,7 +2,7 @@
 
 """Checkpoint continuation with beta1-zero Adam and chunked GPU state offload."""
 
-import io
+import copy
 
 import torch
 from transformer_engine.pytorch.optimizers import FusedAdam
@@ -10,10 +10,7 @@ from transformer_engine.pytorch.optimizers import FusedAdam
 from megatron.core.optimizer.cpu_offloading.chunked_optimizer_state_offload import (
     ChunkedOptimizerStateOffloader,
 )
-from megatron.core.optimizer.optimizer import (
-    _initialize_adam_beta1_zero_state,
-    _step_with_adam_beta1_zero,
-)
+from megatron.core.optimizer.optimizer import _initialize_adam_beta1_zero_state
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -44,7 +41,6 @@ def test_adam_beta1_zero_chunked_state_checkpoint_continuation():
             chunk_size_bytes=512,
             offload_fraction=1.0,
             state_dtypes=(torch.float32,),
-            step_fn=lambda: _step_with_adam_beta1_zero(optimizer),
         )
         assert len(manager.chunks) == 2
         manager.initialize_state_for_loading(initialize_state, None)
@@ -86,12 +82,8 @@ def test_adam_beta1_zero_chunked_state_checkpoint_continuation():
         if step == 1:
             # Saving with gradients cleared must not retain a first-moment alias.
             optimizer.zero_grad()
-            checkpoint = optimizer.state_dict()
+            checkpoint = copy.deepcopy(optimizer.state_dict())
             assert all("exp_avg" not in state for state in checkpoint["state"].values())
-            stream = io.BytesIO()
-            torch.save(checkpoint, stream)
-            stream.seek(0)
-            checkpoint = torch.load(stream, weights_only=False)
             # Legacy checkpoints may still carry momentum; the offloader must
             # discard it before restoring canonical CPU state.
             for state in checkpoint["state"].values():

@@ -62,7 +62,6 @@ def _initialize_adam_beta1_zero_state(
 ) -> None:
     """Initialize stock Adam's retained state without allocating its first moment."""
     state = optimizer.state[param]
-    state.pop("exp_avg", None)
     if isinstance(optimizer, torch.optim.AdamW):
         if param.device.type != "cpu" or param.dtype != torch.float32 or not param.is_contiguous():
             raise ValueError("beta1=0 CPU Adam requires contiguous CPU FP32 parameters")
@@ -99,11 +98,7 @@ def _strip_adam_beta1_zero_state(optimizer: torch.optim.Optimizer, state_dict: d
     return {
         **state_dict,
         "state": {
-            key: (
-                {name: value for name, value in state.items() if name != "exp_avg"}
-                if isinstance(state, dict)
-                else state
-            )
+            key: {name: value for name, value in state.items() if name != "exp_avg"}
             for key, state in state_dict["state"].items()
         },
     }
@@ -148,7 +143,7 @@ def _step_with_adam_beta1_zero(
                 # for grad=None. Keep their retained state nonempty to avoid that
                 # unconditional allocation of both moments in its stock step.
                 state = optimizer.state[param]
-                if (not cpu_adam or grad is not None) and (
+                if (
                     "exp_avg_sq" not in state
                     or (cpu_adam and "step" not in state)
                     or (getattr(optimizer, "master_weights", False) and "master_param" not in state)
@@ -338,7 +333,6 @@ class MegatronOptimizer(ABC):
             optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
             d2h_stream=d2h_stream,
             h2d_stream=h2d_stream,
-            step_fn=lambda: _step_with_adam_beta1_zero(self.optimizer),
         )
 
     def set_optimizer_state_offload_deferred_lifecycle(
@@ -1390,11 +1384,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
             self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
         )
-        state_dict[optimizer_key] = _strip_adam_beta1_zero_state(
-            self.optimizer, state_dict[optimizer_key]
-        )
         if self._optimizer_state_offloader is None:
-            self.optimizer.load_state_dict(state_dict[optimizer_key])
+            self.optimizer.load_state_dict(
+                _strip_adam_beta1_zero_state(self.optimizer, state_dict[optimizer_key])
+            )
         else:
             self._optimizer_state_offloader.load_state_dict_without_device_cast(
                 state_dict[optimizer_key]

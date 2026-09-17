@@ -99,7 +99,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     fp32_param.requires_grad = True
                 else:
                     fp32_param.requires_grad = False
-                    fp32_param.grad = None
 
         # Sync the grads from GPU to CPU.
         for optimizer in self.cpu_optimizers:
@@ -161,6 +160,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             3. Step the sub-optimizers.
             4. Sync the sub-optimizers state to HDO.
         """
+        # Import at runtime because MegatronOptimizer also imports HDO.
+        from ..optimizer import _step_with_adam_beta1_zero
+
         # Sync param_groups to sub-optimizers before each step to make sure
         # the lr, wd, etc. are up-to-date.
         self._sync_hdo_param_groups_to_sub_optimizers()
@@ -173,18 +175,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if self.gpu_optimizer:
             self.gpu_optimizer.step(closure)
 
-        if self.omit_exp_avg:
-            # Import at runtime because MegatronOptimizer also imports HDO.
-            from ..optimizer import _step_with_adam_beta1_zero
-
         for cpu_optimizer in self.cpu_optimizers:
             d2h_event = self._cpu_optimizer_map_data_event.pop(cpu_optimizer, None)
             if d2h_event is not None:
                 d2h_event.synchronize()
-            if self.omit_exp_avg:
-                _step_with_adam_beta1_zero(cpu_optimizer, closure)
-            else:
-                cpu_optimizer.step(closure)
+            _step_with_adam_beta1_zero(cpu_optimizer, closure)
 
         # Sync state and param_groups to HDO after each step.
         # NOTE: It is possible for the optimizer to change the properties
@@ -224,9 +219,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if self.omit_exp_avg:
             for optimizer in self.cpu_optimizers:
                 optimizer.omit_exp_avg = True
-                optimizer.defaults.update(fused=True, foreach=False)
-                for group in optimizer.param_groups:
-                    group.update(fused=True, foreach=False)
 
         if len(self.gpu_param_groups) > 0:
             self.gpu_optimizer = self.gpu_optimizer_cls(self.gpu_param_groups)
@@ -428,17 +420,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             Returns:
                 dict: The modified state dictionary with `float32` parameters.
             """
-            if self.omit_exp_avg:
-                for group in state_dict["param_groups"]:
-                    if group["betas"][0] != 0.0:
-                        raise ValueError("beta1=0 CPU Adam cannot restore nonzero beta1")
-                state_dict = {
-                    **state_dict,
-                    "state": {
-                        key: {name: value for name, value in state.items() if name != "exp_avg"}
-                        for key, state in state_dict["state"].items()
-                    },
-                }
+            from ..optimizer import _strip_adam_beta1_zero_state
+
+            state_dict = _strip_adam_beta1_zero_state(self, state_dict)
             if not self.param_update_in_fp32:
                 return state_dict
 

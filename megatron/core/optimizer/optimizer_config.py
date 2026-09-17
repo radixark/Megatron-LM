@@ -237,7 +237,7 @@ class OptimizerConfig:
     adam_beta1: float = 0.9
     """First coefficient for computing running averages of gradient and its square in Adam
     optimizer. Exactly zero selects AdamW without persistent first-moment state,
-    using TE on GPU or a direct update with full CPU optimizer offload.
+    using stock TE on GPU or stock fused AdamW with full CPU optimizer offload.
     """
 
     adam_beta2: float = 0.999

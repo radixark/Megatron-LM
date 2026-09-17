@@ -66,7 +66,6 @@ from .fused_adam_patch import apply_fused_adam_patch, is_patch_applied
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
-    _step_with_adam_beta1_zero,
     _strip_adam_beta1_zero_state,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
@@ -983,7 +982,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     state_dict["param_to_group_meta"], self.optimizer.param_groups
                 )
                 del state_dict["param_to_group_meta"]
-            self.optimizer.load_state_dict(_strip_adam_beta1_zero_state(self.optimizer, state_dict))
+            self.optimizer.load_state_dict(state_dict)
             return
 
         if len(self.optimizer.state) == 0:
@@ -1103,9 +1102,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Optimizer.
         optimizer_state_dict = {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        optimizer_state_dict = _strip_adam_beta1_zero_state(self.optimizer, optimizer_state_dict)
         if self._optimizer_state_offloader is None:
-            self.optimizer.load_state_dict(optimizer_state_dict)
+            self.optimizer.load_state_dict(
+                _strip_adam_beta1_zero_state(self.optimizer, optimizer_state_dict)
+            )
         else:
             # The distributed checkpoint path has already allocated selected tensor
             # states on CPU. Avoid Optimizer.load_state_dict's automatic cast to the
@@ -1183,8 +1183,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             tensors = {}
             for k in self.optimizer.state[sharded_model_param]:
-                if k == "exp_avg" and getattr(self.optimizer, "omit_exp_avg", False):
-                    continue
                 if not isinstance(self.optimizer.state[sharded_model_param][k], torch.Tensor):
                     continue
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
@@ -1198,8 +1196,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             optim_state = self.optimizer.state[main_param]
             tensors = {"param": main_param}
             for k, v in optim_state.items():
-                if k == "exp_avg" and getattr(self.optimizer, "omit_exp_avg", False):
-                    continue
                 if isinstance(v, torch.Tensor):
                     tensors[k] = v
         return tensors
@@ -1314,8 +1310,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dst_tensors = {"param": main_param}
             for k, v in optim_state.items():
                 if k == "step":
-                    continue
-                if k == "exp_avg" and getattr(self.optimizer, "omit_exp_avg", False):
                     continue
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
@@ -1538,7 +1532,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # Avoid FusedAdam errors on empty tensor input.
                     continue
                 param.grad = torch.zeros_like(param)
-        _step_with_adam_beta1_zero(self.optimizer)
+        self.optimizer.step()
         self.optimizer.zero_grad()
 
     def _param_name(self, param: torch.nn.Parameter) -> str:

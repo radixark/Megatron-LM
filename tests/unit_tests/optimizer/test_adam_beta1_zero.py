@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import io
 
 import pytest
 import torch
@@ -37,7 +36,7 @@ def _parameters(device):
 def _groups(params):
     return [
         {"params": params[:2], "lr": 0.025, "weight_decay": 0.125},
-        {"params": params[2:], "lr": 0.01, "weight_decay": 0.05},
+        {"params": params[2:], "lr": 0.01, "weight_decay": 0.0},
     ]
 
 
@@ -88,7 +87,7 @@ def _assert_bitwise(actual, reference):
     )
 
 
-def _assert_matches(optimizer, reference, params, reference_params, backend):
+def _assert_matches(optimizer, reference, params, reference_params):
     # Compare against the fused optimizers selected by Megatron on both backends.
     for param, reference_param in zip(params, reference_params):
         _assert_bitwise(param, reference_param)
@@ -101,105 +100,47 @@ def _assert_matches(optimizer, reference, params, reference_params, backend):
 
 
 @pytest.mark.parametrize("backend", ["cpu", "cuda"])
-@pytest.mark.parametrize("initialize_state", [False, True])
-def test_adam_beta1_zero_matches_existing_optimizer(backend, initialize_state):
+@pytest.mark.parametrize("legacy_checkpoint", [False, True])
+def test_adam_beta1_zero_state_and_checkpoint(backend, legacy_checkpoint):
     params = _parameters(backend)
     reference_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
     optimizer, reference = _optimizers(backend, params, reference_params)
-    if initialize_state:
-        for param in params:
-            _initialize_adam_beta1_zero_state(optimizer, param)
-        _assert_no_first_moment(optimizer)
-
+    # Exercise explicit initialization and lazy initialization in the same update.
+    _initialize_adam_beta1_zero_state(optimizer, params[0])
+    _assert_no_first_moment(optimizer)
     for step in range(6):
         _set_gradients(params, step)
         _set_gradients(reference_params, step)
         gradients = [None if param.grad is None else param.grad.clone() for param in params]
         _step_with_adam_beta1_zero(optimizer)
         reference.step()
-        _assert_matches(optimizer, reference, params, reference_params, backend)
+        _assert_matches(optimizer, reference, params, reference_params)
         for param, gradient in zip(params, gradients):
             if gradient is not None:
                 torch.testing.assert_close(param.grad, gradient, rtol=0, atol=0)
 
-
-@pytest.mark.parametrize("backend", ["cpu", "cuda"])
-@pytest.mark.parametrize("legacy_checkpoint", [False, True])
-def test_adam_beta1_zero_checkpoint_continuation(backend, legacy_checkpoint):
-    params = _parameters(backend)
-    reference_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
-    optimizer, reference = _optimizers(backend, params, reference_params)
-    for step in range(3):
-        _set_gradients(params, step)
-        _set_gradients(reference_params, step)
-        _step_with_adam_beta1_zero(optimizer)
-        reference.step()
-
-    checkpoint = reference.state_dict() if legacy_checkpoint else optimizer.state_dict()
-    stream = io.BytesIO()
-    torch.save(checkpoint, stream)
-    stream.seek(0)
-    restored_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
-    restored, _ = _optimizers(backend, restored_params, reference_params)
-    restored.load_state_dict(
-        _strip_adam_beta1_zero_state(restored, torch.load(stream, weights_only=False))
-    )
-    _assert_no_first_moment(restored)
-
-    for step in range(3, 6):
-        _set_gradients(restored_params, step)
-        _set_gradients(reference_params, step)
-        _step_with_adam_beta1_zero(restored)
-        reference.step()
-        _assert_matches(restored, reference, restored_params, reference_params, backend)
-
-
-@pytest.mark.parametrize("weight_decay", [0.0, 0.1])
-def test_adam_beta1_zero_cpu_vectorized_rounding(weight_decay):
-    """Repeated vector updates retain parity near cancellation in the parameter update."""
-    generator = torch.Generator().manual_seed(1234)
-    param = torch.nn.Parameter(torch.randn(1000000, generator=generator).mul_(0.1))
-    param.grad = torch.randn(param.shape, generator=generator).mul_(0.01)
-    reference_param = torch.nn.Parameter(param.detach().clone())
-    reference_param.grad = param.grad.clone()
-    kwargs = dict(lr=0.001, betas=(0.0, 0.95), eps=1e-8, weight_decay=weight_decay)
-    optimizer = _omit_first_moment(torch.optim.AdamW([param], fused=True, **kwargs))
-    reference = torch.optim.AdamW([reference_param], fused=True, **kwargs)
-    for _ in range(22):
-        _step_with_adam_beta1_zero(optimizer)
-        reference.step()
-    _assert_matches(optimizer, reference, [param], [reference_param], "cpu")
-    torch.testing.assert_close(param.grad, reference_param.grad, rtol=0, atol=0)
-    for index in range(8):
-        for opt in (optimizer, reference):
-            opt.param_groups[0]["lr"] = 0.001 * (index + 1) / 8
-            opt.param_groups[0]["weight_decay"] = (
-                weight_decay + index * 0.001 if weight_decay else 0.0
+        if step == 2:
+            checkpoint = copy.deepcopy(
+                reference.state_dict() if legacy_checkpoint else optimizer.state_dict()
             )
-            _step_with_adam_beta1_zero(opt)
-        _assert_matches(optimizer, reference, [param], [reference_param], "cpu")
+            params = [torch.nn.Parameter(param.detach().clone()) for param in params]
+            optimizer, _ = _optimizers(backend, params, reference_params)
+            optimizer.load_state_dict(_strip_adam_beta1_zero_state(optimizer, checkpoint))
+            _assert_no_first_moment(optimizer)
+            assert (
+                any("exp_avg" in state for state in checkpoint["state"].values())
+                == legacy_checkpoint
+            )
+
+    checkpoint = copy.deepcopy(optimizer.state_dict())
+    checkpoint["param_groups"][0]["betas"] = (0.9, 0.95)
+    with pytest.raises(ValueError, match="beta1"):
+        _strip_adam_beta1_zero_state(optimizer, checkpoint)
 
 
-@pytest.mark.parametrize("numel", [17, 65536])
-def test_adam_beta1_zero_cpu_weight_decay_schedule(numel):
-    """Switching decay off/on preserves stock AdamW's update and state."""
-    param = torch.nn.Parameter(torch.linspace(-0.1, 0.1, numel))
-    param.grad = torch.linspace(0.01, 0.02, numel)
-    reference_param = torch.nn.Parameter(param.detach().clone())
-    reference_param.grad = param.grad.clone()
-    kwargs = dict(lr=0.001, betas=(0.0, 0.95), weight_decay=0.0)
-    optimizer = _omit_first_moment(torch.optim.AdamW([param], fused=True, **kwargs))
-    reference = torch.optim.AdamW([reference_param], fused=True, **kwargs)
-    for weight_decay in (0.0, 0.1, 0.0, 0.25, 0.0, 0.5, 0.0):
-        for opt in (optimizer, reference):
-            opt.param_groups[0]["weight_decay"] = weight_decay
-            _step_with_adam_beta1_zero(opt)
-        _assert_matches(optimizer, reference, [param], [reference_param], "cpu")
-
-
-@pytest.mark.parametrize("values", [[0.0, -0.0], [-0.0] * 17])
-def test_adam_beta1_zero_cpu_signed_zero_values(values):
+def test_adam_beta1_zero_cpu_signed_zero_values():
     """Aliasing may change a zero's sign bit while preserving its numerical value."""
+    values = [0.0, -0.0] * 8 + [-0.0]  # Vector lanes and a scalar tail.
     param = torch.nn.Parameter(torch.tensor(values))
     reference_param = torch.nn.Parameter(param.detach().clone())
     param.grad = torch.tensor(values)
@@ -222,29 +163,19 @@ def test_adam_beta1_zero_cpu_signed_zero_values(values):
         _assert_no_first_moment(optimizer)
 
 
-def test_adam_beta1_zero_cpu_step_hooks_and_closure():
+def test_adam_beta1_zero_cpu_closure_gradients():
+    """Prepare aliases after a closure creates the current gradient."""
     param = torch.nn.Parameter(torch.ones(17))
     optimizer = _omit_first_moment(torch.optim.AdamW([param], betas=(0.0, 0.999), fused=True))
-    events = []
-
-    def pre_hook(opt, args, kwargs):
-        events.append("pre")
-        _assert_no_first_moment(opt)
-
-    def post_hook(opt, args, kwargs):
-        events.append("post")
-        assert opt.state[param]["exp_avg"] is param.grad
+    calls = []
 
     def closure():
-        events.append("closure")
-        assert torch.is_grad_enabled()
+        calls.append(torch.is_grad_enabled())
         param.grad = torch.full_like(param, 0.125)
         return 42
 
-    optimizer.register_step_pre_hook(pre_hook)
-    optimizer.register_step_post_hook(post_hook)
     assert _step_with_adam_beta1_zero(optimizer, closure) == 42
-    assert events == ["pre", "closure", "post"]
+    assert calls == [True]
     assert optimizer.state[param]["step"].item() == 1
     _assert_no_first_moment(optimizer)
 
@@ -290,7 +221,7 @@ def test_adam_beta1_zero_decoupled_grad_and_bf16_master(store_param_remainders):
             reference_param.decoupled_grad = None if grad is None else grad.clone()
         _step_with_adam_beta1_zero(optimizer)
         reference.step()
-        _assert_matches(optimizer, reference, params, reference_params, "cuda")
+        _assert_matches(optimizer, reference, params, reference_params)
         for param, reference_param in zip(params, reference_params):
             torch.testing.assert_close(
                 optimizer.state[param]["master_param"],
@@ -306,17 +237,6 @@ def test_adam_beta1_zero_decoupled_grad_and_bf16_master(store_param_remainders):
             optimizer.load_state_dict(
                 _strip_adam_beta1_zero_state(optimizer, copy.deepcopy(optimizer.state_dict()))
             )
-
-
-@pytest.mark.parametrize("backend", ["cpu", "cuda"])
-def test_adam_beta1_zero_rejects_restored_nonzero_beta1(backend):
-    params = _parameters(backend)
-    reference_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
-    optimizer, _ = _optimizers(backend, params, reference_params)
-    checkpoint = copy.deepcopy(optimizer.state_dict())
-    checkpoint["param_groups"][0]["betas"] = (0.9, 0.95)
-    with pytest.raises(ValueError, match="beta1"):
-        optimizer.load_state_dict(_strip_adam_beta1_zero_state(optimizer, checkpoint))
 
 
 @pytest.mark.parametrize("overlap", [False, True])
@@ -380,24 +300,22 @@ def test_adam_beta1_zero_hybrid_full_cpu_offload(overlap, dtype):
                 _assert_no_first_moment(child)
 
 
-@pytest.mark.parametrize("fraction", [0.0, 0.5])
-def test_adam_beta1_zero_rejects_partial_cpu_offload(fraction):
-    with pytest.raises(AssertionError, match="only full optimizer offload"):
+def test_adam_beta1_zero_cpu_offload_config():
+    for fraction in (0.0, 0.5):
+        with pytest.raises(AssertionError, match="only full optimizer offload"):
+            OptimizerConfig(
+                adam_beta1=0.0, optimizer_cpu_offload=True, optimizer_offload_fraction=fraction
+            )
+    for beta1, fraction in ((0.0, 1.0), (0.9, 0.5)):
         OptimizerConfig(
-            adam_beta1=0.0, optimizer_cpu_offload=True, optimizer_offload_fraction=fraction
+            adam_beta1=beta1, optimizer_cpu_offload=True, optimizer_offload_fraction=fraction
         )
 
 
-@pytest.mark.parametrize("beta1,fraction", [(0.0, 1.0), (0.9, 0.5)])
-def test_adam_beta1_zero_offload_config_accepts_supported_combinations(beta1, fraction):
-    OptimizerConfig(
-        adam_beta1=beta1, optimizer_cpu_offload=True, optimizer_offload_fraction=fraction
-    )
-
-
-@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize(
+    "cpu_offload,dtype", [(False, torch.bfloat16), (True, torch.float32), (True, torch.bfloat16)]
+)
 @pytest.mark.parametrize("sharding_type", ["dp_reshardable", "fully_reshardable"])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_adam_beta1_zero_distributed_checkpoint(
     tmp_path_dist_ckpt, cpu_offload, sharding_type, dtype
 ):

@@ -84,7 +84,6 @@ class ChunkedOptimizerStateOffloader:
             accounts for compact int16 parameter remainders.
         d2h_stream: Optional transfer stream shared by related optimizer wrappers.
         h2d_stream: Optional transfer stream shared by related optimizer wrappers.
-        step_fn: Optional callback for an update of the optimizer's current parameter subset.
     """
 
     def __init__(
@@ -97,7 +96,6 @@ class ChunkedOptimizerStateOffloader:
         optimizer_owned_master_dtypes: Mapping[torch.Tensor, torch.dtype] | None = None,
         d2h_stream: torch.cuda.Stream | None = None,
         h2d_stream: torch.cuda.Stream | None = None,
-        step_fn: Callable[[], object] | None = None,
     ) -> None:
         if chunk_size_bytes < 0:
             raise ValueError(f"chunk_size_bytes must be non-negative, got {chunk_size_bytes}")
@@ -107,7 +105,6 @@ class ChunkedOptimizerStateOffloader:
             raise ValueError("state_dtypes must contain at least one optimizer-state dtype")
 
         self.optimizer = optimizer
-        self._step_fn = optimizer.step if step_fn is None else step_fn
         self.chunk_size_bytes = chunk_size_bytes
         self.offload_fraction = offload_fraction
         self.state_dtypes = tuple(state_dtypes)
@@ -939,12 +936,14 @@ class ChunkedOptimizerStateOffloader:
         base_group_metadata: Sequence[dict],
         resulting_group_metadata: Dict[int, dict],
     ) -> None:
+        from ..optimizer import _step_with_adam_beta1_zero
+
         groups, indexed_groups = self._make_subset_groups(params, base_group_metadata)
         if not groups:
             return
         self.optimizer.param_groups = groups
         try:
-            self._step_fn()
+            _step_with_adam_beta1_zero(self.optimizer)
             for group_index, group in indexed_groups:
                 metadata = self._snapshot_group_metadata([group])[0]
                 previous = resulting_group_metadata.get(group_index)
@@ -964,9 +963,10 @@ class ChunkedOptimizerStateOffloader:
     @torch.no_grad()
     def step(self) -> None:
         """Run the external optimizer over resident parameters and staged state chunks."""
+        from ..optimizer import _step_with_adam_beta1_zero
 
         if not self._selected_params:
-            self._step_fn()
+            _step_with_adam_beta1_zero(self.optimizer)
             return
 
         self.prefetch_for_step()
