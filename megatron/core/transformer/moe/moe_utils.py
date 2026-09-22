@@ -494,6 +494,9 @@ def unpermute(
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
+    # BF16/FP16 scatter accumulation amplifies the nondeterministic atomic-add order.
+    if input_dtype in (torch.float16, torch.bfloat16):
+        permuted_tokens = permuted_tokens.float()
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
