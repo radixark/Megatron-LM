@@ -16,7 +16,10 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    HAVE_DEEPGEMM_BF16,
+    set_batch_invariant_mode,
+)
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_te_min_version
@@ -735,3 +738,25 @@ def test_bik_te_general_gemm_numerical_parity(dtype):
         C_bik = _te_general_gemm(A, B, out_dtype=dtype, layout="TN")[0]
 
     torch.testing.assert_close(C_bik, C_ref, **_tols(dtype))
+
+
+@pytest.mark.skipif(not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable")
+def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
+    torch.manual_seed(123)
+    M1, M2, K, N = 37, 23, 128, 128
+    A1 = torch.randn(M1, K, **_device(torch.float32))
+    A2 = torch.randn(M2, K, **_device(torch.float32))
+    A = torch.cat([A1, A2], dim=0)
+    B = torch.randn(K, N, **_device(torch.float32))
+
+    with set_batch_invariant_mode(True, backend="deepgemm"):
+        full = _te_general_gemm(A, B, out_dtype=torch.float32, layout="TN")[0]
+        chunks = torch.cat(
+            [
+                _te_general_gemm(A1, B, out_dtype=torch.float32, layout="TN")[0],
+                _te_general_gemm(A2, B, out_dtype=torch.float32, layout="TN")[0],
+            ],
+            dim=1,
+        )
+
+    assert torch.equal(full, chunks)
