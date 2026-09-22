@@ -37,7 +37,7 @@ from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig, is_gated_delta_net_variant
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
     MlpBuilder,
@@ -209,7 +209,7 @@ def get_experimental_attention_variant_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    if config.experimental_attention_variant == "gated_delta_net":
+    if is_gated_delta_net_variant(config.experimental_attention_variant):
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
@@ -411,8 +411,8 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
-    return experimental_attention_variant in linear_attention_variants
+    # gated_delta_net and its upstream alias gdn; see transformer_config.is_gated_delta_net_variant.
+    return is_gated_delta_net_variant(experimental_attention_variant)
 
 
 def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:
