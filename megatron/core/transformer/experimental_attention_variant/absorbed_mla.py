@@ -1007,12 +1007,16 @@ class AbsorbedMLASelfAttention(Attention):
                 self.num_attention_heads_per_partition,
                 self.config.kv_lora_rank,
             )
-            core_attn_out = projection(
-                core_attn_out,
-                qk_head_dim=self.config.qk_head_dim,
-                v_head_dim=self.config.v_head_dim,
-                transpose=False,
-            ).flatten(-2).contiguous()
+            core_attn_out = (
+                projection(
+                    core_attn_out,
+                    qk_head_dim=self.config.qk_head_dim,
+                    v_head_dim=self.config.v_head_dim,
+                    transpose=False,
+                )
+                .flatten(-2)
+                .contiguous()
+            )
         else:
             core_consumed_v_up_projection = getattr(
                 self.core_attention, "consumes_absorbed_v_up_projection", False
