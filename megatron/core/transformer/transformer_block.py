@@ -229,21 +229,15 @@ class TransformerBlockSubmodules:
             defines a complete transformer layer (e.g., self-attention, feed-forward network).
         layer_norm (Optional[Union[ModuleSpec, torch.nn.Module]], optional): Specification
             or instance of the layer normalization to be applied.
-        hc_head_contraction (Optional[Union[ModuleSpec, type]], optional): Model-specific
-            mHC output contraction, contracting ``[s, b, n*C] -> [s, b, C]`` before the
-            final layer norm. Leave as ``None`` to keep the built-in DeepSeek-V4
-            contraction (``learned_output_contract`` over block-owned ``hc_head_*``
-            parameters); that path, and its parameter names, are untouched by this field.
-            Supply a spec when a model's contraction is a different function of
-            differently shaped parameters -- Qwen3.8-Next, for instance, uses the same
-            low-rank gated mean as its per-layer hyper-connections, with the RMS taken
-            per stream rather than over the whole ``n*C`` vector. The module owns its own
-            parameters and is called as ``module(hidden_states)``.
+        hc_head_contraction (ModuleSpec | type | None, optional): Model-specific mHC output
+            contraction ``[s, b, n*C] -> [s, b, C]`` applied before the final layer norm,
+            called as ``module(hidden_states)`` and owning its own parameters. ``None``
+            keeps the built-in ``learned_output_contract`` over ``hc_head_*``.
     """
 
     layer_specs: Optional[List[ModuleSpec]] = None
     layer_norm: LayerNormBuilder | None = None
-    hc_head_contraction: Optional[Union[ModuleSpec, type]] = None
+    hc_head_contraction: ModuleSpec | type | None = None
 
 
 def _get_block_submodules(
@@ -409,10 +403,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
             if self.config.enable_hyper_connections:
-                # A model whose contraction is not DeepSeek-V4's supplies its own module,
-                # which owns its own parameters. The default path below is left exactly
-                # as it was, parameter names included, so existing checkpoints keep
-                # loading against `decoder.hc_head_*`.
+                # the built-in path keeps its parameters on the block so checkpoints keyed
+                # on decoder.hc_head_* still load
                 self.hc_head_contraction = (
                     build_module(self.submodules.hc_head_contraction, config=self.config)
                     if self.submodules.hc_head_contraction is not None
@@ -433,9 +425,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         setattr(self.hc_head_scale, 'sequence_parallel', True)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
-            # forward() only reaches the contraction under
-            # has_final_layernorm_in_this_stage(), but keep the attribute defined on
-            # every stage so nothing has to guard an AttributeError.
             self.hc_head_contraction = None
 
         if self.config.inference_fuse_tp_communication:
@@ -547,9 +536,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         len(extract_layer_indices) == 0
                     ), "Feature extraction is not supported with mHC + MTP."
                 mhc_multistream = hidden_states
-            # [s, b, n*C] -> [s, b, C]. DSv4 introduced the built-in contraction;
-            # a model with different contraction math supplies its own module through
-            # TransformerBlockSubmodules.hc_head_contraction.
+            # [s, b, n*C] -> [s, b, C]
             if self.hc_head_contraction is not None:
                 hidden_states = self.hc_head_contraction(hidden_states)
             else:
