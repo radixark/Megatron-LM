@@ -413,9 +413,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 if self.hc_head_contraction is None:
                     hc_mult = self.config.num_residual_streams
                     hc_dim = self.config.hidden_size * hc_mult
-                    self.hc_head_fn = mark_keep_in_fp32(
-                        nn.Parameter(torch.randn(hc_mult, hc_dim))
-                    )
+                    self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
                     self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
                     self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
                     nn.init.xavier_uniform_(self.hc_head_fn)
