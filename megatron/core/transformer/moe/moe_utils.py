@@ -434,8 +434,11 @@ def permute(
         if probs is not None:
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
-    # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    input_dtype = tokens.dtype
+    # index_select backward sums the expert contributions for each token.
+    if tokens.requires_grad and input_dtype in (torch.float16, torch.bfloat16):
+        tokens = tokens.float()
+    permuted_input = tokens.index_select(0, sorted_indices).to(input_dtype)
 
     return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
