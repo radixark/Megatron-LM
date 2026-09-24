@@ -791,6 +791,52 @@ def csa_sparse_attn(
 # ---------------------------------------------------------------------------
 
 
+# Upper bound on the transient buffers one ``_stable_topk_indices`` sort may
+# hold at once: the masked score copy, the sorted scores and the int64 order.
+_STABLE_TOPK_SORT_BYTES = 256 << 20
+_NEG_INF = float("-inf")
+
+
+def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tensor:
+    """Select the ``topk_k`` highest-scoring key ids per row with a fixed tie order.
+
+    Rows may only draw from their first ``seq_lens[row]`` key columns; a row with
+    fewer valid keys than ``topk_k`` is padded with ``-1``. Exact score ties are
+    resolved toward the smallest key id and the selected ids are returned in
+    descending-score order, so identical inputs always yield identical ids. The
+    radix Top-K kernel does not order equal scores, which matters for ReLU-scored
+    indexers where many keys share a score of exactly zero.
+
+    Rows are independent, so they are sorted in slabs sized to keep the sort's
+    temporary buffers under ``_STABLE_TOPK_SORT_BYTES`` regardless of ``rows``.
+
+    Args:
+        scores: ``(rows, sk)`` fp32 indexer scores; masked positions hold ``-inf``.
+        seq_lens: ``(rows,)`` int32 number of candidate key columns per row.
+        topk_k: number of ids to select, at most ``sk``.
+
+    Returns:
+        ``(rows, topk_k)`` int32 key ids, ``-1`` where a row has no more valid keys.
+    """
+    rows, sk = scores.shape
+    columns = torch.arange(sk, device=scores.device, dtype=seq_lens.dtype)
+    bytes_per_row = sk * (2 * scores.element_size() + 8)
+    slab = max(1, min(rows, _STABLE_TOPK_SORT_BYTES // bytes_per_row))
+    selected = torch.empty(rows, topk_k, dtype=torch.int32, device=scores.device)
+    for start in range(0, rows, slab):
+        stop = min(start + slab, rows)
+        candidates = scores[start:stop].masked_fill(
+            columns.unsqueeze(0) >= seq_lens[start:stop].unsqueeze(1), _NEG_INF
+        )
+        sorted_scores, order = torch.sort(candidates, dim=-1, descending=True, stable=True)
+        selected[start:stop] = (
+            order[:, :topk_k]
+            .to(torch.int32)
+            .masked_fill(torch.isneginf(sorted_scores[:, :topk_k]), -1)
+        )
+    return selected
+
+
 def _indexer_topk_core(
     q: Tensor,
     k: Tensor,
@@ -803,6 +849,7 @@ def _indexer_topk_core(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
     q_causal_offsets: Optional[Tensor] = None,
+    deterministic: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Layout-agnostic core for :func:`indexer_topk`.
 
@@ -901,12 +948,15 @@ def _indexer_topk_core(
         valid_per_q = ((q_idx + 1) // ratio).clamp(max=sk).to(torch.int32)
         seq_lens = valid_per_q.repeat(b)  # (b*sq,), row-major over (b, sq)
 
-    # ---------------- Shared: radix top-K + pad-to-topk -----------------
+    # ---------------- Shared: top-K + pad-to-topk -----------------------
     topk_k = min(topk, sk)
-    tk_result = _DSA.indexer_top_k_wrapper(
-        scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
-    )
-    topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
+    if deterministic:
+        topk_indices = _stable_topk_indices(scores_flat, seq_lens, topk_k)
+    else:
+        tk_result = _DSA.indexer_top_k_wrapper(
+            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
+        )
+        topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
 
     if topk_k < topk:
         pad = torch.full((total_q, topk - topk_k), -1, dtype=torch.int32, device=device)
@@ -942,6 +992,7 @@ def indexer_topk(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
     q_causal_offsets: Optional[Tensor] = None,
+    deterministic: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Score + top-K selection for inference (no KL loss, no backward).
 
@@ -965,6 +1016,9 @@ def indexer_topk(
         max_seqlen_kv: THD only — per-batch max KV length.
         q_causal_offsets: THD only — optional ``(B,)`` int32 CUDA tensor. Entry
             ``b`` is the sequence-relative position of that segment's first Q.
+        deterministic: select the Top-K from the dense scores with a stable sort
+            instead of the radix kernel. Ids come back in descending-score order
+            and exact-value ties resolve toward the smallest local KV id.
 
     Returns:
         SBHD: ``(topk_indices (b, sq, topk),  topk_length (b, sq))`` int32
@@ -1008,6 +1062,7 @@ def indexer_topk(
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
         q_causal_offsets=q_causal_offsets,
+        deterministic=deterministic,
     )
     return topk_indices, topk_length
 
@@ -1375,6 +1430,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         max_seqlen_compressed_idx: Optional[int],  # indexer K max
         compressed_kv: Optional[Tensor] = None,  # THD only — pre-packed compressed KV
         cu_seqlens_q_unpadded: Optional[Tensor] = None,  # THD only — unpadded Q cu_seqlens
+        deterministic: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -1430,6 +1486,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             max_seqlen_kv=(
                 int(max_seqlen_compressed_idx) if max_seqlen_compressed_idx is not None else None
             ),
+            deterministic=deterministic,
         )
 
         # ---- 3. Combine indices (indexer first, then window) + globalize. ----
@@ -1839,7 +1896,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         #   cu_seqlens_q, cu_seqlens_kv, cu_seqlens_kv_full,
         #   cu_seqlens_compressed_idx,
         #   max_seqlen_q, max_seqlen_compressed_idx,
-        #   compressed_kv, cu_seqlens_q_unpadded
+        #   compressed_kv, cu_seqlens_q_unpadded, deterministic
         return (
             grad_query,
             grad_kv_full,
@@ -1848,6 +1905,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -2167,6 +2225,7 @@ def fused_csa_indexer_sparse_attn(
     max_seqlen_compressed_idx: Optional[int] = None,
     compressed_kv: Optional[Tensor] = None,
     cu_seqlens_q_unpadded: Optional[Tensor] = None,
+    deterministic: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -2245,6 +2304,9 @@ def fused_csa_indexer_sparse_attn(
             so padding rows are excluded from the indexer KL loss and
             backward gradients.  Ignored when ``None`` or when it equals
             ``cu_seqlens_q``.
+        deterministic: select the Top-K from the dense scores with a stable sort
+            instead of the radix kernel. Ids come back in descending-score order
+            and exact-value ties resolve toward the smallest local KV id.
     """
     if cu_seqlens_q is not None:
         missing = [
@@ -2287,6 +2349,7 @@ def fused_csa_indexer_sparse_attn(
         max_seqlen_compressed_idx,
         compressed_kv,
         cu_seqlens_q_unpadded,
+        deterministic,
     )
 
 

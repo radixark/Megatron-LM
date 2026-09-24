@@ -1984,10 +1984,16 @@ class CompressedSparseAttention(MegatronModule):
             self.indexer.index_topk,
             self.compress_ratio,
             indexer_softmax_scale=self.indexer.softmax_scale,
+            deterministic=self.config.deterministic_mode,
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + offset, -1)
+        # Same lowering as ``FusedCSAIndexerSparseAttnFunc.forward`` (the
+        # grad-enabled path): compressed ids, then window ids, globalized and
+        # compacted. FlashMLA's online softmax accumulates in key order, so a
+        # forward-only pass reproduces the training forward only if it hands
+        # the kernel the same id sequence.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            window_idxs, compress_topk_idxs, batch_size=b, compact=True
+            compress_topk_idxs, window_idxs, batch_size=b, compact=True
         )
         nvtx_range_pop("compressed_indices")
 
@@ -2045,6 +2051,7 @@ class CompressedSparseAttention(MegatronModule):
             sparse_loss=getattr(self.config, "dsa_indexer_use_sparse_loss", True),
             kv_offset=offset,
             calculate_per_token_loss=self.config.calculate_per_token_loss,
+            deterministic=self.config.deterministic_mode,
         )
         nvtx_range_pop("sparse_attn_kernel")
 
@@ -2407,6 +2414,7 @@ class CompressedSparseAttention(MegatronModule):
                 cu_seqlens_kv=cu_seqlens_compressed_idx,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_compressed_idx,
+                deterministic=self.config.deterministic_mode,
             )
 
         # Shift into per-segment full-KV index space.
@@ -2422,9 +2430,12 @@ class CompressedSparseAttention(MegatronModule):
         else:
             compress_topk_idxs = topk_indices_cmp
 
+        # Same group order as ``FusedCSAIndexerSparseAttnFunc.forward``:
+        # compressed ids first, then window ids, before globalizing and
+        # compacting, so both grad modes hand FlashMLA an identical id sequence.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            window_idxs,
             compress_topk_idxs,
+            window_idxs,
             batch_size=-1,
             compact=True,
             cu_seqlens_q=cu_seqlens_q,
@@ -2519,6 +2530,7 @@ class CompressedSparseAttention(MegatronModule):
             compressed_kv=compressed_kv,
             calculate_per_token_loss=self.config.calculate_per_token_loss,
             cu_seqlens_q_unpadded=cu_seqlens_q_unpadded,
+            deterministic=self.config.deterministic_mode,
         )
 
         if indexer_loss_coeff > 0:
