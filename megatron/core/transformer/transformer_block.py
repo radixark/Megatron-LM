@@ -229,10 +229,15 @@ class TransformerBlockSubmodules:
             defines a complete transformer layer (e.g., self-attention, feed-forward network).
         layer_norm (Optional[Union[ModuleSpec, torch.nn.Module]], optional): Specification
             or instance of the layer normalization to be applied.
+        hc_head_contraction (ModuleSpec | type | None, optional): Model-specific mHC output
+            contraction ``[s, b, n*C] -> [s, b, C]`` applied before the final layer norm,
+            called as ``module(hidden_states)`` and owning its own parameters. ``None``
+            keeps the built-in ``learned_output_contract`` over ``hc_head_*``.
     """
 
     layer_specs: Optional[List[ModuleSpec]] = None
     layer_norm: LayerNormBuilder | None = None
+    hc_head_contraction: ModuleSpec | type | None = None
 
 
 def _get_block_submodules(
@@ -398,18 +403,27 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
             if self.config.enable_hyper_connections:
-                hc_mult = self.config.num_residual_streams
-                hc_dim = self.config.hidden_size * hc_mult
-                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-                nn.init.xavier_uniform_(self.hc_head_fn)
-                if self.config.sequence_parallel:
-                    setattr(self.hc_head_fn, 'sequence_parallel', True)
-                    setattr(self.hc_head_base, 'sequence_parallel', True)
-                    setattr(self.hc_head_scale, 'sequence_parallel', True)
+                # the built-in path keeps its parameters on the block so checkpoints keyed
+                # on decoder.hc_head_* still load
+                self.hc_head_contraction = (
+                    build_module(self.submodules.hc_head_contraction, config=self.config)
+                    if self.submodules.hc_head_contraction is not None
+                    else None
+                )
+                if self.hc_head_contraction is None:
+                    hc_mult = self.config.num_residual_streams
+                    hc_dim = self.config.hidden_size * hc_mult
+                    self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                    self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                    self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                    nn.init.xavier_uniform_(self.hc_head_fn)
+                    if self.config.sequence_parallel:
+                        setattr(self.hc_head_fn, 'sequence_parallel', True)
+                        setattr(self.hc_head_base, 'sequence_parallel', True)
+                        setattr(self.hc_head_scale, 'sequence_parallel', True)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
+            self.hc_head_contraction = None
 
         if self.config.inference_fuse_tp_communication:
             self._setup_fused_tp_communication()
@@ -520,16 +534,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         len(extract_layer_indices) == 0
                     ), "Feature extraction is not supported with mHC + MTP."
                 mhc_multistream = hidden_states
-            # DSv4 introduced the new output contraction for mHC.
             # [s, b, n*C] -> [s, b, C]
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self.hc_head_contraction is not None:
+                hidden_states = self.hc_head_contraction(hidden_states)
+            else:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
 
         # Final layer norm.
         if self.final_layernorm is not None:
