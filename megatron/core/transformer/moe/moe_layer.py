@@ -14,6 +14,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import split_along_nth_dim
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -63,9 +64,9 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
 else:
-    TELinear, te_checkpoint = None, None
+    TELinear, TENorm, te_checkpoint = None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -302,6 +303,12 @@ class MoELayer(BaseMoELayer):
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
             )
+            if self.config.moe_latent_use_norm:
+                self.routed_expert_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.moe_latent_size,
+                    eps=self.config.layernorm_epsilon,
+                )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -460,6 +467,9 @@ class MoELayer(BaseMoELayer):
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
+        # sequence parallelism scatters hidden states along seq, so scatter input_ids to match
+        if input_ids is not None and self.config.sequence_parallel:
+            input_ids = split_along_nth_dim(input_ids, dim=1, group=self.tp_group)
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids, packed_seq_params
         )
@@ -643,6 +653,8 @@ class MoELayer(BaseMoELayer):
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
+            if self.config.moe_latent_use_norm:
+                output = self.routed_expert_norm(output)
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:

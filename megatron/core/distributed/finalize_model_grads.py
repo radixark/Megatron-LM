@@ -396,8 +396,20 @@ def _allreduce_non_tensor_model_parallel_grads(
         ddp_config = model_chunk.ddp_config
         for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
             if param.requires_grad:
+                # TP-replicated params whose grad is a partial sum over the TP shards (K3 LoRA)
+                if getattr(param, "sum_gradients_across_tp_domain", False):
+                    grad_attr = _get_main_grad_attr(param)
+                    grad = getattr(param, grad_attr)
+                    if grad is None:
+                        continue
+                    params_sum.append(param)
+                    if ddp_config.use_megatron_fsdp:
+                        grads_sum.append(grad._local_tensor.data)
+                    else:
+                        grad = _unshard_if_dtensor(grad)
+                        grads_sum.append(grad.data)
                 # Check if this param needs average reduction (average_gradients_across_tp_domain)
-                if getattr(param, "average_gradients_across_tp_domain", False):
+                elif getattr(param, "average_gradients_across_tp_domain", False):
                     grad_attr = _get_main_grad_attr(param)
                     grad = getattr(param, grad_attr)
                     if grad is None:
@@ -540,7 +552,7 @@ def finalize_model_grads(
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 
-    if config.moe_router_enable_expert_bias:
+    if config.moe_router_enable_expert_bias and not config.freeze_e_score_correction_bias:
         if pg_collection is None:
             tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
                 with_context_parallel=True

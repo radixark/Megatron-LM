@@ -19,8 +19,8 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def _reduce(input_, group):
-    """All-reduce the input tensor across model parallel group."""
+def _reduce(input_, group, fp32=False):
+    """All-reduce across the model parallel group; `fp32` reduces in fp32 and casts back."""
     assert group is not None, "group should not be None"
 
     # Bypass the function if we are using only 1 GPU.
@@ -28,11 +28,17 @@ def _reduce(input_, group):
         return input_
 
     # All-reduce.
-    # Note: If input_ is contiguous, it is mutated in-place.
-    # If not, a new contiguous tensor is created and returned;
-    # callers must use the returned value to ensure the reduced result is captured.
-    input_ = input_.contiguous()
-    torch.distributed.all_reduce(input_, group=group)
+    if fp32:
+        orig_dtype = input_.dtype
+        input_fp32 = input_.float().contiguous()
+        torch.distributed.all_reduce(input_fp32, group=group)
+        input_.copy_(input_fp32.to(orig_dtype))
+    else:
+        # Note: If input_ is contiguous, it is mutated in-place.
+        # If not, a new contiguous tensor is created and returned;
+        # callers must use the returned value to ensure the reduced result is captured.
+        input_ = input_.contiguous()
+        torch.distributed.all_reduce(input_, group=group)
 
     return input_
 
@@ -55,6 +61,25 @@ def _split_along_last_dim(input_, group):
     output = input_list[rank].contiguous()
 
     return output
+
+
+def split_along_nth_dim(input_, dim, group):
+    """Keep this rank's slice of `input_` along `dim` (no autograd)."""
+    assert group is not None, "group should not be None"
+
+    world_size = group.size()
+    if world_size == 1:
+        return input_
+
+    dim_size = input_.size(dim)
+    assert (
+        dim_size % world_size == 0
+    ), f"Dimension {dim} of the tensor (size {dim_size}) should be divisible by world size {world_size}"
+    local_dim_size = dim_size // world_size
+    rank = group.rank()
+    dim_offset = rank * local_dim_size
+
+    return input_.narrow(dim, dim_offset, local_dim_size).contiguous()
 
 
 def _split_along_first_dim(input_, group):
@@ -202,20 +227,21 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
     """Pass the input to the model parallel region."""
 
     @staticmethod
-    def symbolic(graph, input_, group):
+    def symbolic(graph, input_, group, all_reduce_grad_fp32=False):
         """Symbolic function for tracing."""
         return input_
 
     @staticmethod
-    def forward(ctx, input_, group):
+    def forward(ctx, input_, group, all_reduce_grad_fp32=False):
         """Forward function."""
         ctx.group = group
+        ctx.all_reduce_grad_fp32 = all_reduce_grad_fp32
         return input_
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
-        return _reduce(grad_output, ctx.group), None
+        return _reduce(grad_output, ctx.group, fp32=ctx.all_reduce_grad_fp32), None, None
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
@@ -489,10 +515,10 @@ class _AllToAll(torch.autograd.Function):
 # -----------------
 
 
-def copy_to_tensor_model_parallel_region(input_, group=None):
-    """Wrapper for autograd function: forward: copy, backward allreduce"""
+def copy_to_tensor_model_parallel_region(input_, group=None, all_reduce_grad_fp32=False):
+    """Wrapper for autograd function: forward: copy, backward allreduce (fp32 if requested)"""
     group = get_tensor_model_parallel_group_if_none(group)
-    return _CopyToModelParallelRegion.apply(input_, group)
+    return _CopyToModelParallelRegion.apply(input_, group, all_reduce_grad_fp32)
 
 
 def reduce_from_tensor_model_parallel_region(input_, group=None):

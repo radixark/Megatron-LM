@@ -124,6 +124,9 @@ class SharedExpertMLP(MLP):
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
+        if not config.activation_func_clamp_shared_expert:
+            config.activation_func_clamp_value = None
+
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
         super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp, name=name)

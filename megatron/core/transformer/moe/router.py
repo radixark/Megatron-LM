@@ -88,6 +88,11 @@ class Router(ABC, MegatronModule):
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
         self.reset_parameters()
 
+        if self.config.moe_router_freeze_gate:
+            self.weight.requires_grad = False
+            if self.bias is not None:
+                self.bias.requires_grad = False
+
     def reset_parameters(self):
         """Reset the router parameters."""
         if self.config.perform_initialization:
@@ -216,7 +221,8 @@ class TopKRouter(Router):
             tid2eid = torch.stack([(ids + k) % num_experts for k in range(self.topk)], dim=1).to(
                 torch.int32
             )
-            self.register_buffer('tid2eid', tid2eid)
+            # parameter, not buffer: the sync gathers buffers as zeros, clobbering the engine table
+            self.tid2eid = torch.nn.Parameter(tid2eid, requires_grad=False)
         else:
             self.tid2eid = None
 
@@ -274,7 +280,9 @@ class TopKRouter(Router):
         # training. No-op (early return) unless miles enables the manager.
         from miles.utils.replay_base import routing_replay_manager
 
-        routing_replay_manager.register_to_module(self, "routing_replay")
+        # replay only records main-decoder MoE layers; an MTP router would pop from an empty stream
+        if not self.is_mtp_layer:
+            routing_replay_manager.register_to_module(self, "routing_replay")
 
     def _maintain_float32_expert_bias(self):
         """
@@ -864,8 +872,15 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
-        # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+        # Hash routing assignments come from tid2eid rather than the learned logits, so a
+        # learned top-k aux loss would optimize routing decisions that were never dispatched.
+        # Keep aux loss enabled for the non-hash MoE layers that share this configuration.
+        if (
+            not self.is_hash_layer
+            and self.training
+            and torch.is_grad_enabled()
+            and self.is_aux_loss_enabled()
+        ):
             # Calculate scores and routing_map for aux loss
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits,

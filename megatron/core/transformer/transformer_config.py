@@ -53,6 +53,19 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+GATED_DELTA_NET_VARIANTS = ("gated_delta_net", "gdn")
+
+
+def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
+    """True for the Gated DeltaNet linear-attention variant under either of its names.
+
+    Upstream Megatron-LM renamed ``gated_delta_net`` to ``gdn`` (NVIDIA/Megatron-LM#5765) and
+    Megatron-Bridge ``main`` selects Qwen3.5's linear attention with the new name. miles-main
+    keeps ``gated_delta_net`` as the canonical spelling and treats ``gdn`` as an alias.
+    """
+    return experimental_attention_variant in GATED_DELTA_NET_VARIANTS
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -211,6 +224,10 @@ class TransformerConfig(ModelParallelConfig):
     activation_func: Callable[[torch.Tensor], torch.Tensor] = F.gelu
     """Activation function to use for the non-linearity in the MLP."""
 
+    gated_activation_func: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    """Activation that consumes the packed [gate | linear] GLU input itself (Kimi K3's situ);
+    None keeps the activation_func(gate) * linear form."""
+
     activation_func_fp8_input_store: bool = False
     """Store the input of MLP activation function in FP8 for backprop to save memory.
     The stored input is casted back to the original precision before backprop compuatation."""
@@ -222,6 +239,10 @@ class TransformerConfig(ModelParallelConfig):
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu or weighted SwiGLU (MoE only)."""
+
+    activation_func_clamp_shared_expert: bool = True
+    """If False, skip activation_func_clamp_value inside SharedExpertMLP so only routed MoE
+    experts get the clamp."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -307,10 +328,14 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
-        None
-    )
-    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
+    experimental_attention_variant: Optional[
+        Literal['gated_delta_net', 'gdn', 'dsa', 'dsv4_hybrid', 'dsv4']
+    ] = None
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, dsv4_hybrid, and
+    dsv4 (miles' DeepSeek-V4 sparse-attention path). 'gdn' is upstream Megatron-LM's name for
+    gated_delta_net (NVIDIA/Megatron-LM#5765) and is accepted as an alias: it is normalized to
+    'gated_delta_net' in __post_init__, and every check goes through is_gated_delta_net_variant so a
+    value assigned after construction (Megatron-Bridge sets it on the provider) is recognized too."""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks.
@@ -874,6 +899,12 @@ class TransformerConfig(ModelParallelConfig):
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
+    freeze_e_score_correction_bias: bool = False
+    """Freeze expert score correction bias during training (DSv4 RL)."""
+
+    moe_router_freeze_gate: bool = False
+    """Freeze MoE router gate weights during training (DSv4 RL)."""
+
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
@@ -1015,6 +1046,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
+
+    moe_latent_use_norm: bool = False
+    """RMSNorm the combined routed output in latent space before fc2_latent_proj (Kimi K3)."""
 
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
@@ -1479,6 +1513,10 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
+        if self.experimental_attention_variant == "gdn":
+            # Upstream spelling (NVIDIA/Megatron-LM#5765); canonicalize so every check below matches.
+            self.experimental_attention_variant = "gated_delta_net"
+
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
@@ -1608,14 +1646,16 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_partition_mode='contiguous' is not supported with "
                         "multi_latent_attention outside dsv4_hybrid."
                     )
-                if self.experimental_attention_variant not in ("dsv4_hybrid", "gated_delta_net"):
+                if self.experimental_attention_variant != "dsv4_hybrid" and not is_gated_delta_net_variant(
+                    self.experimental_attention_variant
+                ):
                     raise ValueError(
                         "cp_partition_mode='contiguous' with context parallelism currently "
                         "requires experimental_attention_variant to be either 'dsv4_hybrid' "
                         "or 'gated_delta_net'."
                     )
                 if (
-                    self.experimental_attention_variant == "gated_delta_net"
+                    is_gated_delta_net_variant(self.experimental_attention_variant)
                     and self.linear_cp_mode == "headwise"
                 ):
                     raise ValueError(
@@ -1659,12 +1699,12 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.dsa_kernel_backend = legacy_backend
 
-        if self.experimental_attention_variant in ["gated_delta_net"]:
+        if is_gated_delta_net_variant(self.experimental_attention_variant):
             assert (
                 self.linear_attention_freq is not None
             ), f"linear_attention_freq must be set for linear attention."
 
-            if self.experimental_attention_variant == "gated_delta_net":
+            if is_gated_delta_net_variant(self.experimental_attention_variant):
                 if self.pad_packed_seq_alignment is not None:
                     tail_policy = self.thd_tail_padding_policy or 'append_dummy_seq'
                     assert tail_policy == 'append_dummy_seq', (
@@ -1754,6 +1794,8 @@ class TransformerConfig(ModelParallelConfig):
                     "DSAttention context parallelism currently supports "
                     "cp_comm_type=allgather only."
                 )
+        elif self.experimental_attention_variant == "dsv4":
+            assert self.multi_latent_attention, "dsv4 requires multi_latent_attention."
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -1833,7 +1875,7 @@ class TransformerConfig(ModelParallelConfig):
 
         if (
             self.gdn_pre_gated_delta_rule_fusion
-            and self.experimental_attention_variant != "gated_delta_net"
+            and not is_gated_delta_net_variant(self.experimental_attention_variant)
         ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
@@ -2239,7 +2281,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if (
                 "gdn_norm_out" in self.recompute_modules
-                and self.experimental_attention_variant != "gated_delta_net"
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
@@ -2248,7 +2290,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if (
                 "gdn" in self.recompute_modules
-                and self.experimental_attention_variant != "gated_delta_net"
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
                     "gdn in recompute_modules is only supported with "
@@ -2894,14 +2936,16 @@ class TransformerConfig(ModelParallelConfig):
                 self.actual_vocab_size is not None
             ), "actual_vocab_size must be set when moe_n_hash_layers > 0."
             if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
-                assert self.pipeline_model_parallel_layout is not None, (
-                    "pipeline_model_parallel_layout must be set when using hash MoE "
-                    "layers with pipeline parallelism (PP > 1)."
-                )
-                # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
-                # All hash MoE layers must be in the same virtual pipeline stage.
-                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
-                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                # hash layers read input_ids, which only the embedding stage has, so all live there;
+                # the stage size may come from a layout, uneven first/last, or the even split
+                if self.pipeline_model_parallel_layout is not None:
+                    # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
+                    embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                    n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                else:
+                    from megatron.core.transformer.transformer_block import get_num_layers_to_build
+
+                    n_decoders_with_embedding = get_num_layers_to_build(self, vp_stage=0, pp_rank=0)
                 assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
                     f"Currently, All hash MoE layers must be in the same virtual pipeline stage "
                     f"as the embedding. The embedding stage has "
@@ -3186,7 +3230,7 @@ class TransformerConfig(ModelParallelConfig):
             and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
         )
 
-        cp_layout_conversion_required = self.experimental_attention_variant == "gated_delta_net"
+        cp_layout_conversion_required = is_gated_delta_net_variant(self.experimental_attention_variant)
         # TODO: Extend this predicate as GDN2/KDA are introduced, and for DSv4 when
         # dsa_cp_balance_indexer is introduced; those paths will also require module-local THD CP
         # layout conversion.

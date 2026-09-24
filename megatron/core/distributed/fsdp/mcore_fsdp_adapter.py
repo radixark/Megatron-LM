@@ -484,6 +484,29 @@ class FullyShardedDataParallel(_BaseDataParallel):
         _load_rng_state_dict(broadcast_list[0])
 
 
+# Name compatibility with upstream Megatron-Core (NVIDIA/Megatron-LM#5865), which split
+# Megatron-FSDP into ``FullyShardedDataParallelV1`` (this implementation) and
+# ``FullyShardedDataParallelV2`` and turned ``FullyShardedDataParallel`` into a factory.
+# Callers written against upstream, such as Megatron-Bridge's ``unwrap_model``, import both
+# names from this module. ``miles-main`` keeps ``FullyShardedDataParallel`` as the v1 class
+# (nothing here selects v2) and does not carry the v2 implementation.
+FullyShardedDataParallelV1 = FullyShardedDataParallel
+
+
+class FullyShardedDataParallelV2(_BaseDataParallel):
+    """Placeholder for Megatron-FSDP v2 (NVIDIA/Megatron-LM#5865), which is not ported.
+
+    The class exists so that upstream-style ``isinstance`` checks import and evaluate to
+    ``False``; constructing it raises.
+    """
+
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Megatron-FSDP v2 (NVIDIA/Megatron-LM#5865) is not ported to miles-main; "
+            "use FullyShardedDataParallel (FullyShardedDataParallelV1)."
+        )
+
+
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
     world_size = dist.get_world_size()
