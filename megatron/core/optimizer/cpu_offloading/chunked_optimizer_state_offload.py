@@ -474,6 +474,11 @@ class ChunkedOptimizerStateOffloader:
         restoration without that cast.
         """
 
+        # Import lazily: optimizer.py owns the common Adam state helpers and
+        # imports this manager when constructing Megatron optimizer wrappers.
+        from ..optimizer import _strip_adam_beta1_zero_state
+
+        state_dict = _strip_adam_beta1_zero_state(self.optimizer, state_dict)
         saved_groups = state_dict["param_groups"]
         current_groups = self.optimizer.param_groups
         if len(saved_groups) != len(current_groups):
@@ -931,12 +936,14 @@ class ChunkedOptimizerStateOffloader:
         base_group_metadata: Sequence[dict],
         resulting_group_metadata: Dict[int, dict],
     ) -> None:
+        from ..optimizer import _step_with_adam_beta1_zero
+
         groups, indexed_groups = self._make_subset_groups(params, base_group_metadata)
         if not groups:
             return
         self.optimizer.param_groups = groups
         try:
-            self.optimizer.step()
+            _step_with_adam_beta1_zero(self.optimizer)
             for group_index, group in indexed_groups:
                 metadata = self._snapshot_group_metadata([group])[0]
                 previous = resulting_group_metadata.get(group_index)
@@ -956,9 +963,10 @@ class ChunkedOptimizerStateOffloader:
     @torch.no_grad()
     def step(self) -> None:
         """Run the external optimizer over resident parameters and staged state chunks."""
+        from ..optimizer import _step_with_adam_beta1_zero
 
         if not self._selected_params:
-            self.optimizer.step()
+            _step_with_adam_beta1_zero(self.optimizer)
             return
 
         self.prefetch_for_step()

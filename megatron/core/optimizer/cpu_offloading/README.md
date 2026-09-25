@@ -12,6 +12,35 @@ Add these flags to enable optimizer cpu offload in MCore.
 
 Gradient copy from GPU to CPU, CPU optimizer step, and subsequent parameter copy from CPU to GPU can be time-consuming operations, and it is recommended to use the flag `--overlap-cpu-optimizer-d2h-h2d` to execute them concurrently.
 
+## Adam with beta1 zero
+
+`--adam-beta1 0.0` automatically omits persistent first-moment (`exp_avg`) state.
+GPU AdamW reuses its FP32 gradient during the unmodified Transformer Engine update;
+full CPU offload reuses its CPU FP32 gradient during PyTorch's unmodified fused
+AdamW update. Both retain the original update arithmetic, second moment, bias
+correction, and decoupled weight decay. The kernels still execute first-moment
+arithmetic, but its input/output aliases the current gradient instead of a
+persistent momentum allocation. No Transformer Engine modifications are needed.
+
+For full CPU updates, combine `--adam-beta1 0.0` with the CPU-offload flags above.
+The existing Megatron/HDO step call sites temporarily bind the first moment to
+the current gradient and remove the alias after the stock optimizer step, including
+on exceptions. The original optimizer classes, closures and hooks remain in use.
+There is no custom optimizer class, update kernel, compiler requirement, or package
+extension. State initialization and checkpoint loading skip the unused first moment.
+Fractional CPU optimizer offload is deliberately unsupported in this path.
+The CPU specialization also rejects `--low-memory-resume`, whose current loader
+moves optimizer tensors to CUDA after loading.
+
+The specialization requires FP32 moment state and, on GPU, contiguous FP32 gradients.
+Optimizer CUDA graphs, Megatron FSDP, and coupled weight decay are unsupported.
+Nonzero beta1 continues to use the existing optimizers. Beta1 must remain zero,
+including after checkpoint loading: resuming optimizer groups with nonzero beta1
+is rejected. Legacy beta1-zero checkpoints may contain `exp_avg`; it is ignored.
+New checkpoints omit `exp_avg`, so resuming them requires this implementation.
+With FP32 moments this saves four persistent bytes per locally owned parameter
+element (half the moment storage), on the device that owns the optimizer state.
+
 ## Chunked GPU optimizer-state offload
 
 `--chunked-optimizer-state-offload` keeps a configurable fraction of optimizer tensor state and
