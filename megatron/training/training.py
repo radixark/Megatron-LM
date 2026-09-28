@@ -2216,9 +2216,20 @@ def get_model(
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
+    # With CPU initialization and the distributed optimizer, DDP copies every param into its GPU
+    # param buffer; moving the model first would hold a second GPU copy of the params next to the
+    # param and grad buffers while they are built. Leave the params on CPU until DDP has remapped them.
+    defer_gpu_allocation_to_ddp = (
+        wrap_with_ddp
+        and args.use_cpu_initialization
+        and args.use_distributed_optimizer
+        and not args.use_torch_fsdp2
+        and not args.use_megatron_fsdp
+    )
     if (
         not (args.use_torch_fsdp2 and args.use_cpu_initialization)
         and not args.init_model_with_meta_device
+        and not defer_gpu_allocation_to_ddp
     ):
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
@@ -2301,6 +2312,11 @@ def get_model(
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
+
+        if defer_gpu_allocation_to_ddp:
+            # Params now view the GPU buffers; move what DDP does not own (buffers, frozen params).
+            for model_module in model:
+                model_module.cuda(torch.cuda.current_device())
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
