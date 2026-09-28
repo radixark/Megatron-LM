@@ -1669,6 +1669,52 @@ def csa_sparse_attn(
 # ---------------------------------------------------------------------------
 
 
+# Upper bound on the transient buffers one ``_stable_topk_indices`` sort may
+# hold at once: the masked score copy, the sorted scores and the int64 order.
+_STABLE_TOPK_SORT_BYTES = 256 << 20
+_NEG_INF = float("-inf")
+
+
+def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tensor:
+    """Select the ``topk_k`` highest-scoring key ids per row with a fixed tie order.
+
+    Rows may only draw from their first ``seq_lens[row]`` key columns; a row with
+    fewer valid keys than ``topk_k`` is padded with ``-1``. Exact score ties are
+    resolved toward the smallest key id and the selected ids are returned in
+    descending-score order, so identical inputs always yield identical ids. The
+    radix Top-K kernel does not order equal scores, which matters for ReLU-scored
+    indexers where many keys share a score of exactly zero.
+
+    Rows are independent, so they are sorted in slabs sized to keep the sort's
+    temporary buffers under ``_STABLE_TOPK_SORT_BYTES`` regardless of ``rows``.
+
+    Args:
+        scores: ``(rows, sk)`` fp32 indexer scores; masked positions hold ``-inf``.
+        seq_lens: ``(rows,)`` int32 number of candidate key columns per row.
+        topk_k: number of ids to select, at most ``sk``.
+
+    Returns:
+        ``(rows, topk_k)`` int32 key ids, ``-1`` where a row has no more valid keys.
+    """
+    rows, sk = scores.shape
+    columns = torch.arange(sk, device=scores.device, dtype=seq_lens.dtype)
+    bytes_per_row = sk * (2 * scores.element_size() + 8)
+    slab = max(1, min(rows, _STABLE_TOPK_SORT_BYTES // bytes_per_row))
+    selected = torch.empty(rows, topk_k, dtype=torch.int32, device=scores.device)
+    for start in range(0, rows, slab):
+        stop = min(start + slab, rows)
+        candidates = scores[start:stop].masked_fill(
+            columns.unsqueeze(0) >= seq_lens[start:stop].unsqueeze(1), _NEG_INF
+        )
+        sorted_scores, order = torch.sort(candidates, dim=-1, descending=True, stable=True)
+        selected[start:stop] = (
+            order[:, :topk_k]
+            .to(torch.int32)
+            .masked_fill(torch.isneginf(sorted_scores[:, :topk_k]), -1)
+        )
+    return selected
+
+
 # The balanced CP path fails closed above the shared limit before reaching this
 # compatibility warning; see cp_utils.compute_cp_indexer_topk.
 
@@ -1931,6 +1977,27 @@ def _indexer_topk_core(
             del returned_buffers, actual, expected
         del compact_logits, compact_result
 
+        if deterministic:
+            # cuDNN's compact forward + Top-K returns a repeatable key *set* under
+            # ``deterministic=True`` but writes the slots in kernel arrival order, which
+            # differs call to call (about half of all rows at 33k x 1040, cuDNN Frontend
+            # 1.28.0). FlashMLA accumulates its online softmax in slot order, so a no-grad
+            # and a grad-enabled forward over the same weights would still round
+            # differently. Impose a canonical per-row order: ascending key id, ``-1``
+            # padding last, and carry the softmax along. Any fixed order restores bitwise
+            # agreement; ascending id matches the fallback's tie rule for equal scores.
+            # Written back in place so CUDA-graph workspace buffers keep aliasing.
+            padding_last = torch.where(
+                topk_indices < 0,
+                torch.full_like(topk_indices, torch.iinfo(topk_indices.dtype).max),
+                topk_indices,
+            )
+            canonical_order = torch.argsort(padding_last, dim=-1)
+            topk_indices.copy_(torch.gather(topk_indices, -1, canonical_order))
+            if compact_softmax is not None:
+                compact_softmax.copy_(torch.gather(compact_softmax, -1, canonical_order))
+            del padding_last, canonical_order
+
         topk_indices = topk_indices.int()
         topk_length = (topk_indices >= 0).sum(dim=-1).int()
         if is_thd:
@@ -1986,10 +2053,13 @@ def _indexer_topk_core(
 
     # ---------------- Shared: radix top-K + pad-to-topk -----------------
     topk_k = min(topk, sk)
-    tk_result = _DSA.indexer_top_k_wrapper(
-        scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
-    )
-    topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
+    if deterministic:
+        topk_indices = _stable_topk_indices(scores_flat, seq_lens, topk_k)
+    else:
+        tk_result = _DSA.indexer_top_k_wrapper(
+            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=False
+        )
+        topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
 
     if is_thd:
         topk_indices, topk_length = thd_indexer_kernels.sanitize_topk(
@@ -2062,8 +2132,9 @@ def indexer_topk(
             available. False retains dense scoring for the balanced indexer's
             existing unpadded synthetic layouts.
         deterministic: resolve exact-value ties at the K-th boundary toward
-            the smallest local KV indices. The output slot order remains
-            unspecified.
+            the smallest local KV indices. Compact dispatch leaves the output
+            slot order unspecified; the standalone Top-K fallback returns ids in
+            descending-score order.
         return_softmax: also return the compact kernel's Top-K softmax. The
             third return is ``None`` when compact dispatch is unavailable.
 
@@ -3170,6 +3241,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
 
         # Preserve the fixed window suffix for the dense teacher before
         # compacting the complete attention index set.
+        if q_padding_mask is not None:
+            # Padding queries attend only to the sink, as in raw THD lowering.
+            topk_idxs.masked_fill_(q_padding_mask.unsqueeze(-1), -1)
         if logical_window_width is None:
             logical_window_width = topk_idxs.shape[-1] - indexer_topk
         window_topk_idxs = topk_idxs[:, indexer_topk : indexer_topk + int(logical_window_width)]
