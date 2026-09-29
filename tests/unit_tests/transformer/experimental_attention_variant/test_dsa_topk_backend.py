@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels, dsa_kernels
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -261,7 +262,8 @@ def test_external_score_hook_declines_explicit_key_positions():
     )
 
 
-def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch):
+@pytest.mark.parametrize("layout", ["plain", "packed_tail", "padded"])
+def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch, layout):
     config = _config("torch")
     config.dsa_indexer_topk = 2
     config.dsa_indexer_topk_freq = 4
@@ -280,13 +282,22 @@ def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch):
         pg_collection=SimpleNamespace(),
     )
     mask = torch.ones(1)
+    packed = None
+    if layout != "plain":
+        cu = torch.tensor([0, 3], dtype=torch.int32)
+        packed = PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=4, max_seqlen_kv=4
+        )
+        if layout == "padded":
+            packed.real_token_mask_q = torch.tensor([True, True, True, False])
     scores = torch.zeros(1, 4, 4)
     scores.masked_fill_(torch.triu(torch.ones(4, 4, dtype=torch.bool), diagonal=1), -torch.inf)
     selected = select_dsa_topk(scores, 2, config)
-    attention._get_index_share_topk_holder(None, mask)[1] = selected
+    attention._get_index_share_topk_holder(packed, mask)[1] = selected
     forwarded = []
 
     def sparse_attention(**kwargs):
+        assert kwargs["all_rows_nonempty"] is (layout != "padded")
         forwarded.append(kwargs["topk_indices"])
         return kwargs["query"].flatten(2)
 
@@ -301,12 +312,13 @@ def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch):
         torch.randn(4, 1, 16),
         torch.randn(4, 1, 8),
         attn_mask_type=AttnMaskType.causal,
+        packed_seq_params=packed,
     )
     assert forwarded == [selected]
     assert forwarded[0] is selected
 
 
-def test_external_selection_declines_combined_fused_hooks(monkeypatch):
+def test_external_selection_declines_combined_indexer_loss_hooks(monkeypatch):
     def must_not_load(*args, **kwargs):
         raise AssertionError("Combined kernels must not own top-k under an explicit policy")
 
@@ -328,7 +340,231 @@ def test_external_selection_declines_combined_fused_hooks(monkeypatch):
         if parameter.default is inspect.Parameter.empty
     }
     kwargs["config"] = config
+    kwargs["loss_coeff"] = 0.1
     assert dsa_kernels.run_fused_dsa_attention(**kwargs) is None
+
+
+@pytest.mark.parametrize("segments", [1, 2])
+@pytest.mark.parametrize("tie_break", [1, 2])
+@pytest.mark.parametrize("nonzero", [False, True], ids=["tied", "nonzero"])
+def test_external_selection_preserves_fused_packed_cp_scores(
+    monkeypatch, segments, tie_break, nonzero
+):
+    _require_flashinfer()
+    pytest.importorskip("cudnn")
+    seq, local_seq, heads, dim, topk = 128, 64, 64, 128, 32
+    q, k, weights = _indexer_inputs(local_seq, seq, 1, heads, dim, nonzero)
+    seq_len = seq // segments
+    positions = torch.cat(
+        [
+            torch.arange(start + seq_len // 4, start + 3 * seq_len // 4, device="cuda")
+            for start in range(0, seq, seq_len)
+        ]
+    )
+    starts = (positions // seq_len * seq_len).to(torch.int32)
+    ends = (positions + 1).to(torch.int32)
+    cu = torch.arange(0, seq + 1, seq_len, dtype=torch.int32, device="cuda")
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=seq_len,
+        max_seqlen_kv=seq_len,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Packed CP must retain fused scoring and external selection")
+
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_compute_indexer_scores_chunk_with_global_rows", forbidden
+    )
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_top_k_wrapper_chunked", forbidden)
+    config = _config(tie_break=tie_break)
+    indices, lengths = dsa_kernels.run_fused_qk_topk(
+        config,
+        q,
+        k,
+        weights,
+        topk,
+        starts,
+        ends,
+        block_size=128,
+        cp_size=2,
+        use_local_indexer_varlen=True,
+        single_packed_thd_sequence=segments == 1,
+        local_packed_cp_rank=1,
+        packed_seq_params=packed,
+    )
+    scores, _ = _reference_scores(q, k, weights, starts, ends)
+    expected = select_dsa_topk(scores, topk, config)
+    # Unsorted FlashInfer output order may depend on the segment's score width;
+    # the selected original indices and boundary tie policy must be identical.
+    torch.testing.assert_close(indices.sort().values, expected.sort().values, rtol=0, atol=0)
+    assert lengths is None
+
+
+@pytest.mark.parametrize("segments", [1, 2])
+def test_packed_cp_without_causal_offset_api_uses_global_row_fallback(monkeypatch, segments):
+    _require_flashinfer()
+    q, k, weights = _indexer_inputs(64, 128, 1, 2, 8, True)
+    seq_len = 128 // segments
+    positions = torch.cat(
+        [
+            torch.arange(start + seq_len // 4, start + 3 * seq_len // 4, device="cuda")
+            for start in range(0, 128, seq_len)
+        ]
+    )
+    starts = (positions // seq_len * seq_len).to(torch.int32)
+    ends = (positions + 1).to(torch.int32)
+    cu = torch.arange(0, 129, seq_len, dtype=torch.int32, device="cuda")
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=seq_len,
+        max_seqlen_kv=seq_len,
+    )
+
+    def legacy_wrapper(q, k, weights, ratio, sm_scale):
+        raise AssertionError("A cuDNN API without causal offsets cannot score cropped CP prefixes")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Legacy cuDNN must use explicit global-row score masking")
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_cudnn_dsa", SimpleNamespace(indexer_forward_wrapper=legacy_wrapper)
+    )
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_single_packed_cp_segments", forbidden)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_multi_packed_cp_thd", forbidden)
+    config = _config()
+    indices, lengths = dsa_kernels.run_fused_qk_topk(
+        config,
+        q,
+        k,
+        weights,
+        16,
+        starts,
+        ends,
+        block_size=128,
+        cp_size=2,
+        use_local_indexer_varlen=True,
+        single_packed_thd_sequence=segments == 1,
+        packed_seq_params=packed,
+        local_packed_cp_rank=1,
+    )
+    scores, _ = _reference_scores(q, k, weights, starts, ends)
+    torch.testing.assert_close(indices, select_dsa_topk(scores, 16, config), rtol=0, atol=0)
+    assert lengths is None
+
+
+@pytest.mark.parametrize("tie_break", [1, 2])
+def test_multi_packed_cp_local_tp_slice_uses_global_row_fallback(monkeypatch, tie_break):
+    _require_flashinfer()
+    q, k, weights = _indexer_inputs(32, 128, 1, 2, 8, True)
+    positions = torch.cat(
+        (torch.arange(32, 48, device="cuda"), torch.arange(80, 96, device="cuda"))
+    )
+    starts = (positions // 64 * 64).to(torch.int32)
+    ends = (positions + 1).to(torch.int32)
+    cu = torch.tensor([0, 64, 128], dtype=torch.int32, device="cuda")
+    packed = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=64, max_seqlen_kv=64
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Whole-CP cu_seqlens cannot describe a TP-local query slice")
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_multi_packed_cp_thd", forbidden)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_forward_wrapper_with_warning", forbidden)
+    config = _config(tie_break=tie_break)
+    indices, lengths = dsa_kernels.run_fused_qk_topk(
+        config,
+        q,
+        k,
+        weights,
+        16,
+        starts,
+        ends,
+        block_size=128,
+        cp_size=2,
+        use_local_indexer_varlen=True,
+        packed_seq_params=packed,
+        local_packed_cp_rank=1,
+        local_packed_cp_query_start=16,
+        local_packed_cp_query_len=64,
+    )
+    scores, _ = _reference_scores(q, k, weights, starts, ends)
+    torch.testing.assert_close(indices, select_dsa_topk(scores, 16, config), rtol=0, atol=0)
+    assert lengths is None
+
+
+@pytest.mark.parametrize("has_empty_row", [False, True])
+def test_split_attention_backward_skips_compaction_only_for_known_nonempty_rows(
+    monkeypatch, has_empty_row
+):
+    seen = []
+
+    class FakeDSA:
+        @staticmethod
+        def sparse_attention_backward_wrapper(q, kv, out, dO, lse, sink, indices, **kwargs):
+            seen.append((q.size(0), kwargs["topk_length"].clone()))
+            return {"dq": torch.ones_like(q), "dkv": torch.zeros_like(kv)}
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+
+    def fake_forward(q, kv, indices, softmax_scale, d_v, attn_sink, topk_length):
+        return torch.zeros(q.size(0), q.size(1), d_v), torch.zeros(q.size(0), q.size(1))
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_dsa_fwd_flash_mla", fake_forward)
+    original_nonzero = torch.nonzero
+    nonzero_calls = []
+
+    def checked_nonzero(*args, **kwargs):
+        assert has_empty_row, "Known nonempty rows must not trigger CUDA nonzero/synchronization"
+        nonzero_calls.append(True)
+        return original_nonzero(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "nonzero", checked_nonzero)
+    query = torch.zeros(2, 1, 1, 512, requires_grad=True)
+    key = torch.zeros(4, 1, 1, 512, requires_grad=True)
+    indices = torch.tensor([[[0, -1], [1, 0]]], dtype=torch.int32)
+    if has_empty_row:
+        indices[:, 0] = -1
+    output = dsa_kernels.run_fused_absorbed_sparse_attention(
+        _config("torch"), query, key, indices, 1.0, 512, all_rows_nonempty=not has_empty_row
+    )
+    output.sum().backward()
+    assert bool(nonzero_calls) == has_empty_row
+    torch.testing.assert_close(
+        query.grad[0],
+        torch.zeros_like(query.grad[0]) if has_empty_row else torch.ones_like(query.grad[0]),
+    )
+    torch.testing.assert_close(query.grad[1], torch.ones_like(query.grad[1]))
+    assert seen[0][0] == 2  # original rows, or one real row plus the fallback dummy row
+
+
+def test_no_auxiliary_loss_keeps_full_fused_dispatch(monkeypatch):
+    observed = []
+
+    def full_hook(**kwargs):
+        observed.append(kwargs["config"])
+        return "output", "loss"
+
+    monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda *_: full_hook)
+    kwargs = {
+        key: None
+        for key, parameter in inspect.signature(
+            dsa_kernels.run_fused_dsa_attention
+        ).parameters.items()
+        if parameter.default is inspect.Parameter.empty
+    }
+    config = _config("torch")
+    kwargs.update(config=config, loss_coeff=0.0)
+    assert dsa_kernels.run_fused_dsa_attention(**kwargs) == ("output", "loss")
+    assert observed == [config]
 
 
 @pytest.mark.parametrize("sparse_loss", [False, True])

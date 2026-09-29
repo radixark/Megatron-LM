@@ -215,12 +215,16 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    all_rows_nonempty: bool = False,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    kwargs = {}
+    if uses_external_topk(config) and _get_dsa_kernel_backend(config) == "cudnn":
+        kwargs["all_rows_nonempty"] = all_rows_nonempty
+    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length, **kwargs)
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
     return result
@@ -257,10 +261,13 @@ def run_fused_dsa_attention(
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    all_rows_nonempty: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together."""
-    if uses_external_topk(config):
-        # Combined kernels choose their own top-k. Keep attention on the split path.
+    if uses_external_topk(config) and (
+        _get_dsa_kernel_backend(config) != "cudnn" or loss_coeff > 0
+    ):
+        # cuDNN accepts an external selector on its optimized no-auxiliary-loss path.
         return None
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:
@@ -295,6 +302,7 @@ def run_fused_dsa_attention(
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         pg_collection=pg_collection,
+        **({"all_rows_nonempty": all_rows_nonempty} if uses_external_topk(config) else {}),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_dsa_attention", "backend returned None")

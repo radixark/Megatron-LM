@@ -384,10 +384,10 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_topk_backend: Optional[Literal["torch", "flashinfer"]] = None
     """Select ordinary-DSA top-k independently from its score/attention kernels.
-    None preserves the kernel backend's selection. Explicit selection bypasses
-    combined fused indexer/attention and indexer-loss kernels that own their top-k.
-    Unsupported fused score layouts and indexer loss use the reference indexer;
-    fused sparse attention remains enabled."""
+    None preserves the kernel backend's selection. Explicit selection retains
+    cuDNN score layouts and no-auxiliary-loss attention fusion. Unsupported fused
+    score layouts and indexer loss use the reference indexer; fused sparse
+    attention remains enabled."""
 
     dsa_indexer_topk_deterministic: bool = False
     """Pass deterministic=True to FlashInfer top_k when selected explicitly."""
