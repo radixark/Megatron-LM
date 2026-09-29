@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from torch import Tensor
 
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa_topk import uses_external_topk
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -116,7 +117,9 @@ def run_fused_qk_topk(
     cp_size: int = 1,
 ) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
     """Optional fused indexer hook for backend-specific implementations."""
-    fn = _resolve_fused_hook(config, "run_fused_qk_topk")
+    external_topk = uses_external_topk(config)
+    hook = "run_fused_qk_topk_with_external_topk" if external_topk else "run_fused_qk_topk"
+    fn = _resolve_fused_hook(config, hook)
     if fn is None:
         return None
     result = fn(
@@ -135,6 +138,7 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **({"config": config} if external_topk else {}),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
@@ -167,6 +171,9 @@ def run_fused_qk_topk_with_loss(
     cp_size: int = 1,
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations."""
+    if uses_external_topk(config):
+        # The reference loss path retains exactly the externally selected indices.
+        return None
     fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_loss")
     if fn is None:
         return None
@@ -252,6 +259,9 @@ def run_fused_dsa_attention(
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together."""
+    if uses_external_topk(config):
+        # Combined kernels choose their own top-k. Keep attention on the split path.
+        return None
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:
         return None

@@ -382,6 +382,19 @@ class TransformerConfig(ModelParallelConfig):
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
     """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
 
+    dsa_indexer_topk_backend: Optional[Literal["torch", "flashinfer"]] = None
+    """Select ordinary-DSA top-k independently from its score/attention kernels.
+    None preserves the kernel backend's selection. Explicit selection bypasses
+    combined fused indexer/attention and indexer-loss kernels that own their top-k.
+    Unsupported fused score layouts and indexer loss use the reference indexer;
+    fused sparse attention remains enabled."""
+
+    dsa_indexer_topk_deterministic: bool = False
+    """Pass deterministic=True to FlashInfer top_k when selected explicitly."""
+
+    dsa_indexer_topk_tie_break: int = 0
+    """FlashInfer tie policy: 0 leaves it unset, 1 prefers small indices, 2 large indices."""
+
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
 
@@ -1587,6 +1600,26 @@ class TransformerConfig(ModelParallelConfig):
         if self.experimental_attention_variant == "gdn":
             # Upstream spelling (NVIDIA/Megatron-LM#5765); canonicalize so every check below matches.
             self.experimental_attention_variant = "gated_delta_net"
+
+        if self.dsa_indexer_topk_backend not in (None, "torch", "flashinfer"):
+            raise ValueError("dsa_indexer_topk_backend must be None, 'torch', or 'flashinfer'.")
+        if (
+            self.dsa_indexer_topk_backend is not None
+            and self.experimental_attention_variant != "dsa"
+        ):
+            raise ValueError(
+                "Explicit DSA top-k selection requires experimental_attention_variant='dsa'."
+            )
+        if self.dsa_indexer_topk_tie_break not in (0, 1, 2):
+            raise ValueError(
+                "dsa_indexer_topk_tie_break must be 0 (unset), 1 (small), or 2 (large)."
+            )
+        if (
+            self.dsa_indexer_topk_deterministic or self.dsa_indexer_topk_tie_break != 0
+        ) and self.dsa_indexer_topk_backend != "flashinfer":
+            raise ValueError(
+                "DSA top-k deterministic/tie-break options require the flashinfer backend."
+            )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

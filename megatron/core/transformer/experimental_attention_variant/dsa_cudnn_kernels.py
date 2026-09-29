@@ -21,6 +21,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety i
     FUSED_INDEXER_MAX_SAFE_ROWS,
     warn_fused_indexer_row_limit_once,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_topk import select_dsa_topk
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 if TYPE_CHECKING:
@@ -600,6 +601,7 @@ def _indexer_topk_from_score_chunks(
     indexer_ratio: int = _INDEXER_RATIO,
     score_seq_lens: Optional[Tensor] = None,
     bottom_right_key_start: Optional[int] = None,
+    topk_config: Optional["TransformerConfig"] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
@@ -663,6 +665,18 @@ def _indexer_topk_from_score_chunks(
                 scores_chunk, starts[row_start:row_end], ends[row_start:row_end], key_positions_i64
             )
         scores_flat = scores_chunk.reshape(b * (row_end - row_start), score_sk).contiguous()
+        if topk_config is not None:
+            # Do not apply the backend's score perturbation or internal radix top-k:
+            # the external selector owns ties on the original masked scores.
+            topk_indices = select_dsa_topk(scores_flat, chunk_topk_k, topk_config).view(
+                b, row_end - row_start, chunk_topk_k
+            )
+            indices_chunks.append(topk_indices)
+            if return_topk_scores:
+                topk_values = scores_chunk.gather(-1, topk_indices.clamp(min=0).long())
+                values_chunks.append(topk_values.masked_fill(topk_indices < 0, -torch.inf))
+            del scores_flat, scores_chunk
+            continue
         use_tie_break = _use_dense_indexer_topk_tie_break(scores_flat, chunk_topk_k)
         scores_for_topk = (
             _add_indexer_topk_tie_break(scores_flat, inplace=True) if use_tie_break else scores_flat
@@ -1363,6 +1377,56 @@ def _sbhd_to_bshd_indexer_inputs(
     k_bsd = k_indexer.permute(1, 0, 2).contiguous()
     w_bsh = weights.permute(1, 0, 2).contiguous()
     return q_bshd, k_bsd, w_bsh
+
+
+def run_fused_qk_topk_with_external_topk(
+    *,
+    config: "TransformerConfig",
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    index_topk: int,
+    starts: Tensor,
+    ends: Tensor,
+    cp_size: int = 1,
+    use_relu: bool = True,
+    key_positions: Optional[Tensor] = None,
+    **kwargs,
+) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
+    """Score in bounded chunks, then apply the caller's unmodified top-k policy.
+
+    Unpartitioned rows can use cuDNN score emission, including packed THD rows
+    masked by starts/ends. CP-local or oversized score chunks use the existing
+    global-row reference scorer. Sparse attention remains on the fused path.
+    """
+    if not use_relu or q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
+        return None
+    if starts is None or ends is None:
+        return None
+    # The split dispatch contract uses contiguous global key bounds. Explicit
+    # key positions must use the reference indexer, which handles arbitrary order.
+    if key_positions is not None:
+        return None
+    _ensure_dsa_namespace()
+    q_bshd, k_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q, k, weights)
+    b, sq = q_bshd.shape[:2]
+    sk = k_bsd.size(1)
+    indices, _ = _indexer_topk_from_score_chunks(
+        q_bshd,
+        k_bsd.unsqueeze(2),
+        w_bsh,
+        ends.clamp(max=sk).to(torch.int32).repeat(b),
+        min(index_topk, sk),
+        False,
+        starts=starts,
+        ends=ends,
+        key_positions_i64=torch.arange(sk, dtype=torch.int64, device=q.device),
+        score_seq_lens=None if cp_size == 1 and sq == sk else ends,
+        topk_config=config,
+    )
+    # None lets sparse attention compact its own copy. Keep the selector's
+    # unsorted order (including masked slots) intact for cross-layer sharing.
+    return indices, None
 
 
 def run_fused_qk_topk(
