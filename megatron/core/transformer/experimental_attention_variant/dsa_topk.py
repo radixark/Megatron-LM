@@ -18,9 +18,9 @@ def uses_external_topk(config: "TransformerConfig") -> bool:
 def select_dsa_topk(scores: torch.Tensor, topk: int, config: "TransformerConfig") -> torch.Tensor:
     """Select indices with the requested policy and mark masked entries as -1.
 
-    FlashInfer consumes flattened rows and preserves its unsorted result. Do not
-    perturb the scores to resolve ties: its tie_break argument defines which
-    original indices survive ties at the selection boundary.
+    Both backends return values and indices; only FlashInfer's 2-D input and
+    optional deterministic/tie-break arguments need adaptation. Preserve Miles'
+    sorted Torch / unsorted FlashInfer ordering without perturbing scores.
     """
     topk = min(topk, scores.size(-1))
     if topk == 0:
@@ -40,8 +40,12 @@ def select_dsa_topk(scores: torch.Tensor, topk: int, config: "TransformerConfig"
             tie_break=config.dsa_indexer_topk_tie_break,
             dsa_graph_safe=True,
         )
-        values = values.reshape(*scores.shape[:-1], topk)
-        indices = indices.reshape(*scores.shape[:-1], topk)
     else:
         raise ValueError(f"Unsupported DSA top-k backend: {backend!r}")
-    return indices.to(torch.int32).masked_fill(values == -torch.inf, -1)
+    # The selector owns these indices. Mask in place after the dtype conversion
+    # instead of allocating another output; reshape only the final result.
+    return (
+        indices.to(torch.int32)
+        .masked_fill_(values == -torch.inf, -1)
+        .reshape(*scores.shape[:-1], topk)
+    )

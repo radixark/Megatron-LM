@@ -134,7 +134,6 @@ def _run_sparse_attention(
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
-    all_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
     if absorbed_mla:
@@ -162,7 +161,6 @@ def _run_sparse_attention(
                 softmax_scale,
                 latent_v_channels,
                 topk_length=topk_length,
-                all_rows_nonempty=all_rows_nonempty,
             )
         # Fused backends may decline unsupported shapes or layouts by returning
         # None, so keep the absorbed PyTorch path as the authoritative fallback.
@@ -693,7 +691,11 @@ def fused_qk_topk_naive(
     use_relu: bool = True,
     topk_config: Optional[TransformerConfig] = None,
 ):
-    """Naive implementation of QK Topk."""
+    """Compute reference scores and top-k indices.
+
+    An explicit selector returns int32 indices; the default torch.topk path returns
+    int64. Both use -1 for masked entries; cast to long before torch.gather.
+    """
     sk = k.size(0)
     # =========================================
     # Compute index scores
@@ -2150,26 +2152,6 @@ class DSAttention(MegatronModule):
         query_valid_rows = dsa_masking.extract_query_valid_rows_from_packed_seq_params(
             packed_seq_params, b=b, sq=sq, device=query.device
         )
-        # Prove nonempty causal rows from layout metadata, without a GPU scalar
-        # read. CP1 packed rows include their own physical KV position. For CP,
-        # only exact single-sequence coverage proves that no sentinel rows remain.
-        attention_rows_nonempty = (
-            query_valid_rows is None
-            and attn_mask_type == AttnMaskType.causal
-            and key_positions is None
-            and self.index_topk > 0
-            and skv > 0
-            and (
-                varlen_is_plain_causal
-                or (packed_thd and cp_size == 1 and sq == skv)
-                or (
-                    single_packed_thd_sequence
-                    and isinstance(packed_seq_params.max_seqlen_q, int)
-                    and packed_seq_params.max_seqlen_q == packed_global_output_size
-                    and packed_seq_params.max_seqlen_kv == skv
-                )
-            )
-        )
         use_fused_kernels = dsa_kernels.use_fused_dsa_kernels(self.config)
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
         use_local_indexer_varlen = (
@@ -2316,7 +2298,6 @@ class DSAttention(MegatronModule):
                 local_packed_cp_query_start=local_packed_cp_query_start,
                 local_packed_cp_query_len=local_packed_cp_query_len,
                 pg_collection=self.pg_collection,
-                all_rows_nonempty=attention_rows_nonempty,
             )
         if fused_output is not None:
             output, indexer_loss = fused_output
@@ -2453,6 +2434,12 @@ class DSAttention(MegatronModule):
                     topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
+                if use_fused_kernels and self.config.dsa_indexer_topk_backend is not None:
+                    raise RuntimeError(
+                        "Explicit fused DSA top-k requires supported contiguous causal key bounds. "
+                        "Custom key positions or masks require dsa_kernel_backend='none' or "
+                        "attention_backend='unfused'."
+                    )
                 with torch.no_grad():
                     index_scores, topk_indices = fused_qk_topk_naive(
                         q,
@@ -2492,7 +2479,6 @@ class DSAttention(MegatronModule):
             varlen_starts=varlen_starts,
             varlen_ends=varlen_ends,
             key_positions=key_positions,
-            all_rows_nonempty=attention_rows_nonempty,
         )
 
         if use_indexer_loss:

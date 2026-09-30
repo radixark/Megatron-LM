@@ -93,6 +93,40 @@ def test_external_topk_cli_fields_are_generated():
     assert parsed.dsa_indexer_topk_tie_break == 2
 
 
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({"dsa_indexer_loss_coeff": 0.1}, "auxiliary loss"),
+        ({"dsa_kernel_backend": "tilelang"}, "requires dsa_kernel_backend"),
+        ({"dsa_indexer_scoring_relu": False}, "requires dsa_kernel_backend"),
+        ({"dsa_kernel_backend": "none", "dsa_indexer_loss_coeff": 0.1}, None),
+        ({"attention_backend": AttnBackend.unfused, "dsa_indexer_loss_coeff": 0.1}, None),
+    ],
+)
+def test_explicit_fused_topk_config_rejects_unsupported_training(monkeypatch, overrides, error):
+    from megatron.core.transformer import transformer_config
+
+    monkeypatch.setattr(
+        transformer_config, "_validate_dsa_kernel_backend_dependencies", lambda _: None
+    )
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        add_bias_linear=False,
+        dsa_kernel_backend="cudnn",
+        dsa_indexer_topk_backend="torch",
+        dsa_indexer_loss_coeff=0.0,
+    )
+    kwargs.update(overrides)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            transformer_config.TransformerConfig(**kwargs)
+    else:
+        assert transformer_config.TransformerConfig(**kwargs).dsa_indexer_loss_coeff == 0.1
+
+
 @pytest.mark.parametrize("shape", [(4, 128), (2, 2, 128)])
 @pytest.mark.parametrize("tie_break", [0, 1, 2])
 @pytest.mark.parametrize("deterministic", [False, True])
@@ -180,57 +214,47 @@ def test_cudnn_score_hook_uses_external_tie_policy(monkeypatch, tie_break, packe
 
 
 @pytest.mark.parametrize("tie_break", [1, 2])
-@pytest.mark.parametrize("cp_rows", [False, True], ids=["packed-chunks", "cp-zigzag-chunks"])
 @pytest.mark.parametrize("nonzero", [False, True], ids=["tied", "nonzero"])
-def test_external_score_chunks_preserve_global_mask_offsets(
-    monkeypatch, tie_break, cp_rows, nonzero
-):
+def test_external_score_chunks_preserve_global_mask_offsets(monkeypatch, tie_break, nonzero):
     _require_flashinfer()
-    seq, heads, dim, topk = 128, 2, 8, 16
+    pytest.importorskip("cudnn")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("cuDNN DSA requires SM90+")
+    seq, heads, dim, topk = 128, 64, 128, 16
     positions = torch.arange(seq, device="cuda")
-    if cp_rows:
-        positions = torch.cat((positions[:32], positions[96:]))
-    q, k, weights = _indexer_inputs(positions.numel(), seq, 1, heads, dim, nonzero)
+    q, k, weights = _indexer_inputs(seq, seq, 1, heads, dim, nonzero)
     starts = torch.where(positions < 64, 0, 64).to(torch.int32)
     ends = (positions + 1).to(torch.int32)
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_score_chunk_rows", lambda *_: 17)
 
-    def internal_kernel_must_not_run(*args, **kwargs):
-        raise AssertionError("Offset score chunks require the reference scorer and external top-k")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Explicit fused chunks must use cuDNN scoring and external top-k")
 
-    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_top_k_wrapper_chunked", forbidden)
     monkeypatch.setattr(
-        dsa_cudnn_kernels, "_indexer_forward_wrapper_with_warning", internal_kernel_must_not_run
+        dsa_cudnn_kernels, "_compute_indexer_scores_chunk_with_global_rows", forbidden
     )
-    monkeypatch.setattr(
-        dsa_cudnn_kernels, "_indexer_top_k_wrapper_chunked", internal_kernel_must_not_run
-    )
-    original_score = dsa_cudnn_kernels._compute_indexer_scores_chunk_with_global_rows
+    original_score = dsa_cudnn_kernels._indexer_forward_wrapper_with_warning
     score_calls = []
 
     def score_hook(*args, **kwargs):
         result = original_score(*args, **kwargs)
-        score_calls.append((kwargs["row_start"], result))
+        score_calls.append((kwargs.get("q_causal_offsets"), result["scores"]))
         return result
 
-    monkeypatch.setattr(
-        dsa_cudnn_kernels, "_compute_indexer_scores_chunk_with_global_rows", score_hook
-    )
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_forward_wrapper_with_warning", score_hook)
     config = _config(tie_break=tie_break)
     indices, lengths = dsa_kernels.run_fused_qk_topk(
-        config,
-        q,
-        k,
-        weights,
-        topk,
-        starts,
-        ends,
-        block_size=128,
-        cp_size=2 if cp_rows else 1,
-        use_local_indexer_varlen=cp_rows,
+        config, q, k, weights, topk, starts, ends, block_size=128, cp_size=1
     )
     expected_scores, valid = _reference_scores(q, k, weights, starts, ends)
-    for row_start, scores in score_calls:
+    assert len(score_calls) == 8
+    for chunk, (offsets, scores) in enumerate(score_calls):
+        row_start = chunk * 17
+        if row_start == 0:
+            assert offsets is None
+        else:
+            torch.testing.assert_close(offsets, torch.full_like(offsets, row_start))
         row_end = row_start + scores.size(1)
         torch.testing.assert_close(
             scores.masked_fill(~valid[None, row_start:row_end], -torch.inf),
@@ -278,7 +302,7 @@ def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch, l
     forwarded = []
 
     def sparse_attention(**kwargs):
-        assert kwargs["all_rows_nonempty"] is (layout != "padded")
+        assert "all_rows_nonempty" not in kwargs
         forwarded.append(kwargs["topk_indices"])
         return kwargs["query"].flatten(2)
 
@@ -299,25 +323,22 @@ def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch, l
     assert forwarded[0] is selected
 
 
-def test_external_selection_declines_unsupported_fused_hooks(monkeypatch):
+def test_external_selection_rejects_unsupported_fused_hooks(monkeypatch):
     def must_not_load(*args, **kwargs):
         raise AssertionError("Unsupported kernels must not own top-k under an explicit policy")
 
     monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", must_not_load)
     config = _config("torch")
-    assert (
+    with pytest.raises(ValueError, match="requires cuDNN and ReLU"):
         dsa_kernels.run_fused_qk_topk(config, None, None, None, 4, None, None, 32, use_relu=False)
-        is None
-    )
     config.dsa_kernel_backend = "tilelang"
-    assert dsa_kernels.run_fused_qk_topk(config, None, None, None, 4, None, None, 32) is None
+    with pytest.raises(ValueError, match="requires cuDNN and ReLU"):
+        dsa_kernels.run_fused_qk_topk(config, None, None, None, 4, None, None, 32)
     config.dsa_kernel_backend = "cudnn"
-    assert (
+    with pytest.raises(ValueError, match="does not support indexer auxiliary loss"):
         dsa_kernels.run_fused_qk_topk_with_loss(
             config, None, None, None, 4, None, None, 32, None, None, 1.0, 0.1, None
         )
-        is None
-    )
     # Supply the orchestration contract without allocating tensors; the guard
     # must precede all backend access and ignore no selector configuration.
     kwargs = {
@@ -391,71 +412,14 @@ def test_external_selection_preserves_fused_packed_cp_scores(
     assert lengths is None
 
 
-@pytest.mark.parametrize("segments", [1, 2])
-def test_packed_cp_without_causal_offset_api_uses_global_row_fallback(monkeypatch, segments):
-    _require_flashinfer()
-    q, k, weights = _indexer_inputs(64, 128, 1, 2, 8, True)
-    seq_len = 128 // segments
-    positions = torch.cat(
-        [
-            torch.arange(start + seq_len // 4, start + 3 * seq_len // 4, device="cuda")
-            for start in range(0, 128, seq_len)
-        ]
-    )
-    starts = (positions // seq_len * seq_len).to(torch.int32)
-    ends = (positions + 1).to(torch.int32)
-    cu = torch.arange(0, 129, seq_len, dtype=torch.int32, device="cuda")
-    packed = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu,
-        cu_seqlens_kv=cu,
-        max_seqlen_q=seq_len,
-        max_seqlen_kv=seq_len,
-    )
-
-    def legacy_wrapper(q, k, weights, ratio, sm_scale):
-        raise AssertionError("A cuDNN API without causal offsets cannot score cropped CP prefixes")
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Legacy cuDNN must use explicit global-row score masking")
-
-    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
-    monkeypatch.setattr(
-        dsa_cudnn_kernels, "_cudnn_dsa", SimpleNamespace(indexer_forward_wrapper=legacy_wrapper)
-    )
-    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_single_packed_cp_segments", forbidden)
-    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_multi_packed_cp_thd", forbidden)
-    config = _config()
-    indices, lengths = dsa_kernels.run_fused_qk_topk(
-        config,
-        q,
-        k,
-        weights,
-        16,
-        starts,
-        ends,
-        block_size=128,
-        cp_size=2,
-        use_local_indexer_varlen=True,
-        single_packed_thd_sequence=segments == 1,
-        packed_seq_params=packed,
-        local_packed_cp_rank=1,
-    )
-    scores, _ = _reference_scores(q, k, weights, starts, ends)
-    torch.testing.assert_close(indices, select_dsa_topk(scores, 16, config), rtol=0, atol=0)
-    assert lengths is None
-
-
-@pytest.mark.parametrize("tie_break", [1, 2])
-def test_multi_packed_cp_local_tp_slice_uses_global_row_fallback(monkeypatch, tie_break):
-    _require_flashinfer()
-    q, k, weights = _indexer_inputs(32, 128, 1, 2, 8, True)
-    positions = torch.cat(
-        (torch.arange(32, 48, device="cuda"), torch.arange(80, 96, device="cuda"))
-    )
+def test_multi_packed_cp_local_tp_slice_rejects_unsupported_layout(monkeypatch):
+    q = torch.zeros(32, 1, 2, 8)
+    k = torch.zeros(128, 1, 8)
+    weights = torch.ones(32, 1, 2)
+    positions = torch.cat((torch.arange(32, 48), torch.arange(80, 96)))
     starts = (positions // 64 * 64).to(torch.int32)
     ends = (positions + 1).to(torch.int32)
-    cu = torch.tensor([0, 64, 128], dtype=torch.int32, device="cuda")
+    cu = torch.tensor([0, 64, 128], dtype=torch.int32)
     packed = PackedSeqParams(
         qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=64, max_seqlen_kv=64
     )
@@ -465,40 +429,45 @@ def test_multi_packed_cp_local_tp_slice_uses_global_row_fallback(monkeypatch, ti
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_multi_packed_cp_thd", forbidden)
-    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_forward_wrapper_with_warning", forbidden)
-    config = _config(tie_break=tie_break)
-    indices, lengths = dsa_kernels.run_fused_qk_topk(
-        config,
-        q,
-        k,
-        weights,
-        16,
-        starts,
-        ends,
-        block_size=128,
-        cp_size=2,
-        use_local_indexer_varlen=True,
-        packed_seq_params=packed,
-        local_packed_cp_rank=1,
-        local_packed_cp_query_start=16,
-        local_packed_cp_query_len=64,
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_compute_indexer_scores_chunk_with_global_rows", forbidden
     )
-    scores, _ = _reference_scores(q, k, weights, starts, ends)
-    torch.testing.assert_close(indices, select_dsa_topk(scores, 16, config), rtol=0, atol=0)
-    assert lengths is None
+    with pytest.raises(RuntimeError, match="query-position layout"):
+        dsa_kernels.run_fused_qk_topk(
+            _config("torch"),
+            q,
+            k,
+            weights,
+            16,
+            starts,
+            ends,
+            block_size=128,
+            cp_size=2,
+            use_local_indexer_varlen=True,
+            packed_seq_params=packed,
+            local_packed_cp_rank=1,
+            local_packed_cp_query_start=16,
+            local_packed_cp_query_len=64,
+        )
 
 
-@pytest.mark.parametrize("has_empty_row", [False, True])
-def test_split_attention_backward_skips_compaction_only_for_known_nonempty_rows(
-    monkeypatch, has_empty_row
-):
+@pytest.mark.parametrize(
+    "capability",
+    [(9, 0), (10, 0), (10, 3), (10, 1)],
+    ids=["sm90", "sm100", "sm103", "unaudited-sm101"],
+)
+@pytest.mark.parametrize("row_layout", ["nonempty", "mixed", "empty"])
+def test_split_attention_backward_uses_device_capability(monkeypatch, capability, row_layout):
+    direct = capability in ((10, 0), (10, 3))
     seen = []
 
     class FakeDSA:
         @staticmethod
         def sparse_attention_backward_wrapper(q, kv, out, dO, lse, sink, indices, **kwargs):
-            seen.append((q.size(0), kwargs["topk_length"].clone()))
-            return {"dq": torch.ones_like(q), "dkv": torch.zeros_like(kv)}
+            lengths = kwargs["topk_length"]
+            seen.append((q.size(0), lengths.clone()))
+            dq = torch.ones_like(q).masked_fill((lengths == 0)[:, None, None], 0)
+            return {"dq": dq, "dkv": torch.zeros_like(kv)}
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
@@ -507,31 +476,126 @@ def test_split_attention_backward_skips_compaction_only_for_known_nonempty_rows(
         return torch.zeros(q.size(0), q.size(1), d_v), torch.zeros(q.size(0), q.size(1))
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_dsa_fwd_flash_mla", fake_forward)
-    original_nonzero = torch.nonzero
-    nonzero_calls = []
-
-    def checked_nonzero(*args, **kwargs):
-        assert has_empty_row, "Known nonempty rows must not trigger CUDA nonzero/synchronization"
-        nonzero_calls.append(True)
-        return original_nonzero(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "nonzero", checked_nonzero)
     query = torch.zeros(2, 1, 1, 512, requires_grad=True)
     key = torch.zeros(4, 1, 1, 512, requires_grad=True)
     indices = torch.tensor([[[0, -1], [1, 0]]], dtype=torch.int32)
-    if has_empty_row:
+    if row_layout != "nonempty":
         indices[:, 0] = -1
+    if row_layout == "empty":
+        indices[:, 1] = -1
+    lengths = (indices >= 0).sum(-1).flatten().to(torch.int32)
     output = dsa_kernels.run_fused_absorbed_sparse_attention(
-        _config("torch"), query, key, indices, 1.0, 512, all_rows_nonempty=not has_empty_row
+        _config("torch"), query, key, indices, 1.0, 512
     )
-    output.sum().backward()
-    assert bool(nonzero_calls) == has_empty_row
-    torch.testing.assert_close(
-        query.grad[0],
-        torch.zeros_like(query.grad[0]) if has_empty_row else torch.ones_like(query.grad[0]),
+    original_nonzero = torch.nonzero
+    original_index_select = torch.Tensor.index_select
+    compaction_calls = []
+    devices = []
+
+    def checked_nonzero(*args, **kwargs):
+        assert not direct, "Audited SM100-family kernels must not synchronize to compact empty rows"
+        compaction_calls.append("nonzero")
+        return original_nonzero(*args, **kwargs)
+
+    def checked_index_select(tensor, *args, **kwargs):
+        assert not direct, "Audited SM100-family kernels must receive the original rows"
+        compaction_calls.append("index_select")
+        return original_index_select(tensor, *args, **kwargs)
+
+    def device_sm(device):
+        devices.append(device)
+        return capability
+
+    with monkeypatch.context() as patch:
+        # Exercise the CUDA-only dispatch using CPU tensor arithmetic and a GPU kernel double.
+        patch.setattr(torch.Tensor, "is_cuda", property(lambda tensor: True))
+        patch.setattr(dsa_cudnn_kernels, "_device_sm", device_sm)
+        patch.setattr(dsa_cudnn_kernels, "_get_head_padding", lambda heads: heads)
+        patch.setattr(torch, "nonzero", checked_nonzero)
+        patch.setattr(torch.Tensor, "index_select", checked_index_select)
+        output.sum().backward()
+
+    assert devices == [query.device.index]
+    assert ("nonzero" in compaction_calls) is (not direct)
+    assert ("index_select" in compaction_calls) is (not direct)
+    expected_lengths = (
+        lengths if direct else torch.cat((lengths[lengths > 0], torch.ones(1, dtype=torch.int32)))
     )
-    torch.testing.assert_close(query.grad[1], torch.ones_like(query.grad[1]))
-    assert seen[0][0] == 2  # original rows, or one real row plus the fallback dummy row
+    assert seen[0][0] == expected_lengths.numel()
+    torch.testing.assert_close(seen[0][1], expected_lengths)
+    expected_grad = (lengths > 0).to(query.dtype).view(2, 1, 1, 1).expand_as(query)
+    torch.testing.assert_close(query.grad, expected_grad)
+    torch.testing.assert_close(key.grad, torch.zeros_like(key))
+
+
+@pytest.mark.parametrize("row_layout", ["nonempty", "mixed", "empty"])
+def test_sm100_split_attention_empty_rows_match_filtered_reference(row_layout):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("This numerical regression requires audited SM100/SM103 cuDNN sparse attention")
+    pytest.importorskip("cudnn")
+    dsa_cudnn_kernels._ensure_dsa_namespace()
+    pytest.importorskip("flash_mla")
+    torch.manual_seed(713)
+    sq, sk, heads, dim, value_dim, topk = 8, 128, 32, 576, 512, 512
+    query = torch.randn(sq, 1, heads, dim, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    key = torch.randn(sk, 1, 1, dim, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    lengths_list = [4, 67, 128, 9, 31, 85, 3, 64]
+    if row_layout == "mixed":
+        lengths_list[::2] = [0] * (sq // 2)
+    elif row_layout == "empty":
+        lengths_list = [0] * sq
+    lengths = torch.tensor([lengths_list], dtype=torch.int32, device="cuda")
+    indices = torch.full((1, sq, topk), -1, dtype=torch.int32, device="cuda")
+    for row, length in enumerate(lengths_list):
+        indices[0, row, :length] = torch.arange(length, dtype=torch.int32, device="cuda")
+
+    output = dsa_kernels.run_fused_absorbed_sparse_attention(
+        _config("torch"), query, key, indices, dim**-0.5, value_dim, topk_length=lengths
+    )
+    assert output is not None
+    grad_output = torch.randn_like(output)
+    assert grad_output.abs().sum() > 0
+    output.backward(grad_output)
+    expected_output = torch.zeros_like(output)
+    expected_query_grad = torch.zeros_like(query)
+    expected_key_grad = torch.zeros_like(key)
+    valid_rows = torch.tensor(
+        [row for row, length in enumerate(lengths_list) if length], device="cuda", dtype=torch.long
+    )
+    if valid_rows.numel():
+        # Physically remove empty queries; they cannot affect the reference kernel's dKV reduction.
+        reference_query = query.detach().index_select(0, valid_rows).requires_grad_()
+        reference_key = key.detach().clone().requires_grad_()
+        reference_output = dsa_kernels.run_fused_absorbed_sparse_attention(
+            _config("torch"),
+            reference_query,
+            reference_key,
+            indices.index_select(1, valid_rows),
+            dim**-0.5,
+            value_dim,
+            topk_length=lengths.index_select(1, valid_rows),
+        )
+        reference_output.backward(grad_output.index_select(0, valid_rows))
+        expected_output.index_copy_(0, valid_rows, reference_output.detach())
+        expected_query_grad.index_copy_(0, valid_rows, reference_query.grad)
+        expected_key_grad.copy_(reference_key.grad)
+        assert expected_query_grad.abs().sum() > 0
+        assert expected_key_grad.abs().sum() > 0
+    for actual, expected in (
+        (output, expected_output),
+        (query.grad, expected_query_grad),
+        (key.grad, expected_key_grad),
+    ):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-3)
+    empty_rows = lengths.flatten() == 0
+    assert torch.count_nonzero(query.grad[empty_rows]) == 0
+    assert torch.count_nonzero(output[empty_rows]) == 0
+    if row_layout == "empty":
+        assert torch.count_nonzero(key.grad) == 0
 
 
 @pytest.mark.parametrize("sparse_loss", [False, True])
@@ -545,6 +609,7 @@ def test_reference_indexer_loss_retains_external_indices_and_backward(sparse_los
     key = torch.randn(8, 1, 2, 4, device=device)
     mask = torch.triu(torch.full((1, 8, 8), -torch.inf, device=device), diagonal=1)
     config = _config("torch")
+    config.dsa_kernel_backend = "none"
     pg = SimpleNamespace(tp=SimpleNamespace(size=lambda: 1))
     _, expected = fused_qk_topk_naive(q, k, weights, 4, mask=mask, topk_config=config)
     indices, loss = FusedDSAIndexerLoss.apply(

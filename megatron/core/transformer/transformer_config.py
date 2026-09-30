@@ -384,10 +384,9 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_topk_backend: Optional[Literal["torch", "flashinfer"]] = None
     """Select ordinary-DSA top-k independently from its score/attention kernels.
-    None preserves the kernel backend's selection. Explicit selection retains
-    cuDNN score layouts and no-auxiliary-loss attention fusion. Unsupported fused
-    score layouts and indexer loss use the reference indexer; fused sparse
-    attention remains enabled."""
+    None preserves the kernel backend's selection. Explicit fused selection
+    requires modern cuDNN scoring and no auxiliary loss; unsupported layouts fail.
+    Select kernel backend 'none' or attention backend 'unfused' for reference scoring."""
 
     dsa_indexer_topk_deterministic: bool = False
     """Pass deterministic=True to FlashInfer top_k when selected explicitly."""
@@ -1620,6 +1619,24 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "DSA top-k deterministic/tie-break options require the flashinfer backend."
             )
+
+        if (
+            self.dsa_indexer_topk_backend is not None
+            and self.dsa_kernel_backend != "none"
+            and self.attention_backend not in (AttnBackend.unfused, "unfused")
+        ):
+            if self.dsa_kernel_backend != "cudnn" or not self.dsa_indexer_scoring_relu:
+                raise ValueError(
+                    "Explicit fused DSA top-k requires dsa_kernel_backend='cudnn' and "
+                    "dsa_indexer_scoring_relu=True. Select dsa_kernel_backend='none' or "
+                    "attention_backend='unfused' for reference scoring."
+                )
+            if (self.dsa_indexer_loss_coeff or 0.0) > 0:
+                raise ValueError(
+                    "Explicit fused DSA top-k does not support indexer auxiliary loss. "
+                    "Select dsa_kernel_backend='none' or attention_backend='unfused' "
+                    "for reference indexer training."
+                )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

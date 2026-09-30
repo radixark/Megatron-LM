@@ -119,9 +119,11 @@ def run_fused_qk_topk(
     """Optional fused indexer hook for backend-specific implementations."""
     external_topk = uses_external_topk(config)
     if external_topk and (_get_dsa_kernel_backend(config) != "cudnn" or not use_relu):
-        return None
+        raise ValueError("Explicit fused DSA top-k requires cuDNN and ReLU scoring.")
     fn = _resolve_fused_hook(config, "run_fused_qk_topk")
     if fn is None:
+        if external_topk:
+            raise RuntimeError("The cuDNN backend does not provide explicit DSA top-k scoring.")
         return None
     result = fn(
         q=q,
@@ -142,6 +144,12 @@ def run_fused_qk_topk(
         **({"topk_config": config} if external_topk else {}),
     )
     if result is None:
+        if external_topk:
+            raise RuntimeError(
+                "Explicit fused DSA top-k does not support this indexer layout. "
+                "Select dsa_kernel_backend='none' or attention_backend='unfused' "
+                "for reference scoring."
+            )
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
     return result
 
@@ -173,8 +181,10 @@ def run_fused_qk_topk_with_loss(
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations."""
     if uses_external_topk(config):
-        # The reference loss path retains exactly the externally selected indices.
-        return None
+        raise ValueError(
+            "Explicit fused DSA top-k does not support indexer auxiliary loss; "
+            "select an unfused backend for reference indexer training."
+        )
     fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_loss")
     if fn is None:
         return None
@@ -216,16 +226,12 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
-    all_rows_nonempty: bool = False,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    kwargs = {}
-    if uses_external_topk(config) and _get_dsa_kernel_backend(config) == "cudnn":
-        kwargs["all_rows_nonempty"] = all_rows_nonempty
-    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length, **kwargs)
+    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
     return result
@@ -262,7 +268,6 @@ def run_fused_dsa_attention(
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
-    all_rows_nonempty: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together."""
     external_topk = uses_external_topk(config)
@@ -302,7 +307,6 @@ def run_fused_dsa_attention(
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         pg_collection=pg_collection,
-        **({"all_rows_nonempty": all_rows_nonempty} if external_topk else {}),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_dsa_attention", "backend returned None")
