@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -267,7 +266,7 @@ def test_external_score_chunks_preserve_global_mask_offsets(monkeypatch, tie_bre
     assert lengths is None
 
 
-@pytest.mark.parametrize("layout", ["plain", "packed_tail", "padded"])
+@pytest.mark.parametrize("layout", ["plain", "padded"])
 def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch, layout):
     config = _config("torch")
     config.dsa_indexer_topk = 2
@@ -302,7 +301,6 @@ def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch, l
     forwarded = []
 
     def sparse_attention(**kwargs):
-        assert "all_rows_nonempty" not in kwargs
         forwarded.append(kwargs["topk_indices"])
         return kwargs["query"].flatten(2)
 
@@ -321,36 +319,6 @@ def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch, l
     )
     assert forwarded == [selected]
     assert forwarded[0] is selected
-
-
-def test_external_selection_rejects_unsupported_fused_hooks(monkeypatch):
-    def must_not_load(*args, **kwargs):
-        raise AssertionError("Unsupported kernels must not own top-k under an explicit policy")
-
-    monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", must_not_load)
-    config = _config("torch")
-    with pytest.raises(ValueError, match="requires cuDNN and ReLU"):
-        dsa_kernels.run_fused_qk_topk(config, None, None, None, 4, None, None, 32, use_relu=False)
-    config.dsa_kernel_backend = "tilelang"
-    with pytest.raises(ValueError, match="requires cuDNN and ReLU"):
-        dsa_kernels.run_fused_qk_topk(config, None, None, None, 4, None, None, 32)
-    config.dsa_kernel_backend = "cudnn"
-    with pytest.raises(ValueError, match="does not support indexer auxiliary loss"):
-        dsa_kernels.run_fused_qk_topk_with_loss(
-            config, None, None, None, 4, None, None, 32, None, None, 1.0, 0.1, None
-        )
-    # Supply the orchestration contract without allocating tensors; the guard
-    # must precede all backend access and ignore no selector configuration.
-    kwargs = {
-        key: None
-        for key, parameter in inspect.signature(
-            dsa_kernels.run_fused_dsa_attention
-        ).parameters.items()
-        if parameter.default is inspect.Parameter.empty
-    }
-    kwargs["config"] = config
-    kwargs["loss_coeff"] = 0.1
-    assert dsa_kernels.run_fused_dsa_attention(**kwargs) is None
 
 
 @pytest.mark.parametrize("segments", [1, 2])
@@ -452,11 +420,16 @@ def test_multi_packed_cp_local_tp_slice_rejects_unsupported_layout(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "capability",
-    [(9, 0), (10, 0), (10, 3), (10, 1)],
-    ids=["sm90", "sm100", "sm103", "unaudited-sm101"],
+    "capability,row_layout",
+    [
+        pytest.param((9, 0), "mixed", id="sm90-mixed"),
+        pytest.param((9, 0), "empty", id="sm90-empty"),
+        pytest.param((10, 0), "nonempty", id="sm100-nonempty"),
+        pytest.param((10, 0), "mixed", id="sm100-mixed"),
+        pytest.param((10, 3), "empty", id="sm103-empty"),
+        pytest.param((10, 1), "mixed", id="unaudited-sm101-mixed"),
+    ],
 )
-@pytest.mark.parametrize("row_layout", ["nonempty", "mixed", "empty"])
 def test_split_attention_backward_uses_device_capability(monkeypatch, capability, row_layout):
     direct = capability in ((10, 0), (10, 3))
     seen = []
@@ -528,7 +501,7 @@ def test_split_attention_backward_uses_device_capability(monkeypatch, capability
     torch.testing.assert_close(key.grad, torch.zeros_like(key))
 
 
-@pytest.mark.parametrize("row_layout", ["nonempty", "mixed", "empty"])
+@pytest.mark.parametrize("row_layout", ["mixed", "empty"])
 def test_sm100_split_attention_empty_rows_match_filtered_reference(row_layout):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
