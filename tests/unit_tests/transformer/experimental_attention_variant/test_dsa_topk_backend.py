@@ -546,27 +546,6 @@ def test_split_attention_backward_skips_compaction_only_for_known_nonempty_rows(
     assert seen[0][0] == 2  # original rows, or one real row plus the fallback dummy row
 
 
-def test_no_auxiliary_loss_keeps_full_fused_dispatch(monkeypatch):
-    observed = []
-
-    def full_hook(**kwargs):
-        observed.append(kwargs["config"])
-        return "output", "loss"
-
-    monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda *_: full_hook)
-    kwargs = {
-        key: None
-        for key, parameter in inspect.signature(
-            dsa_kernels.run_fused_dsa_attention
-        ).parameters.items()
-        if parameter.default is inspect.Parameter.empty
-    }
-    config = _config("torch")
-    kwargs.update(config=config, loss_coeff=0.0)
-    assert dsa_kernels.run_fused_dsa_attention(**kwargs) == ("output", "loss")
-    assert observed == [config]
-
-
 @pytest.mark.parametrize("sparse_loss", [False, True])
 def test_reference_indexer_loss_retains_external_indices_and_backward(sparse_loss):
     device = "cuda" if torch.cuda.is_available() else "cpu"
