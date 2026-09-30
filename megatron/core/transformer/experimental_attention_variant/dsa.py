@@ -643,7 +643,7 @@ def _compute_index_scores(
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/kernel.py#L254-L274
     This is a BF16 implementation of the `fp8_index` logic:
         1. Compute attention scores: q @ k^T;
-        2. Optionally apply ReLU activation (DeepSeek V3.2 only; disabled for GLM5);
+        2. Optionally apply ReLU activation;
         3. Weight by attention weights;
         4. Sum across attention heads.
 
@@ -1534,6 +1534,9 @@ class DSAIndexer(MegatronModule):
         # Prepare weights for index scores
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
+        # cuDNN FP32 head-weight support is forward-only:
+        # https://github.com/NVIDIA/cudnn-frontend/pull/1311
+        # FP32 projection output and FP32 indexer-loss backward are not enabled here.
         weights, _ = self.linear_weights_proj(x)
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 

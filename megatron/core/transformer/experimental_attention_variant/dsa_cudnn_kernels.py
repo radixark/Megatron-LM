@@ -2201,10 +2201,8 @@ def _run_sparse_attention_backward(
         bwd_attn_sink[:num_heads] = attn_sink
 
     _ensure_dsa_namespace()
-    # SM100 handles topk_length == 0 in-kernel, writing zero dQ before any KV
-    # access. Reuse the cached device capability instead of compacting rows (and
-    # synchronizing CUDA) or threading layout promises through the model API.
-    # Keep compaction for SM90: its supported FE1.27 kernel lacks this guarantee.
+    # B200/B300 handle empty rows in-kernel: zero dQ and no KV update.
+    # Other architectures retain compaction unless nonempty rows are guaranteed.
     if all_rows_nonempty or (
         q_flat.is_cuda and _device_sm(q_flat.device.index) in ((10, 0), (10, 3))
     ):
