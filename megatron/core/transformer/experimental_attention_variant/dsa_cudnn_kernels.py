@@ -643,16 +643,19 @@ def _indexer_topk_from_score_chunks(
         score_chunk_seq_lens = (
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
-        if bottom_right_key_start is not None:
+        if bottom_right_key_start is not None or topk_config is not None:
             offset_kwargs = {}
             if topk_config is not None:
-                # Current cuDNN defaults to top-left causality even for unequal
-                # Q/K lengths. State the cropped prefix's absolute row offset.
-                offset_kwargs["q_causal_offsets"] = torch.full(
-                    (b,),
-                    bottom_right_key_start + row_start,
-                    dtype=torch.int32,
-                    device=q_bshd.device,
+                if score_seq_lens is not None:
+                    raise RuntimeError(
+                        "Explicit fused DSA top-k requires contiguous causal query rows."
+                    )
+                # cuDNN uses top-left causality; retain this chunk's logical row offset.
+                row_offset = (bottom_right_key_start or 0) + row_start
+                offset_kwargs["q_causal_offsets"] = (
+                    torch.full((b,), row_offset, dtype=torch.int32, device=q_bshd.device)
+                    if bottom_right_key_start is not None or row_start
+                    else None
                 )
             scores_chunk = _indexer_forward_wrapper_with_warning(
                 q_chunk,
@@ -661,23 +664,6 @@ def _indexer_topk_from_score_chunks(
                 ratio=indexer_ratio,
                 sm_scale=_INDEXER_SOFTMAX_SCALE,
                 **offset_kwargs,
-            )["scores"]
-        elif topk_config is not None:
-            if score_seq_lens is not None:
-                raise RuntimeError(
-                    "Explicit fused DSA top-k requires contiguous causal query rows."
-                )
-            scores_chunk = _indexer_forward_wrapper_with_warning(
-                q_chunk,
-                k_bshd,
-                w_chunk,
-                ratio=indexer_ratio,
-                sm_scale=_INDEXER_SOFTMAX_SCALE,
-                q_causal_offsets=(
-                    torch.full((b,), row_start, dtype=torch.int32, device=q_bshd.device)
-                    if row_start
-                    else None
-                ),
             )["scores"]
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
             scores_chunk = _indexer_forward_wrapper_with_warning(
@@ -2312,7 +2298,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
-        ctx.num_inputs = len(ctx.needs_input_grad)
 
         sq, b, num_heads, d = query.shape
         skv = kv_full.shape[0]
@@ -2542,7 +2527,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
-        )[: ctx.num_inputs]
+        )
 
 
 class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
@@ -2708,7 +2693,6 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         topk_length: Optional[Tensor],
     ) -> Tensor:
         """Run fused sparse attention for precomputed top-k metadata."""
-        ctx.num_inputs = len(ctx.needs_input_grad)
         sq, b, num_heads, d = query.shape
         skv = kv_full.shape[0]
         out_flat, lse, q_flat, kv_flat, attn_sink, global_idxs, topk_length_flat = (
@@ -2752,7 +2736,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             grad_output=grad_output,
         )
 
-        return (grad_query, grad_kv_full, None, None, None, None)[: ctx.num_inputs]
+        return (grad_query, grad_kv_full, None, None, None, None)
 
 
 def run_fused_absorbed_sparse_attention(

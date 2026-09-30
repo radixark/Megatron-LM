@@ -136,6 +136,7 @@ class _SingleRankProcessGroups:
 
 class _PackedCpCudnnConfig:
     dsa_kernel_backend = "cudnn"
+    dsa_indexer_topk_backend = None
     attention_backend = AttnBackend.auto
     kv_lora_rank = 512
 
@@ -1232,6 +1233,7 @@ def test_cudnn_fused_hooks_reject_non_relu_scoring(hook):
 
             class Config:
                 dsa_kernel_backend = "cudnn"
+                dsa_indexer_topk_backend = None
                 attention_backend = AttnBackend.auto
                 kv_lora_rank = 4
                 calculate_per_token_loss = True
@@ -1288,7 +1290,6 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
-        topk_config=None,
     ):
         seen["return_scores"] = return_scores
         seen["return_topk_scores"] = return_topk_scores
@@ -2523,6 +2524,7 @@ def test_cudnn_dense_loss_recomputes_full_kv_lse(monkeypatch):
 def test_cudnn_full_fusion_declines_absorbed_mla_without_up_v_weight(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 4
         calculate_per_token_loss = True
@@ -2572,6 +2574,7 @@ def test_cudnn_full_fusion_declines_absorbed_mla_without_up_v_weight(monkeypatch
 def test_cudnn_full_fusion_declines_unsupported_flashmla_value_dim(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 4
         calculate_per_token_loss = True
@@ -2623,6 +2626,7 @@ def test_cudnn_full_fusion_declines_unsupported_flashmla_value_dim(monkeypatch):
 def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True
@@ -2714,6 +2718,7 @@ def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch
 def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True
@@ -2802,6 +2807,7 @@ def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeyp
 def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True
@@ -2891,6 +2897,7 @@ def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypa
 def test_cudnn_full_fusion_declines_varlen_dense_indexer_loss(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True
@@ -2954,6 +2961,7 @@ def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
 
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True

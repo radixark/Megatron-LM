@@ -722,10 +722,7 @@ def fused_qk_topk_naive(
     # Select top-k indices
     # =========================================
     topk_k = min(index_topk, sk)
-    if (
-        topk_config is not None
-        and getattr(topk_config, "dsa_indexer_topk_backend", None) is not None
-    ):
+    if topk_config is not None and topk_config.dsa_indexer_topk_backend is not None:
         topk_indices = select_dsa_topk(index_scores, topk_k, topk_config)
     elif topk_k > 0:
         topk_scores, topk_indices = index_scores.topk(topk_k, dim=-1)

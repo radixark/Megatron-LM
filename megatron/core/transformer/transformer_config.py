@@ -411,13 +411,16 @@ class TransformerConfig(ModelParallelConfig):
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     dsa_indexer_weights_proj_use_quantization: bool = True
-    """Reserved indexer weights-projection quantization policy.
-    ``DSAIndexer`` and ``CSAIndexer`` do not currently consume this setting."""
+    """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
+    quantization context. Disable this to keep the projection parameter outside FP8/FP4;
+    ``dsa_indexer_weights_proj_output_dtype`` then controls its BF16 or FP32 output contract.
+    This option does not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
 
     dsa_indexer_weights_proj_output_dtype: Literal["bf16", "fp32"] = "bf16"
-    """Reserved indexer weights-projection output dtype; ``DSAIndexer`` and ``CSAIndexer``
-    do not currently consume this setting. The projection retains its existing output dtype;
-    final index scores are FP32."""
+    """Output dtype of the ``DSAIndexer`` weights projection. BF16 preserves the existing
+    path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
+    backend. The final index scores remain FP32 independently of this option. This option does
+    not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
 
     dsa_cp_balance_indexer: bool = False
     """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the

@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 def uses_external_topk(config: "TransformerConfig") -> bool:
     """Whether the caller selected top-k separately from the fused DSA backend."""
-    return getattr(config, "dsa_indexer_topk_backend", None) is not None
+    return config.dsa_indexer_topk_backend is not None
 
 
 def select_dsa_topk(scores: torch.Tensor, topk: int, config: "TransformerConfig") -> torch.Tensor:
