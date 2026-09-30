@@ -1140,6 +1140,7 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        topk_config=None,
     ):
         seen["q_shape"] = q_bshd.shape
         seen["k_shape"] = k_bsd.shape
@@ -1287,6 +1288,7 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        topk_config=None,
     ):
         seen["return_scores"] = return_scores
         seen["return_topk_scores"] = return_topk_scores
@@ -1642,6 +1644,7 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        topk_config=None,
     ):
         del (
             single_packed_thd_sequence,
@@ -2633,6 +2636,8 @@ def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_config=None,
+        all_rows_nonempty=None,
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
@@ -2723,6 +2728,8 @@ def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeyp
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_config=None,
+        all_rows_nonempty=None,
     ):
         seen["loss_coeff"] = loss_coeff
         seen["sparse_loss"] = sparse_loss
@@ -2810,6 +2817,8 @@ def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypa
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_config=None,
+        all_rows_nonempty=None,
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
@@ -2961,6 +2970,8 @@ def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_config=None,
+        all_rows_nonempty=None,
     ):
         seen["called"] = True
         seen["varlen_starts"] = varlen_starts

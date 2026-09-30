@@ -243,25 +243,6 @@ def test_external_score_chunks_preserve_global_mask_offsets(
     assert lengths is None
 
 
-def test_external_score_hook_declines_explicit_key_positions():
-    q = torch.zeros(4, 1, 2, 8)
-    k = torch.zeros(4, 1, 8)
-    weights = torch.ones(4, 1, 2)
-    assert (
-        dsa_cudnn_kernels.run_fused_qk_topk_with_external_topk(
-            config=_config("torch"),
-            q=q,
-            k=k,
-            weights=weights,
-            index_topk=2,
-            starts=torch.zeros(4, dtype=torch.int32),
-            ends=torch.arange(1, 5),
-            key_positions=torch.tensor([2, 3, 0, 1]),
-        )
-        is None
-    )
-
-
 @pytest.mark.parametrize("layout", ["plain", "packed_tail", "padded"])
 def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch, layout):
     config = _config("torch")
@@ -318,12 +299,19 @@ def test_skip_layer_reuses_external_selection_without_recomputing(monkeypatch, l
     assert forwarded[0] is selected
 
 
-def test_external_selection_declines_combined_indexer_loss_hooks(monkeypatch):
+def test_external_selection_declines_unsupported_fused_hooks(monkeypatch):
     def must_not_load(*args, **kwargs):
-        raise AssertionError("Combined kernels must not own top-k under an explicit policy")
+        raise AssertionError("Unsupported kernels must not own top-k under an explicit policy")
 
     monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", must_not_load)
     config = _config("torch")
+    assert (
+        dsa_kernels.run_fused_qk_topk(config, None, None, None, 4, None, None, 32, use_relu=False)
+        is None
+    )
+    config.dsa_kernel_backend = "tilelang"
+    assert dsa_kernels.run_fused_qk_topk(config, None, None, None, 4, None, None, 32) is None
+    config.dsa_kernel_backend = "cudnn"
     assert (
         dsa_kernels.run_fused_qk_topk_with_loss(
             config, None, None, None, 4, None, None, 32, None, None, 1.0, 0.1, None

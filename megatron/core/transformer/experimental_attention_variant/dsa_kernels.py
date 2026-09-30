@@ -118,8 +118,9 @@ def run_fused_qk_topk(
 ) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
     """Optional fused indexer hook for backend-specific implementations."""
     external_topk = uses_external_topk(config)
-    hook = "run_fused_qk_topk_with_external_topk" if external_topk else "run_fused_qk_topk"
-    fn = _resolve_fused_hook(config, hook)
+    if external_topk and (_get_dsa_kernel_backend(config) != "cudnn" or not use_relu):
+        return None
+    fn = _resolve_fused_hook(config, "run_fused_qk_topk")
     if fn is None:
         return None
     result = fn(
@@ -138,7 +139,7 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        **({"config": config} if external_topk else {}),
+        **({"topk_config": config} if external_topk else {}),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
@@ -264,9 +265,8 @@ def run_fused_dsa_attention(
     all_rows_nonempty: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together."""
-    if uses_external_topk(config) and (
-        _get_dsa_kernel_backend(config) != "cudnn" or loss_coeff > 0
-    ):
+    external_topk = uses_external_topk(config)
+    if external_topk and (_get_dsa_kernel_backend(config) != "cudnn" or loss_coeff > 0):
         # cuDNN accepts an external selector on its optimized no-auxiliary-loss path.
         return None
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
@@ -302,7 +302,7 @@ def run_fused_dsa_attention(
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         pg_collection=pg_collection,
-        **({"all_rows_nonempty": all_rows_nonempty} if uses_external_topk(config) else {}),
+        **({"all_rows_nonempty": all_rows_nonempty} if external_topk else {}),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_dsa_attention", "backend returned None")

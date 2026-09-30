@@ -249,7 +249,8 @@ def run_fused_dsa_attention(
     ``use_fused_dsa_kernels`` before calling, so this hook assumes it was selected (matching
     the TileLang backend) and only validates that the requested shapes/layout are supported.
     """
-    if uses_external_topk(config) and (loss_coeff > 0 or not use_relu):
+    external_topk = uses_external_topk(config)
+    if external_topk and (loss_coeff > 0 or not use_relu):
         return None
     _assert_supported_indexer_scoring(use_relu)
     if (
@@ -333,11 +334,8 @@ def run_fused_dsa_attention(
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         tp_group=getattr(pg_collection, "tp", None),
-        **(
-            {"topk_config": config, "all_rows_nonempty": all_rows_nonempty}
-            if uses_external_topk(config)
-            else {}
-        ),
+        topk_config=config if external_topk else None,
+        all_rows_nonempty=all_rows_nonempty if external_topk else None,
         **packed_thd_kwargs,
     )
 
@@ -656,7 +654,7 @@ def _indexer_topk_from_score_chunks(
         )
         if bottom_right_key_start is not None:
             offset_kwargs = {}
-            if uses_external_topk(topk_config):
+            if topk_config is not None:
                 # Current cuDNN defaults to top-left causality even for unequal
                 # Q/K lengths. State the cropped prefix's absolute row offset.
                 offset_kwargs["q_causal_offsets"] = torch.full(
@@ -841,7 +839,7 @@ def _indexer_topk_multi_packed_cp_thd(
     max_k_half = packed_max_seqlen_k // segment_divisor
     max_segment_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
     offset_kwargs = {}
-    if uses_external_topk(topk_config):
+    if topk_config is not None:
         offset_kwargs["q_causal_offsets"] = (
             (segment_k_lengths - segment_q_lengths).to(torch.int32).contiguous()
         )
@@ -859,7 +857,7 @@ def _indexer_topk_multi_packed_cp_thd(
     )["scores"]
 
     segment_topk = min(topk_k, max_segment_k)
-    if segment_topk == max_segment_k and not uses_external_topk(topk_config):
+    if segment_topk == max_segment_k and topk_config is None:
         # Ranking is unnecessary when K covers every score column. This also
         # avoids cuDNN FE's vectorized-output restriction for large odd K.
         topk_indices = torch.arange(segment_topk, dtype=torch.int32, device=device).view(
@@ -868,9 +866,8 @@ def _indexer_topk_multi_packed_cp_thd(
         topk_scores = scores.view(1, sq, segment_topk) if return_topk_scores else None
         return _pad_topk_result(topk_indices, topk_scores, topk_k)
 
-    local_seq_lens = (ends - starts).clamp(max=max_segment_k).to(torch.int32).contiguous()
     use_tie_break = False
-    if uses_external_topk(topk_config):
+    if topk_config is not None:
         indices = select_dsa_topk(scores, segment_topk, topk_config)
         tk_result = {"indices": indices, "values": None}
         if return_topk_scores:
@@ -878,6 +875,7 @@ def _indexer_topk_multi_packed_cp_thd(
                 indices < 0, -torch.inf
             )
     else:
+        local_seq_lens = (ends - starts).clamp(max=max_segment_k).to(torch.int32).contiguous()
         use_tie_break = _use_dense_indexer_topk_tie_break(scores, segment_topk)
         scores_for_topk = (
             _add_indexer_topk_tie_break(scores, inplace=True) if use_tie_break else scores
@@ -1228,6 +1226,7 @@ def _indexer_topk_bshd(
         k_bsd:  ``(b, sk, idx_hd)`` bf16, C-contiguous.
         w_bsh:  ``(b, sq, idx_nh)`` bf16, C-contiguous raw weights.
         topk:   number of top-K indices to return per query.
+        topk_config: Explicit selector config, or None for kernel-owned selection.
 
     Returns:
         ``(topk_indices, topk_length, score_payload)`` where:
@@ -1287,7 +1286,7 @@ def _indexer_topk_bshd(
             and use_local_indexer_varlen
             and single_packed_thd_sequence
             and (
-                not uses_external_topk(topk_config)
+                topk_config is None
                 or _indexer_supports_causal_offsets(_cudnn_dsa.indexer_forward_wrapper)
             )
         ):
@@ -1310,7 +1309,7 @@ def _indexer_topk_bshd(
             and packed_max_seqlen_q is not None
             and packed_max_seqlen_k is not None
             and (
-                not uses_external_topk(topk_config)
+                topk_config is None
                 or (
                     local_packed_cp_query_start == 0
                     and local_packed_cp_query_len in (None, sq)
@@ -1347,9 +1346,7 @@ def _indexer_topk_bshd(
                 key_positions_i64=key_positions_i64,
                 indexer_ratio=_INDEXER_RATIO,
                 score_seq_lens=(
-                    None
-                    if uses_external_topk(topk_config) and packed_cp_size == 1 and sq == sk
-                    else ends
+                    None if topk_config is not None and packed_cp_size == 1 and sq == sk else ends
                 ),
                 topk_config=topk_config,
             )
@@ -1371,7 +1368,7 @@ def _indexer_topk_bshd(
 
     # Top-K selection via the TRT-LLM CuTe-DSL radix kernel.
     if topk_indices is None:
-        if uses_external_topk(topk_config):
+        if topk_config is not None:
             raise RuntimeError("External DSA top-k with fused indexer loss is unsupported.")
         n_rows = b * sq
         scores_flat = scores.reshape(n_rows, sk).contiguous()
@@ -1397,7 +1394,7 @@ def _indexer_topk_bshd(
             if use_tie_break:
                 topk_scores = _remove_indexer_topk_tie_break(topk_scores, topk_indices, sk)
 
-    if uses_external_topk(topk_config) and not return_scores and not return_topk_scores:
+    if topk_config is not None and not return_scores and not return_topk_scores:
         # Keep the original selector order for cross-layer sharing. Attention
         # prepares and sorts a private copy, without altering this tensor.
         return _pad_topk_result(topk_indices, None, topk)[0], None, None
@@ -1471,15 +1468,6 @@ def _sbhd_to_bshd_indexer_inputs(
     return q_bshd, k_bsd, w_bsh
 
 
-def run_fused_qk_topk_with_external_topk(
-    *, config: "TransformerConfig", key_positions: Optional[Tensor] = None, **kwargs
-) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
-    """Reuse optimized cuDNN score layouts with the caller's explicit selection policy."""
-    if key_positions is not None or not kwargs.get("use_relu", True):
-        return None
-    return run_fused_qk_topk(**kwargs, topk_config=config)
-
-
 def run_fused_qk_topk(
     q: Tensor,
     k: Tensor,
@@ -1536,7 +1524,7 @@ def run_fused_qk_topk(
         packed_max_seqlen_q=packed_max_seqlen_q,
         packed_max_seqlen_k=packed_max_seqlen_k,
         packed_cp_size=cp_size,
-        **({"topk_config": topk_config} if topk_config is not None else {}),
+        topk_config=topk_config,
     )
     return topk_indices, topk_length
 
@@ -2353,7 +2341,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
-            **({"topk_config": topk_config} if topk_config is not None else {}),
+            topk_config=topk_config,
         )
 
         prepared_topk_length = (
