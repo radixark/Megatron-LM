@@ -5,7 +5,13 @@ from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
+from megatron.core.ssm.gated_delta_net import (
+    GatedDeltaNet,
+    GatedDeltaNet2,
+    GatedDeltaNetSubmodules,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -72,7 +78,7 @@ except ImportError:
 ##########
 
 # Canonical ``experimental_attention_variant`` names served by the gated delta net family.
-GDN_ATTENTION_VARIANTS = ("gdn", "gdn2")
+GDN_ATTENTION_VARIANTS = ("gdn", "gdn2", "kda")
 
 # Deprecated ``experimental_attention_variant`` spellings mapped to their canonical name.
 _DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
@@ -86,25 +92,37 @@ _DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
 def get_gated_delta_net_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
-    """Build module spec for GatedDeltaNet attention."""
+    """Build a module spec for a GDN-family attention variant."""
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
-    # gdn2 reuses the GDN submodules and spec structure with the GatedDeltaNet2 module.
-    gdn_module = (
-        GatedDeltaNet2 if config.experimental_attention_variant == "gdn2" else GatedDeltaNet
-    )
-    attention = ModuleSpec(
-        module=gdn_module,
-        submodules=GatedDeltaNetSubmodules(
-            in_proj=backend.column_parallel_layer_norm_linear(),
-            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
-            out_proj=backend.row_parallel_linear(),
-        ),
-        metainfo={"fuse_input_layernorm": True},
-    )
+    if config.experimental_attention_variant == "kda":
+        attention = ModuleSpec(
+            module=KimiDeltaAttention,
+            submodules=KimiDeltaAttentionSubmodules(
+                in_proj=backend.column_parallel_linear(),
+                beta_proj=backend.column_parallel_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": False},
+        )
+    else:
+        # gdn2 reuses the GDN submodules and spec structure with the GatedDeltaNet2 module.
+        gdn_module = (
+            GatedDeltaNet2 if config.experimental_attention_variant == "gdn2" else GatedDeltaNet
+        )
+        attention = ModuleSpec(
+            module=gdn_module,
+            submodules=GatedDeltaNetSubmodules(
+                in_proj=backend.column_parallel_layer_norm_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": True},
+        )
     return attention
 
 
