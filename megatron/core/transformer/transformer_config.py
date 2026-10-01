@@ -312,10 +312,15 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gated_delta_net', 'dsa', 'dsv4_hybrid', 'dsv4']
+        Literal['gated_delta_net', 'gdn2', 'dsa', 'dsv4_hybrid', 'dsv4']
     ] = None
-    """Type of attention variant to use. Currently support gated_delta_net, dsa, dsv4_hybrid, and
-    dsv4 (miles' DeepSeek-V4 sparse-attention path)."""
+    """Type of attention variant to use. Currently support gated_delta_net, gdn2, dsa, dsv4_hybrid,
+    and dsv4 (miles' DeepSeek-V4 sparse-attention path). gdn2 selects the GDN2
+    (Gated DeltaNet-2) variant of the gated delta net layer, with channel-wise decay, erase and
+    write gates; it requires flash-linear-attention >= 0.5.1. (Bare 'gdn' is also accepted at
+    runtime as a synonym of 'gated_delta_net' by ``is_gated_delta_net_variant``, matching
+    upstream naming, but validation elsewhere in this file is only exercised for
+    'gated_delta_net'.)"""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks.
@@ -1490,6 +1495,14 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
+        # Imported lazily because the spec module imports this one. 'gated_delta_net' is
+        # intentionally left as the live GDN1 selector (not normalized to 'gdn') so the
+        # literal checks elsewhere in this method keep matching; this helper only widens
+        # those checks to also recognize the 'gdn2' variant.
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            is_gated_delta_net_variant,
+        )
+
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
@@ -1670,12 +1683,16 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.dsa_kernel_backend = legacy_backend
 
-        if self.experimental_attention_variant in ["gated_delta_net"]:
-            assert (
-                self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear attention."
-
+        if is_gated_delta_net_variant(self.experimental_attention_variant):
+            # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
+            # symbol 'G', where linear_attention_freq is unused; the GPT experimental
+            # attention route raises a clear error downstream if it is missing.
             if self.experimental_attention_variant == "gated_delta_net":
+                assert (
+                    self.linear_attention_freq is not None
+                ), "linear_attention_freq must be set for linear attention."
+
+            if is_gated_delta_net_variant(self.experimental_attention_variant):
                 if self.pad_packed_seq_alignment is not None:
                     tail_policy = self.thd_tail_padding_policy or 'append_dummy_seq'
                     assert tail_policy == 'append_dummy_seq', (
@@ -2250,13 +2267,12 @@ class TransformerConfig(ModelParallelConfig):
                     "multi_latent_attention."
                 )
 
-            if (
-                "gdn_norm_out" in self.recompute_modules
-                and self.experimental_attention_variant != "gated_delta_net"
+            if "gdn_norm_out" in self.recompute_modules and (
+                not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
-                    "experimental_attention_variant='gated_delta_net'."
+                    "experimental_attention_variant='gdn' or 'gdn2'."
                 )
 
             if (

@@ -58,6 +58,7 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_gated_delta_net_variant,
     is_linear_attention_variant,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
@@ -669,16 +670,23 @@ def num_floating_point_operations(
         num_qk_heads=16,
         num_v_heads=32,
         conv_kernel_dim=4,
+        use_gdn2=False,
     ):
         """Calculate FLOPs for a Gated Delta Net (GDN) layer."""
         qk_dim = qk_head_dim * num_qk_heads
         v_dim = v_head_dim * num_v_heads
+        if use_gdn2:
+            # GDN2 in_proj: hidden_size -> (4*qk_dim + 3*v_dim) for q, k, v, z, f, b, w
+            in_proj_dim = 4 * qk_dim + 3 * v_dim
+        else:
+            # GDN in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
+            in_proj_dim = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
         return (
             2
             * total_tokens
             * (
-                # in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
-                hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                # in_proj
+                hidden_size * in_proj_dim
                 # conv1d
                 + conv_kernel_dim * (2 * qk_dim + v_dim)
                 # gated delta rule: KK^T, VK^T, S(a(I-bKK^T)), and SQ
@@ -716,6 +724,7 @@ def num_floating_point_operations(
         gdn_num_qk_heads=16,
         gdn_num_v_heads=32,
         gdn_conv_kernel_dim=4,
+        gdn_use_gdn2=False,
         vocab_size=256000,
         mtp_num_layers=0,
         multi_latent_attention=False,
@@ -816,6 +825,7 @@ def num_floating_point_operations(
                 gdn_num_qk_heads,
                 gdn_num_v_heads,
                 gdn_conv_kernel_dim,
+                gdn_use_gdn2,
             )
             +
             # MTP norms (eh_norm + final_norm) and eh projection (2 * h^2).
@@ -1027,7 +1037,7 @@ def num_floating_point_operations(
             num_linear_attention_layers = sum(linear_attention_pattern)
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if args.experimental_attention_variant == "gated_delta_net":
+            if is_gated_delta_net_variant(args.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
@@ -1035,12 +1045,17 @@ def num_floating_point_operations(
                 num_v_heads = args.linear_num_value_heads
                 qk_dim = qk_head_dim * num_qk_heads
                 v_dim = v_head_dim * num_v_heads
+                if args.experimental_attention_variant == "gdn2":
+                    # GDN2 in_proj: q, k, v, z, f, b, w
+                    in_proj_dim = 4 * qk_dim + 3 * v_dim
+                else:
+                    in_proj_dim = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
                 linear_self_attn_term = (
                     forward_backward_expansion_factor
                     * fma_expansion_factor
                     * (
                         ## in proj
-                        args.hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                        args.hidden_size * in_proj_dim
                         ## conv1d
                         + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
                         ## gated delta rule
@@ -1246,6 +1261,7 @@ def num_floating_point_operations(
             gdn_num_qk_heads=args.linear_num_key_heads or 16,
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
+            gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
             multi_latent_attention=args.multi_latent_attention,
