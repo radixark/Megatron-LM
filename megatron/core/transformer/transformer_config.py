@@ -56,15 +56,17 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
-GATED_DELTA_NET_VARIANTS = ("gated_delta_net", "gdn")
+GATED_DELTA_NET_VARIANTS = ("gated_delta_net", "gdn", "gdn2")
 
 
 def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
-    """True for the Gated DeltaNet linear-attention variant under either of its names.
+    """True for a Gated DeltaNet-family linear-attention variant.
 
     Upstream Megatron-LM renamed ``gated_delta_net`` to ``gdn`` (NVIDIA/Megatron-LM#5765) and
     Megatron-Bridge ``main`` selects Qwen3.5's linear attention with the new name. miles-main
     keeps ``gated_delta_net`` as the canonical spelling and treats ``gdn`` as an alias.
+    ``gdn2`` selects the GDN2 (Gated DeltaNet-2) variant, with channel-wise decay, erase and
+    write gates; it requires flash-linear-attention >= 0.5.1.
     """
     return experimental_attention_variant in GATED_DELTA_NET_VARIANTS
 
@@ -332,13 +334,15 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gated_delta_net', 'gdn', 'dsa', 'dsv4_hybrid', 'dsv4']
+        Literal['gated_delta_net', 'gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'dsv4']
     ] = None
-    """Type of attention variant to use. Currently support gated_delta_net, dsa, dsv4_hybrid, and
-    dsv4 (miles' DeepSeek-V4 sparse-attention path). 'gdn' is upstream Megatron-LM's name for
+    """Type of attention variant to use. Currently support gated_delta_net, gdn2, dsa, dsv4_hybrid,
+    and dsv4 (miles' DeepSeek-V4 sparse-attention path). 'gdn' is upstream Megatron-LM's name for
     gated_delta_net (NVIDIA/Megatron-LM#5765) and is accepted as an alias: it is normalized to
     'gated_delta_net' in __post_init__, and every check goes through is_gated_delta_net_variant so a
-    value assigned after construction (Megatron-Bridge sets it on the provider) is recognized too."""
+    value assigned after construction (Megatron-Bridge sets it on the provider) is recognized too.
+    gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
+    channel-wise decay, erase and write gates; it requires flash-linear-attention >= 0.5.1."""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks.
@@ -1864,7 +1868,7 @@ class TransformerConfig(ModelParallelConfig):
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             assert (
                 self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear attention."
+            ), "linear_attention_freq must be set for linear attention."
 
             if is_gated_delta_net_variant(self.experimental_attention_variant):
                 if self.pad_packed_seq_alignment is not None:
@@ -2496,7 +2500,7 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
-                    "experimental_attention_variant='gated_delta_net'."
+                    "experimental_attention_variant='gdn' or 'gdn2'."
                 )
 
             if (
