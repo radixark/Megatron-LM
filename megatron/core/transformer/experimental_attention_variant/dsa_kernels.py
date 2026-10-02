@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 from torch import Tensor
 
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa_topk import uses_external_topk
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -116,8 +117,13 @@ def run_fused_qk_topk(
     cp_size: int = 1,
 ) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
     """Optional fused indexer hook for backend-specific implementations."""
+    external_topk = uses_external_topk(config)
+    if external_topk and (_get_dsa_kernel_backend(config) != "cudnn" or not use_relu):
+        raise ValueError("Explicit fused DSA top-k requires cuDNN and ReLU scoring.")
     fn = _resolve_fused_hook(config, "run_fused_qk_topk")
     if fn is None:
+        if external_topk:
+            raise RuntimeError("The cuDNN backend does not provide explicit DSA top-k scoring.")
         return None
     result = fn(
         q=q,
@@ -135,8 +141,15 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **({"topk_config": config} if external_topk else {}),
     )
     if result is None:
+        if external_topk:
+            raise RuntimeError(
+                "Explicit fused DSA top-k does not support this indexer layout. "
+                "Select dsa_kernel_backend='none' or attention_backend='unfused' "
+                "for reference scoring."
+            )
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
     return result
 
@@ -167,6 +180,11 @@ def run_fused_qk_topk_with_loss(
     cp_size: int = 1,
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations."""
+    if uses_external_topk(config):
+        raise ValueError(
+            "Explicit fused DSA top-k does not support indexer auxiliary loss; "
+            "select an unfused backend for reference indexer training."
+        )
     fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_loss")
     if fn is None:
         return None
@@ -252,6 +270,10 @@ def run_fused_dsa_attention(
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together."""
+    external_topk = uses_external_topk(config)
+    if external_topk and (_get_dsa_kernel_backend(config) != "cudnn" or loss_coeff > 0):
+        # cuDNN accepts an external selector on its optimized no-auxiliary-loss path.
+        return None
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:
         return None

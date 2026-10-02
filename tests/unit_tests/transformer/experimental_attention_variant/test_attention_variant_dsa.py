@@ -405,6 +405,7 @@ def test_dsa_kernel_hooks_return_none_without_backend_function(monkeypatch):
     class Config:
         attention_backend = "auto"
         dsa_kernel_backend = "none"
+        dsa_indexer_topk_backend = None
 
     q = torch.zeros((1, 1, 1, 1))
     k = torch.zeros((1, 1, 1, 1))
@@ -462,6 +463,7 @@ def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
     class Config:
         attention_backend = "auto"
         dsa_kernel_backend = "tilelang"
+        dsa_indexer_topk_backend = None
 
     q = torch.zeros((1, 1, 1, 1))
     starts = torch.tensor([0], dtype=torch.int32)
@@ -531,6 +533,7 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     class Config:
         attention_backend = "auto"
         dsa_kernel_backend = "tilelang"
+        dsa_indexer_topk_backend = None
 
     q = torch.zeros((1, 1, 1, 1))
     k = torch.ones((1, 1, 1, 1))

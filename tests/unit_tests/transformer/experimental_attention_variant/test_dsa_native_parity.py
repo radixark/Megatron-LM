@@ -136,6 +136,7 @@ class _SingleRankProcessGroups:
 
 class _PackedCpCudnnConfig:
     dsa_kernel_backend = "cudnn"
+    dsa_indexer_topk_backend = None
     attention_backend = AttnBackend.auto
     kv_lora_rank = 512
 
@@ -1140,6 +1141,7 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        topk_config=None,
     ):
         seen["q_shape"] = q_bshd.shape
         seen["k_shape"] = k_bsd.shape
@@ -1231,6 +1233,7 @@ def test_cudnn_fused_hooks_reject_non_relu_scoring(hook):
 
             class Config:
                 dsa_kernel_backend = "cudnn"
+                dsa_indexer_topk_backend = None
                 attention_backend = AttnBackend.auto
                 kv_lora_rank = 4
                 calculate_per_token_loss = True
@@ -1642,6 +1645,7 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        topk_config=None,
     ):
         del (
             single_packed_thd_sequence,
@@ -2002,7 +2006,10 @@ def test_cudnn_attention_backward_sanitizes_ignored_topk_slots(monkeypatch, sour
         torch.testing.assert_close(key.grad, torch.zeros_like(key.grad))
 
 
-def test_cudnn_full_fusion_skips_sparse_bwd_compaction_for_nonempty_local_varlen(monkeypatch):
+@pytest.mark.parametrize("external_topk", [False, True])
+def test_cudnn_full_fusion_skips_sparse_bwd_compaction_for_nonempty_local_varlen(
+    monkeypatch, external_topk
+):
     seen = {}
 
     class FakeDSA:
@@ -2022,8 +2029,8 @@ def test_cudnn_full_fusion_skips_sparse_bwd_compaction_for_nonempty_local_varlen
     def fake_indexer_topk(*args, **kwargs):
         assert kwargs["use_local_indexer_varlen"] is True
         return (
-            torch.tensor([[[0, -1, -1], [0, 1, -1]]], dtype=torch.int32),
-            torch.tensor([[1, 2]], dtype=torch.int32),
+            torch.tensor([[[-1 if external_topk else 0, -1, -1], [0, 1, -1]]], dtype=torch.int32),
+            torch.tensor([[0 if external_topk else 1, 2]], dtype=torch.int32),
             None,
         )
 
@@ -2051,17 +2058,29 @@ def test_cudnn_full_fusion_skips_sparse_bwd_compaction_for_nonempty_local_varlen
         varlen_starts=torch.tensor([0, 0], dtype=torch.int64),
         varlen_ends=torch.tensor([1, 2], dtype=torch.int64),
         use_local_indexer_varlen=True,
+        topk_config=SimpleNamespace(dsa_indexer_topk_backend="torch") if external_topk else None,
     )
 
-    output.float().sum().backward()
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "is_cuda", property(lambda tensor: True))
+        patch.setattr(dsa_cudnn_kernels, "_device_sm", lambda device: (9, 0))
+        patch.setattr(dsa_cudnn_kernels, "_get_head_padding", lambda heads: heads)
+        output.float().sum().backward()
 
     assert seen["bwd_q_shape"] == (2, 1, 1)
-    torch.testing.assert_close(seen["fwd_topk_length"], torch.tensor([1, 2], dtype=torch.int32))
-    torch.testing.assert_close(seen["bwd_topk_length"], torch.tensor([1, 2], dtype=torch.int32))
-    torch.testing.assert_close(
-        seen["bwd_topk"], torch.tensor([[0, 0, 0], [0, 1, 0]], dtype=torch.int32)
-    )
-    torch.testing.assert_close(query.grad, torch.ones_like(query.grad))
+    if external_topk:
+        # Local varlen metadata cannot prove that an external selector kept every row nonempty.
+        torch.testing.assert_close(seen["fwd_topk_length"], torch.tensor([0, 2], dtype=torch.int32))
+        torch.testing.assert_close(seen["bwd_topk_length"], torch.tensor([2, 1], dtype=torch.int32))
+        expected_topk = torch.tensor([[0, 1, 0], [0, 0, 0]], dtype=torch.int32)
+        torch.testing.assert_close(query.grad[0], torch.zeros_like(query.grad[0]))
+    else:
+        torch.testing.assert_close(seen["fwd_topk_length"], torch.tensor([1, 2], dtype=torch.int32))
+        torch.testing.assert_close(seen["bwd_topk_length"], torch.tensor([1, 2], dtype=torch.int32))
+        expected_topk = torch.tensor([[0, 0, 0], [0, 1, 0]], dtype=torch.int32)
+        torch.testing.assert_close(query.grad[0], torch.ones_like(query.grad[0]))
+    torch.testing.assert_close(seen["bwd_topk"], expected_topk)
+    torch.testing.assert_close(query.grad[1], torch.ones_like(query.grad[1]))
 
 
 def test_cudnn_sparse_attention_uses_supplied_topk_length(monkeypatch):
@@ -2505,6 +2524,7 @@ def test_cudnn_dense_loss_recomputes_full_kv_lse(monkeypatch):
 def test_cudnn_full_fusion_declines_absorbed_mla_without_up_v_weight(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 4
         calculate_per_token_loss = True
@@ -2554,6 +2574,7 @@ def test_cudnn_full_fusion_declines_absorbed_mla_without_up_v_weight(monkeypatch
 def test_cudnn_full_fusion_declines_unsupported_flashmla_value_dim(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 4
         calculate_per_token_loss = True
@@ -2605,6 +2626,7 @@ def test_cudnn_full_fusion_declines_unsupported_flashmla_value_dim(monkeypatch):
 def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True
@@ -2633,6 +2655,7 @@ def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_config=None,
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
@@ -2695,6 +2718,7 @@ def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch
 def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True
@@ -2723,6 +2747,7 @@ def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeyp
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_config=None,
     ):
         seen["loss_coeff"] = loss_coeff
         seen["sparse_loss"] = sparse_loss
@@ -2782,6 +2807,7 @@ def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeyp
 def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True
@@ -2810,6 +2836,7 @@ def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypa
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_config=None,
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
@@ -2870,6 +2897,7 @@ def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypa
 def test_cudnn_full_fusion_declines_varlen_dense_indexer_loss(monkeypatch):
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True
@@ -2933,6 +2961,7 @@ def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
 
     class Config:
         dsa_kernel_backend = "cudnn"
+        dsa_indexer_topk_backend = None
         attention_backend = AttnBackend.auto
         kv_lora_rank = 512
         calculate_per_token_loss = True
@@ -2961,6 +2990,7 @@ def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        topk_config=None,
     ):
         seen["called"] = True
         seen["varlen_starts"] = varlen_starts

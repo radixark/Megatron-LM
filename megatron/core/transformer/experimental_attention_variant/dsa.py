@@ -24,6 +24,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_topk import select_dsa_topk
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -642,7 +643,7 @@ def _compute_index_scores(
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/kernel.py#L254-L274
     This is a BF16 implementation of the `fp8_index` logic:
         1. Compute attention scores: q @ k^T;
-        2. Optionally apply ReLU activation (DeepSeek V3.2 only; disabled for GLM5);
+        2. Optionally apply ReLU activation;
         3. Weight by attention weights;
         4. Sum across attention heads.
 
@@ -688,8 +689,13 @@ def fused_qk_topk_naive(
     varlen_ends: Optional[torch.Tensor] = None,
     key_positions: Optional[torch.Tensor] = None,
     use_relu: bool = True,
+    topk_config: Optional[TransformerConfig] = None,
 ):
-    """Naive implementation of QK Topk."""
+    """Compute reference scores and top-k indices.
+
+    An explicit selector returns int32 indices; the default torch.topk path returns
+    int64. Both use -1 for masked entries; cast to long before torch.gather.
+    """
     sk = k.size(0)
     # =========================================
     # Compute index scores
@@ -716,7 +722,9 @@ def fused_qk_topk_naive(
     # Select top-k indices
     # =========================================
     topk_k = min(index_topk, sk)
-    if topk_k > 0:
+    if topk_config is not None and topk_config.dsa_indexer_topk_backend is not None:
+        topk_indices = select_dsa_topk(index_scores, topk_k, topk_config)
+    elif topk_k > 0:
         topk_scores, topk_indices = index_scores.topk(topk_k, dim=-1)
         topk_indices = topk_indices.masked_fill(topk_scores == float("-inf"), -1)
     else:
@@ -746,6 +754,7 @@ def fwd_fused_indexer_loss_naive(
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
     non_compressed_lse: torch.Tensor | None = None,
+    topk_config: Optional[TransformerConfig] = None,
 ):
     """Naive implementation of forward pass for indexer loss."""
     index_scores, topk_indices = fused_qk_topk_naive(
@@ -758,6 +767,7 @@ def fwd_fused_indexer_loss_naive(
         varlen_ends=varlen_ends,
         key_positions=key_positions,
         use_relu=use_relu,
+        topk_config=topk_config,
     )
 
     indexer_loss = compute_dsa_indexer_loss(
@@ -1014,6 +1024,7 @@ _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES = (
     "calculate_per_token_loss",
     "use_relu",
     "non_compressed_lse",
+    "topk_config",
 )
 
 
@@ -1041,6 +1052,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         calculate_per_token_loss: bool = False,
         use_relu: bool = True,
         non_compressed_lse: torch.Tensor | None = None,
+        topk_config: Optional[TransformerConfig] = None,
     ):
         """
         Fused forward: index_scores never materialized in full.
@@ -1064,6 +1076,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             calculate_per_token_loss=calculate_per_token_loss,
             use_relu=use_relu,
             non_compressed_lse=non_compressed_lse,
+            topk_config=topk_config,
         )
 
         # Save for backward (recomputation strategy)
@@ -1518,6 +1531,9 @@ class DSAIndexer(MegatronModule):
         # Prepare weights for index scores
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
+        # cuDNN FP32 head-weight support is forward-only:
+        # https://github.com/NVIDIA/cudnn-frontend/pull/1311
+        # FP32 projection output and FP32 indexer-loss backward are not enabled here.
         weights, _ = self.linear_weights_proj(x)
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
@@ -1553,7 +1569,13 @@ class DSAIndexer(MegatronModule):
 
         # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
         index_scores, topk_indices = fused_qk_topk_naive(
-            q, k, weights, self.index_topk, mask, use_relu=self.config.dsa_indexer_scoring_relu
+            q,
+            k,
+            weights,
+            self.index_topk,
+            mask,
+            use_relu=self.config.dsa_indexer_scoring_relu,
+            topk_config=self.config,
         )
 
         return index_scores, topk_indices
@@ -2239,6 +2261,8 @@ class DSAttention(MegatronModule):
                 query_valid_rows,
                 self.config.calculate_per_token_loss,
                 self.config.dsa_indexer_scoring_relu,
+                None,
+                self.config,
             )
 
         fused_output = None
@@ -2410,6 +2434,12 @@ class DSAttention(MegatronModule):
                     topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
+                if use_fused_kernels and self.config.dsa_indexer_topk_backend is not None:
+                    raise RuntimeError(
+                        "Explicit fused DSA top-k requires supported contiguous causal key bounds. "
+                        "Custom key positions or masks require dsa_kernel_backend='none' or "
+                        "attention_backend='unfused'."
+                    )
                 with torch.no_grad():
                     index_scores, topk_indices = fused_qk_topk_naive(
                         q,
@@ -2421,6 +2451,7 @@ class DSAttention(MegatronModule):
                         varlen_ends=varlen_ends,
                         key_positions=key_positions,
                         use_relu=self.config.dsa_indexer_scoring_relu,
+                        topk_config=self.config,
                     )
                     del index_scores
             slice_topk_to_local_sequence_parallel_rows()
