@@ -28,6 +28,14 @@ except ImportError:
     tl = MagicMock()
     HAVE_TRITON = False
 
+try:
+    import deep_gemm
+
+    HAVE_DEEPGEMM_BF16 = hasattr(deep_gemm, "bf16_gemm_nn")
+except ImportError:
+    deep_gemm = None
+    HAVE_DEEPGEMM_BF16 = False
+
 __all__ = [
     "set_batch_invariant_mode",
     "is_batch_invariant_mode_enabled",
@@ -478,13 +486,51 @@ def mean_dim(
     return output
 
 
+_BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton")
+# Preserve the Miles fork default; callers opt into DeepGEMM explicitly.
+_BATCH_INVARIANT_BACKEND: str = "triton"
+
+
+def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """`a @ b` via DeepGEMM `bf16_gemm_nn`. Both inputs are row-major.
+
+    Bitwise-identical to `torch.mm` on Hopper/Blackwell, deterministic across
+    runs, batch-invariant.
+    """
+    if a.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"The DeepGEMM batch-invariant backend requires bf16 inputs "
+            f"(got {a.dtype}); use backend='triton' for fp16/fp32."
+        )
+    M = a.shape[0]
+    N = b.shape[1]
+    d = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    deep_gemm.bf16_gemm_nn(a, b, d)
+    return d
+
+
 def mm_batch_invariant(a, b):
-    """Batch-invariant replacement for `aten::mm` using a persistent matmul kernel."""
+    """Batch-invariant replacement for `aten::mm`."""
+    if (
+        _BATCH_INVARIANT_BACKEND == "deepgemm"
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+    ):
+        return _mm_deepgemm(a, b)
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
-    """Batch-invariant replacement for `aten::addmm` using a persistent matmul kernel."""
+    """Batch-invariant replacement for `aten::addmm`."""
+    if (
+        _BATCH_INVARIANT_BACKEND == "deepgemm"
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+    ):
+        out = _mm_deepgemm(a, b)
+        if bias is not None:
+            out = out + bias
+        return out
     return matmul_persistent(a, b, bias=bias)
 
 
@@ -751,7 +797,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             opB_2d = opB
 
         # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O)
-        base_2d = matmul_persistent(opB_2d, opA, bias=None)
+        base_2d = mm_batch_invariant(opB_2d, opA)
 
         # Reshape back to original leading dims with output features at the end
         out = base_2d.reshape(*leading_shape, base_2d.shape[-1])
@@ -962,11 +1008,30 @@ def is_batch_invariant_mode_enabled():
     return _batch_invariant_MODE
 
 
-def enable_batch_invariant_mode():
-    """Enable global batch-invariant mode and patch Aten/TE kernels."""
-    global _batch_invariant_MODE, _batch_invariant_LIB
+def enable_batch_invariant_mode(backend: str = "triton"):
+    """Enable global batch-invariant mode and patch Aten/TE kernels.
+
+    Args:
+        backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.
+            "deepgemm" routes bf16 CUDA inputs through DeepGEMM
+            `bf16_gemm_nn`. "triton" (default) routes through the batch-invariant
+            Triton `matmul_persistent` kernel (works for bf16/fp16/fp32 and
+            on any CUDA device). Grouped GEMM is unchanged by this dense-only backport.
+    """
+    global _batch_invariant_MODE, _batch_invariant_LIB, _BATCH_INVARIANT_BACKEND
     if _batch_invariant_MODE:
         return
+    if backend not in _BATCH_INVARIANT_BACKENDS:
+        raise ValueError(
+            f"Unknown batch-invariant backend {backend!r}; "
+            f"expected one of {_BATCH_INVARIANT_BACKENDS}."
+        )
+    if backend == "deepgemm" and not HAVE_DEEPGEMM_BF16:
+        raise RuntimeError(
+            "The DeepGEMM batch-invariant backend requires DeepGEMM with "
+            "bf16 bindings. Install DeepGEMM or use backend='triton'."
+        )
+    _BATCH_INVARIANT_BACKEND = backend
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
@@ -990,30 +1055,38 @@ def disable_batch_invariant_mode():
 
 
 @contextlib.contextmanager
-def set_batch_invariant_mode(enabled: bool = True):
+def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None):
     """Context manager to toggle global batch-invariant mode.
 
     When `enabled` is True, batch-invariant kernels are enabled for the duration of
     the context; when False, they are disabled for the duration. This implementation
     is re-entrant and correctly restores the previous state even under nesting.
+    The helper default remains "triton" for tests that exercise non-bf16 operators.
     """
     global _batch_invariant_MODE, _batch_invariant_LIB
     # Save the previous on/off state so we can correctly restore it, even under
     # nested usage or when toggling from True->False inside an outer True scope.
     prev_enabled = _batch_invariant_MODE
+    prev_backend = _BATCH_INVARIANT_BACKEND
 
     # Apply the requested state only if it differs from the current one.
     if enabled and not prev_enabled:
-        enable_batch_invariant_mode()
+        enable_batch_invariant_mode(backend=backend or "triton")
+    elif enabled and prev_enabled and backend is not None and backend != prev_backend:
+        raise RuntimeError(
+            "Cannot switch batch-invariant backend inside an active context "
+            f"(active={prev_backend!r}, requested={backend!r})."
+        )
     elif not enabled and prev_enabled:
         disable_batch_invariant_mode()
 
     try:
         yield
     finally:
-        # Restore the previous state. If we turned BIK on at entry, turn it off here.
-        # If we turned it off at entry (inside an outer True scope), turn it back on.
+        # Restore the previous state. If we turned batch-invariant mode on at
+        # entry, turn it off here. If we turned it off at entry (inside an
+        # outer True scope), turn it back on.
         if enabled and not prev_enabled:
             disable_batch_invariant_mode()
         elif not enabled and prev_enabled:
-            enable_batch_invariant_mode()
+            enable_batch_invariant_mode(backend=prev_backend)
