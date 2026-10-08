@@ -56,15 +56,18 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
-GATED_DELTA_NET_VARIANTS = ("gated_delta_net", "gdn")
+GATED_DELTA_NET_VARIANTS = ("gated_delta_net", "gdn", "gdn2", "kda")
 
 
 def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
-    """True for the Gated DeltaNet linear-attention variant under either of its names.
+    """True for a Gated DeltaNet-family linear-attention variant.
 
     Upstream Megatron-LM renamed ``gated_delta_net`` to ``gdn`` (NVIDIA/Megatron-LM#5765) and
     Megatron-Bridge ``main`` selects Qwen3.5's linear attention with the new name. miles-main
     keeps ``gated_delta_net`` as the canonical spelling and treats ``gdn`` as an alias.
+    ``gdn2`` selects the GDN2 (Gated DeltaNet-2) variant, with channel-wise decay, erase and
+    write gates; it requires flash-linear-attention >= 0.5.1. ``kda`` selects Kimi Delta
+    Attention, a channel-wise Gated DeltaNet variant with direct Q/K/V/F/G projections.
     """
     return experimental_attention_variant in GATED_DELTA_NET_VARIANTS
 
@@ -287,15 +290,23 @@ class TransformerConfig(ModelParallelConfig):
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
     attention_output_gate: bool = False
-    """Apply a full head_dim output gate (num_attention_heads * head_dim rows
-    fused inline per-group [q, gate, k, v] into linear_qkv). Mutually
-    exclusive with `head_wise_attn_gate` (per-head scalar gate)."""
+    """Whether to apply output gating to attention layers.
 
+    The gate projection granularity is controlled by
+    ``gated_attention_proj_granularity``. It is mutually exclusive with
+    ``head_wise_attn_gate``.
+    """
+
+    gated_attention_proj_granularity: Literal['elementwise', 'headwise'] = "elementwise"
+    """Projection granularity for ``attention_output_gate``.
+
+    ``elementwise`` projects one gate per attention output element. ``headwise`` projects one
+    scalar gate per attention head and is currently supported only by Multi-Latent Attention.
+    """
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
     SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
     the shared model-level rotary_pos_emb is not created."""
-
     head_wise_attn_gate: bool = False
     """Apply a per-head scalar output gate (Step-3.5-Flash g_proj):
     num_attention_heads scalar gates fused as the trailing rows of
@@ -332,13 +343,18 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gated_delta_net', 'gdn', 'dsa', 'dsv4_hybrid', 'dsv4']
+        Literal['gated_delta_net', 'gdn', 'gdn2', 'kda', 'dsa', 'dsv4_hybrid', 'dsv4']
     ] = None
-    """Type of attention variant to use. Currently support gated_delta_net, dsa, dsv4_hybrid, and
-    dsv4 (miles' DeepSeek-V4 sparse-attention path). 'gdn' is upstream Megatron-LM's name for
-    gated_delta_net (NVIDIA/Megatron-LM#5765) and is accepted as an alias: it is normalized to
-    'gated_delta_net' in __post_init__, and every check goes through is_gated_delta_net_variant so a
-    value assigned after construction (Megatron-Bridge sets it on the provider) is recognized too."""
+    """Type of attention variant to use. Currently support gated_delta_net, gdn2, kda, dsa,
+    dsv4_hybrid, and dsv4 (miles' DeepSeek-V4 sparse-attention path). 'gdn' is upstream
+    Megatron-LM's name for gated_delta_net (NVIDIA/Megatron-LM#5765) and is accepted as an
+    alias: it is normalized to 'gated_delta_net' in __post_init__, and every check goes
+    through is_gated_delta_net_variant so a value assigned after construction (Megatron-Bridge
+    sets it on the provider) is recognized too. gdn2 selects the GDN2 (Gated DeltaNet-2)
+    variant of the gated delta net layer, with channel-wise decay, erase and write gates; kda
+    selects Kimi Delta Attention, a channel-wise Gated DeltaNet variant with direct Q/K/V/F/G
+    projections. Both require flash-linear-attention with the matching kernel (gdn2 >= 0.5.1;
+    kda's chunk_kda)."""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks.
@@ -521,6 +537,12 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    kda_safe_gate: bool = False
+    """Whether the KDA kernel should use bounded gate values."""
+
+    kda_lower_bound: Optional[float] = None
+    """Optional lower bound for KDA's bounded gate values."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
@@ -720,11 +742,11 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + MHCCheckpointManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
-    "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
-            gated norm, CP all-to-all and out_proj). Requires
-            experimental_attention_variant="gated_delta_net".
-    "gdn_norm_out": recompute the GatedDeltaNet gated normalization output via
-            CheckpointWithoutOutput. Requires experimental_attention_variant="gated_delta_net".
+    "gdn": recompute the entire GDN-family layer, including GatedDeltaNet and KDA
+            (input projections, conv1d, gated delta rule, gated norm, CP all-to-all, and
+            out_proj). Requires a GDN-family experimental attention variant or a hybrid model.
+    "gdn_norm_out": recompute gated output normalization and layout restoration for
+            Gated DeltaNet-family layers, including GatedDeltaNet and KDA.
     "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
     output-discarding checkpointing,
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
@@ -1676,6 +1698,17 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
 
+        if self.gated_attention_proj_granularity not in ('elementwise', 'headwise'):
+            raise ValueError(
+                "gated_attention_proj_granularity must be either 'elementwise' or 'headwise', "
+                f"got {self.gated_attention_proj_granularity!r}."
+            )
+        if self.gated_attention_proj_granularity == 'headwise' and not self.multi_latent_attention:
+            raise ValueError(
+                "Regular attention does not support headwise "
+                "gated_attention_proj_granularity; use 'elementwise'."
+            )
+
         if (
             self.num_query_groups % self.tensor_model_parallel_size != 0
             and self.tensor_model_parallel_size % self.num_query_groups != 0
@@ -1734,6 +1767,11 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
+        if self.experimental_attention_variant is not None:
+            self.experimental_attention_variant = normalize_experimental_attention_variant(
+                self.experimental_attention_variant
+            )
+
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
@@ -1773,8 +1811,8 @@ class TransformerConfig(ModelParallelConfig):
                 ):
                     raise ValueError(
                         "cp_partition_mode='contiguous' with context parallelism currently "
-                        "requires experimental_attention_variant to be either 'dsv4_hybrid' "
-                        "or 'gated_delta_net'."
+                        "requires experimental_attention_variant to be 'dsv4_hybrid', 'gdn', "
+                        "or 'kda'."
                     )
                 if (
                     is_gated_delta_net_variant(self.experimental_attention_variant)
@@ -1782,7 +1820,7 @@ class TransformerConfig(ModelParallelConfig):
                 ):
                     raise ValueError(
                         "cp_partition_mode='contiguous' is incompatible with "
-                        "gated_delta_net linear_cp_mode='headwise'."
+                        "GDN-family linear_cp_mode='headwise'."
                     )
             elif self.cp_partition_mode == "zigzag":
                 if self.experimental_attention_variant == "dsv4_hybrid":
@@ -1862,49 +1900,69 @@ class TransformerConfig(ModelParallelConfig):
                     "flag would only add per-microbatch prebuild work."
                 )
         if is_gated_delta_net_variant(self.experimental_attention_variant):
-            assert (
-                self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear attention."
-
-            if is_gated_delta_net_variant(self.experimental_attention_variant):
+            # GDN-family layers built via the hybrid layer pattern (symbol 'G'/'K') don't
+            # use linear_attention_freq; the GPT experimental attention route raises a
+            # clear error downstream if it is missing in the non-hybrid case.
+            if not self.is_hybrid_model:
+                assert (
+                    self.linear_attention_freq is not None
+                ), "linear_attention_freq must be set for linear attention."
                 if self.pad_packed_seq_alignment is not None:
                     tail_policy = self.thd_tail_padding_policy or 'append_dummy_seq'
                     assert tail_policy == 'append_dummy_seq', (
-                        "gated_delta_net with pad_packed_seq_alignment requires "
+                        "GDN-family attention with pad_packed_seq_alignment requires "
                         "thd_tail_padding_policy='append_dummy_seq'."
                     )
 
-                # Check required parameters
-                assert (
-                    self.linear_conv_kernel_dim is not None
-                ), "linear_conv_kernel_dim must be set for gated delta net."
-                assert (
-                    self.linear_key_head_dim is not None
-                ), "linear_key_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_value_head_dim is not None
-                ), "linear_value_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_num_key_heads is not None
-                ), "linear_num_key_heads must be set for gated delta net."
-                assert (
-                    self.linear_num_value_heads is not None
-                ), "linear_num_value_heads must be set for gated delta net."
-                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
-                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
-                    f"linear_num_key_heads ({self.linear_num_key_heads})."
-                )
-                if self.gdn_conv_pad_alignment is not None:
-                    assert self.gdn_conv_pad_alignment > 0, (
-                        f"gdn_conv_pad_alignment must be positive when set, "
-                        f"got {self.gdn_conv_pad_alignment}."
-                    )
+            # Required by both standalone GDN and hybrid KDA layers.
+            assert (
+                self.linear_conv_kernel_dim is not None
+            ), "linear_conv_kernel_dim must be set for a GDN-family layer."
+            assert (
+                self.linear_key_head_dim is not None
+            ), "linear_key_head_dim must be set for a GDN-family layer."
+            assert (
+                self.linear_value_head_dim is not None
+            ), "linear_value_head_dim must be set for a GDN-family layer."
+            assert (
+                self.linear_num_key_heads is not None
+            ), "linear_num_key_heads must be set for a GDN-family layer."
+            assert (
+                self.linear_num_value_heads is not None
+            ), "linear_num_value_heads must be set for a GDN-family layer."
 
-            if self.context_parallel_size > 1:
-                assert self.linear_cp_mode in ("headwise", "chunkwise"), (
-                    f"linear_cp_mode must be one of 'headwise' or 'chunkwise', "
+            if self.experimental_attention_variant == "kda":
+                if self.linear_num_key_heads != self.linear_num_value_heads:
+                    raise ValueError("KDA requires equal key and value head counts.")
+                if self.linear_key_head_dim != self.linear_value_head_dim:
+                    raise ValueError("KDA requires equal key and value head dimensions.")
+                if self.kda_safe_gate:
+                    if self.kda_lower_bound is None:
+                        raise ValueError("KDA requires kda_lower_bound when kda_safe_gate=True.")
+                    if not (-5.0 <= self.kda_lower_bound < 0.0):
+                        raise ValueError(
+                            "KDA requires kda_lower_bound to be in [-5, 0) "
+                            "when kda_safe_gate=True."
+                        )
+
+            assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                f"linear_num_key_heads ({self.linear_num_key_heads})."
+            )
+            if (
+                self.experimental_attention_variant == "kda" or self.context_parallel_size > 1
+            ) and self.linear_cp_mode not in ("headwise", "chunkwise"):
+                raise ValueError(
+                    f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
                     f"got {self.linear_cp_mode!r}."
                 )
+            if self.gdn_conv_pad_alignment is not None:
+                assert self.gdn_conv_pad_alignment > 0, (
+                    f"gdn_conv_pad_alignment must be positive when set, "
+                    f"got {self.gdn_conv_pad_alignment}."
+                )
+
+            if self.context_parallel_size > 1:
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
@@ -1925,7 +1983,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
-        elif self.experimental_attention_variant == "dsa":
+        if self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
             if self.add_bias_linear:
                 raise ValueError(
@@ -2084,13 +2142,18 @@ class TransformerConfig(ModelParallelConfig):
                             "build or set dsa_kernel_backend='none'."
                         )
 
+        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
+            raise NotImplementedError(
+                "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
+            )
+
         if (
             self.gdn_pre_gated_delta_rule_fusion
-            and not is_gated_delta_net_variant(self.experimental_attention_variant)
+            and self.experimental_attention_variant != "gated_delta_net"
         ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gated_delta_net'."
+                "experimental_attention_variant='gdn'."
             )
 
         if self.fp8:
@@ -2492,28 +2555,29 @@ class TransformerConfig(ModelParallelConfig):
 
             if (
                 "gdn_norm_out" in self.recompute_modules
+                and not self.is_hybrid_model
                 and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
-                    "experimental_attention_variant='gated_delta_net'."
+                    f"GDN-family layers, but got {self.experimental_attention_variant=}."
                 )
 
             if (
                 "gdn" in self.recompute_modules
+                and not self.is_hybrid_model
                 and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
-                    "gdn in recompute_modules is only supported with "
-                    "experimental_attention_variant='gated_delta_net'."
+                    "gdn in recompute_modules is only supported with GDN-family layers, but got "
+                    f"{self.experimental_attention_variant=} and {self.is_hybrid_model=}."
                 )
 
             if "gdn" in self.recompute_modules and "gdn_norm_out" in self.recompute_modules:
                 raise ValueError(
                     "'gdn' and 'gdn_norm_out' in recompute_modules cannot be used together. "
-                    "'gdn' recomputes the full GatedDeltaNet module, including gated norm."
+                    "'gdn' recomputes the full GDN-family layer, including gated norm."
                 )
-
             if "core_attn" in self.recompute_modules:
                 warnings.warn(
                     "If you are using transformer_engine as the transformer implementation, "
@@ -4152,8 +4216,16 @@ class MLATransformerConfig(TransformerConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        if self.attention_output_gate:
-            raise NotImplementedError("Output gate is not supported for MLA yet.")
+        if self.attention_output_gate and self.mla_down_proj_fusion:
+            # Fused MLA hides the post-input-LayerNorm activation inside the fused
+            # LayerNorm+linear module. Gated MLA must consume that activation as the
+            # gate input; using raw hidden_states would silently change the model.
+            # Keep this combination fail-fast until the fused API exposes the
+            # normalized activation.
+            raise ValueError(
+                "MLA output gating does not support fused down projections; "
+                "disable mla_down_proj_fusion to use the unfused path."
+            )
 
         # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim
         if self.experimental_attention_variant == "dsv4_hybrid":

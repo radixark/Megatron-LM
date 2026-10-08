@@ -57,8 +57,10 @@ class HybridStackSubmodules:
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    kda_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    mla_layer: Union[ModuleSpec, type] = IdentityOp
     csa_layer: Union[ModuleSpec, type] = IdentityOp
     hca_layer: Union[ModuleSpec, type] = IdentityOp
     window_layer: Union[ModuleSpec, type] = IdentityOp
@@ -688,6 +690,17 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif layer_type == LayerSymbols.MLA:
+                    layer = build_module(
+                        submodules.mla_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 elif layer_type == LayerSymbols.CSA:
                     # DSv4 Compressed Sparse Attention (compress_ratio fixed by the spec).
                     layer = build_module(
@@ -742,12 +755,29 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.GDN:
+                    gdn_layer_spec = submodules.gdn_layer
+                    if self.config.experimental_attention_variant == "gdn2":
+                        # 'G' layers build the GDN2 variant when the gdn2 experimental
+                        # attention variant is selected.
+                        from megatron.core.ssm.gated_delta_net import GatedDeltaNet2
+
+                        gdn_layer_spec = copy.deepcopy(gdn_layer_spec)
+                        gdn_layer_spec.submodules.self_attention.module = GatedDeltaNet2
                     layer = build_module(
-                        submodules.gdn_layer,
+                        gdn_layer_spec,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.KDA:
+                    layer = build_module(
+                        submodules.kda_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
