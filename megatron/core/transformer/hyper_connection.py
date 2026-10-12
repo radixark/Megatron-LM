@@ -127,8 +127,9 @@ def native_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
     return NativeHAggregateInto.apply(x, h_pre, out)
 
 
-# dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile
+# Cache misses can fall back to eager while other signatures stay compiled.
+# Preserve BF16 intermediate rounding so both paths produce the same output.
+@torch.compile(options={"emulate_precision_casts": True})
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:

@@ -387,6 +387,31 @@ class TestTritonHAggregate:
 class TestNativeHPostBDA:
     """Tests for native_h_post_bda."""
 
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_compiled_matches_eager_after_shape_change(self, with_bias):
+        torch._dynamo.reset()
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+        try:
+            graphs_before = torch._dynamo.utils.counters['stats']['unique_graphs']
+            for length in (128, 192):
+                torch.manual_seed(length)
+                h_res = _rand(length, 1, 4, 4)
+                residual = _rand(length, 1, 4, 256)
+                h_post = _rand(length, 1, 4)
+                x = _rand(length, 1, 256)
+                bias = _rand(256) if with_bias else None
+                expected = native_h_post_bda.__wrapped__(h_res, residual, h_post, x, bias)
+                for requires_grad in (False, True):
+                    actual = native_h_post_bda(
+                        h_res, residual.detach().requires_grad_(requires_grad), h_post, x, bias
+                    )
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            assert torch._dynamo.utils.counters['stats']['unique_graphs'] > graphs_before
+        finally:
+            torch.use_deterministic_algorithms(deterministic)
+            torch._dynamo.reset()
+
     def test_forward_uses_h_res_transpose(self):
         h_res, orig, h_post, x, expected = _h_post_bda_transpose_case()
         out = native_h_post_bda(h_res, orig, h_post, x, bias=None)
