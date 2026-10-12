@@ -74,6 +74,7 @@ from .optimizer import (
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     MegatronOptimizer,
+    _initialize_adam_beta1_zero_state,
     param_group_identifier_keys,
 )
 
@@ -560,6 +561,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                 kwargs["adam_w_mode"] = config.decoupled_weight_decay
                 adam_cls = Adam
 
+            if config.adam_beta1 == 0.0:
+                try:
+                    from transformer_engine.pytorch.optimizers import FusedAdam
+                except ImportError as exc:
+                    raise RuntimeError("beta1=0 GPU Adam requires Transformer Engine") from exc
+
+                adam_cls = FusedAdam
+
             if config.use_precision_aware_optimizer:
                 kwargs.update(
                     {
@@ -585,11 +594,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                     kwargs.update({"store_param_remainders": config.store_param_remainders})
 
             optimizer = adam_cls(**kwargs)
+            optimizer.omit_exp_avg = config.adam_beta1 == 0.0
 
             def init_state_fn(opt, config=None):
                 for group in opt.param_groups:
                     for p in group['params']:
-                        if len(opt.state[p]) == 0:
+                        if getattr(opt, "omit_exp_avg", False):
+                            _initialize_adam_beta1_zero_state(opt, p)
+                        elif len(opt.state[p]) == 0:
                             if config is None or not config.use_precision_aware_optimizer:
                                 opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
@@ -1070,6 +1082,8 @@ def get_megatron_optimizer(
     optimizers = []
     model_chunk_offset = 0
     ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
+    if config.optimizer == 'adam' and config.adam_beta1 == 0.0:
+        assert not ddp_config.use_megatron_fsdp, "beta1=0 Adam does not support Megatron FSDP"
     if ddp_config.use_megatron_fsdp:
         # For no_shard, gradients are replicated across DP ranks after all-reduce, so grad stats
         # should only be reduced over TP/PP (model_parallel_group) to avoid inflating the norm.
