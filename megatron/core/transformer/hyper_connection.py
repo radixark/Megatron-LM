@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
 
+# Dynamo cache misses run eager while other signatures stay compiled. Emulate eager's
+# BF16 intermediate rounding so compiled and eager produce bitwise-identical output.
+_MATCH_EAGER_ROUNDING = {"emulate_precision_casts": True}
+
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
@@ -64,8 +68,7 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
     return SinkhornKnopp.apply(input_logits, num_iterations, eps)
 
 
-# dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile
+@torch.compile(options=_MATCH_EAGER_ROUNDING)
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
@@ -127,9 +130,7 @@ def native_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
     return NativeHAggregateInto.apply(x, h_pre, out)
 
 
-# Cache misses can fall back to eager while other signatures stay compiled.
-# Preserve BF16 intermediate rounding so both paths produce the same output.
-@torch.compile(options={"emulate_precision_casts": True})
+@torch.compile(options=_MATCH_EAGER_ROUNDING)
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
