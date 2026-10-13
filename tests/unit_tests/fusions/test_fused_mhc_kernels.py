@@ -217,6 +217,26 @@ class TestFusedSinkhorn:
 class TestNativeHAggregate:
     """Tests for native_h_aggregate."""
 
+    def test_compiled_matches_eager_across_specializations(self):
+        torch._dynamo.reset()
+        try:
+            graphs_before = torch._dynamo.utils.counters['stats']['unique_graphs']
+            for length in (128, 192):
+                torch.manual_seed(length)
+                x = _rand(length, 1, 4, 256)
+                h_pre = _rand(length, 1, 4)
+                expected = native_h_aggregate.__wrapped__(x, h_pre)
+                for requires_grad in (False, True):
+                    for grad_enabled in (False, True):
+                        with torch.set_grad_enabled(grad_enabled):
+                            actual = native_h_aggregate(
+                                x.detach().requires_grad_(requires_grad), h_pre
+                            )
+                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            assert torch._dynamo.utils.counters['stats']['unique_graphs'] > graphs_before
+        finally:
+            torch._dynamo.reset()
+
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C):
         _info()
