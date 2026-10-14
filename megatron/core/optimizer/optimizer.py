@@ -244,7 +244,10 @@ class MegatronOptimizer(ABC):
     def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
         """Start the optimizer prefetch that may overlap gradient finalization."""
 
-        self.prefetch_optimizer_state_for_step()
+        if self._defer_optimizer_state_prefetch_to_step:
+            self.prefetch_optimizer_master_weights_for_step()
+        else:
+            self.prefetch_optimizer_state_for_step()
 
     def prefetch_optimizer_master_weights_for_step(self) -> None:
         """Prefetch master weights without restoring an optimizer-state chunk."""
@@ -1514,6 +1517,27 @@ class ChainedOptimizer(MegatronOptimizer):
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
         self._share_optimizer_state_offload_streams()
+        self._defer_later_children_state_prefetch()
+
+    def _defer_later_children_state_prefetch(self) -> None:
+        """Bound the chain's tensor-state staging to one manager's two slots.
+
+        Children step one after another. Only the first offloading child restores its first
+        state chunk ahead of the update, where the copy overlaps gradient clipping. Each later
+        child restores its own when its step begins, after the previous child released its
+        staging slots, instead of holding a chunk through every earlier child's update.
+        """
+
+        offloading_children = [
+            child
+            for child in self.chained_optimizers
+            if getattr(child, '_optimizer_state_offloader', None) is not None
+        ]
+        for child in offloading_children[1:]:
+            child.set_optimizer_state_offload_deferred_lifecycle(
+                state_prefetch_to_step=True,
+                master_offload_for_param_sync=child._defer_optimizer_master_offload_for_param_sync,
+            )
 
     def _share_optimizer_state_offload_streams(self) -> None:
         """Serialize all nested offload managers on one D2H/H2D stream pair."""

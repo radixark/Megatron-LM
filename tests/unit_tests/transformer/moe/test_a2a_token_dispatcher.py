@@ -123,3 +123,38 @@ class TestAlltoAllDispatcher:
         )
         container.dispatcher_router_padding_for_fp8_test()
         config.ENABLE_EXPERIMENTAL = False
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("moe_combine_in_fp32", [False, True])
+    def test_forward_keeps_no_autograd_history(self, moe_combine_in_fp32):
+        """Once the MoE forward returns, the dispatcher holds none of its autograd graph.
+
+        A graph kept on the dispatcher reaches back to the layer input: under full recompute
+        that is the checkpoint's leaf input, whose gradient it then keeps alive too.
+        """
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=1,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0.0,
+            moe_token_dispatcher_type="alltoall",
+        )
+        moe_layer = container.new_moe_layer(moe_combine_in_fp32=moe_combine_in_fp32)
+        hidden_states = torch.randn(
+            (8, 4, moe_layer.config.hidden_size), device="cuda", requires_grad=True
+        )
+
+        output, _ = moe_layer(hidden_states)
+        output.sum().backward()
+
+        held = [
+            name
+            for name, value in vars(moe_layer.token_dispatcher).items()
+            if isinstance(value, torch.Tensor) and value.grad_fn is not None
+        ]
+        assert not held, f"dispatcher still holds autograd history in {held}"

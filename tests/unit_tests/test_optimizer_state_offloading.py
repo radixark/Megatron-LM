@@ -335,6 +335,10 @@ def test_standard_chained_optimizer_shares_state_offload_streams():
         def __init__(self, config, manager):
             self.config = config
             self._optimizer_state_offloader = manager
+            self._defer_optimizer_master_offload_for_param_sync = False
+
+        def set_optimizer_state_offload_deferred_lifecycle(self, **lifecycle):
+            pass
 
     config = object()
     managers = [FakeManager(), FakeManager()]
@@ -342,6 +346,36 @@ def test_standard_chained_optimizer_shares_state_offload_streams():
 
     assert managers[1].transfer_streams[0] is managers[0].transfer_streams[0]
     assert managers[1].transfer_streams[1] is managers[0].transfer_streams[1]
+
+
+@pytest.mark.skipif(not TE_FUSED_ADAM_AVAILABLE, reason="Requires TE FusedAdam")
+@pytest.mark.usefixtures("model_parallel_context")
+def test_chained_optimizer_defers_later_children_state_prefetch():
+    """Only the first offloading child stages a state chunk before the chained update."""
+
+    models, children = [], []
+    for _ in range(2):
+        model, optimizer = create_model_and_optimizer(hidden_size=512, chunk_size_mb=1)
+        models.append(model)
+        children.append(optimizer.chained_optimizers[0])
+    chain = ChainedOptimizer(children)
+    assert not children[0]._defer_optimizer_state_prefetch_to_step
+    assert children[1]._defer_optimizer_state_prefetch_to_step
+
+    managers = [child._optimizer_state_offloader for child in children]
+    for _ in range(2):
+        offload_before_forward(chain)
+        for model in models:
+            model(torch.randn(8, 512, dtype=torch.bfloat16, device='cuda')).sum().backward()
+        chain.prefetch_optimizer_state_for_gradient_finalization()
+        chain.prepare_grads()
+        assert managers[0]._first_prefetch is not None
+        assert managers[1]._first_prefetch is None
+        update_successful, _, _ = chain.step()
+        assert update_successful
+
+    chain.synchronize_optimizer_state_for_checkpoint()
+    del models, children, chain
 
 
 def test_chained_optimizer_forwards_master_residency_assertion():
@@ -470,6 +504,7 @@ def test_oversized_atomic_state_chunks_log_once():
     manager = object.__new__(ChunkedOptimizerStateOffloader)
     manager.chunk_size_bytes = 1024**2
     manager._state_bytes_per_param = torch.float32.itemsize
+    manager._optimizer_owned_master_dtypes = {}
     manager.optimizer = SimpleNamespace()
     params = tuple(nn.Parameter(torch.empty(numel)) for numel in (300_000, 400_000, 10))
 
@@ -914,6 +949,10 @@ def test_precision_aware_master_planning_uses_real_storage():
     assert manager._estimated_bundle_bytes(low_precision_param) == (
         state_bytes + 128 * torch.int16.itemsize
     )
+    # An optimizer-owned master is chunk state, so the chunk planner counts it too.
+    assert manager._estimated_state_bytes(low_precision_param) == (
+        state_bytes + 128 * torch.int16.itemsize
+    )
 
 
 def create_model_and_optimizer(
@@ -1254,5 +1293,89 @@ def test_training_matches_non_offloaded_optimizer():
             rtol=1e-4,
             msg=f"Parameter {name_offload} differs from the full-step reference",
         )
+
+    del model_offload, optimizer_offload, model_reference, optimizer_reference
+
+
+@pytest.mark.skipif(
+    not TE_FUSED_ADAM_AVAILABLE or not is_te_min_version("2.1.0.dev0"),
+    reason="Requires TE FusedAdam with precision-aware optimizer support",
+)
+@pytest.mark.usefixtures("model_parallel_context")
+def test_optimizer_owned_masters_ride_with_their_state_chunk():
+    """Precision-aware masters are staged per chunk and update exactly like a full step."""
+
+    # DistOpt shards the flat buffer across DP ranks: give every rank several state chunks.
+    precision_aware = dict(
+        num_layers=16 * torch.distributed.get_world_size(),
+        lr=0.01,
+        use_precision_aware_optimizer=True,
+        main_params_dtype=torch.float32,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.bfloat16,
+    )
+    torch.manual_seed(42)
+    model_offload, optimizer_offload = create_model_and_optimizer(
+        chunk_size_mb=1, **precision_aware
+    )
+    torch.manual_seed(42)
+    model_reference, optimizer_reference = create_model_and_optimizer(
+        chunked_optimizer_state_offload=False, **precision_aware
+    )
+    manager = optimizer_offload.chained_optimizers[0]._optimizer_state_offloader
+    assert manager is not None and len(manager.chunks) > 2
+    assert manager._master_in_optimizer_state
+
+    inner = manager.optimizer
+    chunk_step = inner.step
+    cuda_masters_at_chunk_step = []
+
+    def counting_step(*args, **kwargs):
+        cuda_masters_at_chunk_step.append(
+            sum(
+                isinstance(master := inner.state.get(param, {}).get("master_param"), torch.Tensor)
+                and master.is_cuda
+                for param in manager.selected_params
+            )
+        )
+        return chunk_step(*args, **kwargs)
+
+    inner.step = counting_step
+
+    torch.manual_seed(123)
+    for _ in range(3):
+        inputs = torch.randn(8, 256, dtype=torch.bfloat16, device='cuda')
+        offload_before_forward(optimizer_offload)
+        run_forward_backward_step(model_offload, optimizer_offload, input_tensor=inputs)
+
+        output = model_reference(inputs)
+        output.sum().backward()
+        optimizer_reference.step()
+        optimizer_reference.zero_grad()
+
+    optimizer_offload.synchronize_optimizer_state_for_checkpoint()
+    for param in manager.selected_params:
+        master = inner.state[param]["master_param"]
+        assert master.device.type == "cpu" and master.is_pinned()
+    # A chunk step sees its own masters and the next chunk's prefetched ones, never the window.
+    largest_adjacent_pair = max(
+        len(current.params) + len(following.params)
+        for current, following in zip(manager.chunks, manager.chunks[1:])
+    )
+    assert 0 < max(cuda_masters_at_chunk_step) <= largest_adjacent_pair
+    assert largest_adjacent_pair < len(manager.selected_params)
+
+    for (name, param_offload), (_, param_reference) in zip(
+        model_offload.named_parameters(), model_reference.named_parameters()
+    ):
+        torch.testing.assert_close(param_offload, param_reference, atol=0, rtol=0, msg=name)
+    reference_inner = optimizer_reference.chained_optimizers[0].optimizer
+    reference_params = [p for group in reference_inner.param_groups for p in group["params"]]
+    assert len(reference_params) == len(manager._params)
+    for param_offload, param_reference in zip(manager._params, reference_params):
+        for key, value in inner.state[param_offload].items():
+            if isinstance(value, torch.Tensor):
+                expected = reference_inner.state[param_reference][key]
+                assert torch.equal(value.cpu(), expected.cpu()), key
 
     del model_offload, optimizer_offload, model_reference, optimizer_reference

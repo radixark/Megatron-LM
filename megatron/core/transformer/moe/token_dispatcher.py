@@ -929,6 +929,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
         )
+        # The combine was the last reader of this forward's routing tensors. ``probs`` carries
+        # the router's autograd graph back to the layer input; kept until the layer's next
+        # forward, it holds that graph, and under full recompute the checkpointed layer input
+        # with its gradient, across the rest of the step. Shapes stay: CUDA graph replay of the
+        # preprocess restores only tensor attributes.
+        self.probs = None
+        self.routing_map = None
+        self.reversed_local_input_permutation_mapping = None
 
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
