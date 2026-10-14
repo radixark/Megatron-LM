@@ -446,9 +446,7 @@ def test_chained_step_prefetch_follows_each_child_deferral_policy():
     calls = []
     children = [
         SimpleNamespace(
-            prefetch_optimizer_state_for_gradient_finalization=lambda name=name: calls.append(
-                name
-            ),
+            prefetch_optimizer_state_for_gradient_finalization=lambda name=name: calls.append(name),
             prefetch_optimizer_state_for_step=lambda name=name: calls.append(f"eager:{name}"),
         )
         for name in ("first", "deferred")
