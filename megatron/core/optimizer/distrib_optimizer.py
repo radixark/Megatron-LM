@@ -1337,6 +1337,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             {
                                 "gbuf_local_start": param_range_map["gbuf_local"].start,
                                 "gbuf_local_end": param_range_map["gbuf_local"].end,
+                                # load_parameter_state_from_dp_reshardable filters on this key
+                                "padding": False,
                             }
                         )
                         bucket_state.append(tensors)
