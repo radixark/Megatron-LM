@@ -13,6 +13,7 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer import layer_wise_optimizer as layer_wise_optimizer_module
+from megatron.core.optimizer.chunked_muon_optimizer import ChunkedMuonOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -412,6 +413,7 @@ def test_layerwise_offload_rejects_multiple_nonempty_muon_children(monkeypatch):
     monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
     config = SimpleNamespace(
         bf16=True,
+        chunked_muon_master_weights=False,
         chunked_optimizer_state_offload=True,
         optimizer_state_offload_fraction=1.0,
         overlap_param_gather=False,
@@ -520,6 +522,8 @@ class TestLayerWiseOptimizer:
         chunked_optimizer_state_offload=False,
         optimizer_state_offload_chunk_size_mb=0,
         optimizer_state_offload_fraction=1.0,
+        chunked_muon_master_weights=False,
+        grad_reduce_in_fp32=False,
     ):
         """Create model, DDP wrapper, and optimizer.
 
@@ -534,6 +538,8 @@ class TestLayerWiseOptimizer:
                 + ``start_param_sync``). If False (default), build DDP without a layout
                 so ``LayerWiseDistributedOptimizer`` syncs via the legacy
                 flatten / ``all_gather_v`` / unflatten ``allgather_params()`` codepath.
+            chunked_muon_master_weights: Keep Muon masters on CPU and update them per chunk.
+            grad_reduce_in_fp32: Keep DDP gradient buffers in FP32.
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -547,7 +553,7 @@ class TestLayerWiseOptimizer:
         if use_param_layout:
             from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig()
+            ddp_config = DistributedDataParallelConfig(grad_reduce_in_fp32=grad_reduce_in_fp32)
             model = wrap_model_chunks_with_ddp(
                 [model],
                 TransformerConfig(num_attention_heads=1, num_layers=1),
@@ -555,7 +561,9 @@ class TestLayerWiseOptimizer:
                 use_layer_wise_distributed_optimizer=use_layer_wise,
             )[0]
         else:
-            ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+            ddp_config = DistributedDataParallelConfig(
+                use_distributed_optimizer=False, grad_reduce_in_fp32=grad_reduce_in_fp32
+            )
             model = DistributedDataParallel(
                 TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
             )
@@ -576,6 +584,7 @@ class TestLayerWiseOptimizer:
             chunked_optimizer_state_offload=chunked_optimizer_state_offload,
             optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
             optimizer_state_offload_fraction=optimizer_state_offload_fraction,
+            chunked_muon_master_weights=chunked_muon_master_weights,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -821,6 +830,54 @@ class TestLayerWiseOptimizer:
             model.parameters(), reference_model.parameters()
         ):
             torch.testing.assert_close(offloaded_param, reference_param, rtol=1e-4, atol=1e-5)
+
+    def test_chunked_muon_master_weights_match_full_window_offload(self):
+        """CPU Muon masters updated chunk by chunk match the full-window offload update."""
+
+        offload_kwargs = dict(
+            clip_grad=0.0,
+            use_param_layout=True,
+            chunked_optimizer_state_offload=True,
+            optimizer_state_offload_chunk_size_mb=1,
+            grad_reduce_in_fp32=True,
+        )
+        model, optimizer, _ = self.create_model_and_optimizer(
+            chunked_muon_master_weights=True, **offload_kwargs
+        )
+        reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
+            copy_from=model, **offload_kwargs
+        )
+        chunked_children = [
+            child
+            for layerwise_optimizer in optimizer.chained_optimizers
+            if isinstance(layerwise_optimizer, LayerWiseDistributedOptimizer)
+            for child in layerwise_optimizer.chained_optimizers
+        ]
+        assert chunked_children
+        assert all(isinstance(child, ChunkedMuonOptimizer) for child in chunked_children)
+
+        for _ in range(3):
+            inputs = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+            for current_model, current_optimizer in (
+                (model, optimizer),
+                (reference_model, reference_optimizer),
+            ):
+                current_optimizer.offload_optimizer_state_for_forward()
+                current_optimizer.zero_grad()
+                current_model(inputs).sum().backward()
+                current_optimizer.prefetch_optimizer_state_for_gradient_finalization()
+            update_successful, grad_norm, _ = optimizer.step()
+            reference_update_successful, reference_grad_norm, _ = reference_optimizer.step()
+            assert update_successful and reference_update_successful
+            assert grad_norm == reference_grad_norm
+            for child in chunked_children:
+                if not child.is_stub_optimizer:
+                    for group in child.fp32_from_float16_groups:
+                        for master in group:
+                            assert master.device.type == 'cpu'
+
+        for param, reference_param in zip(model.parameters(), reference_model.parameters()):
+            torch.testing.assert_close(param, reference_param, rtol=0, atol=0)
 
     def test_split_layerwise_and_distopt_share_offload_streams(self):
         """Muon children and sibling Adam DistOpt serialize copies on one stream pair."""

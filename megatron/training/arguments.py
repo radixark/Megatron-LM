@@ -2031,6 +2031,26 @@ def validate_args(args, defaults={}):
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
         )
 
+    if args.chunked_muon_master_weights:
+        assert args.optimizer == 'muon' and args.use_layer_wise_distributed_optimizer, (
+            '--chunked-muon-master-weights requires LayerWise Muon'
+        )
+        assert args.bf16 and not args.fp16 and not args.fp8 and not args.fp8_param_gather
+        assert args.chunked_optimizer_state_offload and args.optimizer_state_offload_fraction == 1.0
+        assert args.optimizer_state_offload_chunk_size_mb > 0
+        assert args.clip_grad == 0 and not args.log_num_zeros_in_grad
+        assert not args.overlap_param_gather and not args.overlap_param_gather_with_optimizer_step
+        assert args.no_load_optim and args.no_save_optim, (
+            '--chunked-muon-master-weights requires --no-load-optim --no-save-optim'
+        )
+        # The RL restore would move every CPU master back to the GPU at once.
+        assert not args.rl_offload_optimizer_during_inference, (
+            '--chunked-muon-master-weights does not support --rl-offload-optimizer-during-inference'
+        )
+        assert not getattr(args, 'stream_optimizer_state_to_disk', False), (
+            '--chunked-muon-master-weights currently requires CPU placement'
+        )
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -3799,6 +3819,12 @@ def _add_training_args(parser):
         action='store_false',
         dest='pin_cpu_params',
         help='Disable pinning of CPU memory for parameters.',
+    )
+    group.add_argument(
+        '--chunked-muon-master-weights',
+        action='store_true',
+        help='Stage BF16 LayerWise Muon masters per state chunk; CPU placement only, '
+        'without optimizer checkpoint I/O, clipping, FP8 or overlapped parameter gather.',
     )
     group.add_argument(
         '--chunked-optimizer-state-offload',
