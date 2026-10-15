@@ -306,6 +306,9 @@ class MegatronOptimizer(ABC):
         """Stage optimizer-owned model params before an explicit DDP param sync."""
         return
 
+    def _get_param_grad_for_norm(self, param):
+        return param.grad
+
     def _filter_grads_for_norm(
         self,
         params: List[torch.nn.Parameter],
@@ -341,7 +344,7 @@ class MegatronOptimizer(ABC):
                 # Megatron-FSDP gradients are DTensors.
                 grad = param.grad._local_tensor if param.grad is not None else None
             else:
-                grad = param.grad
+                grad = self._get_param_grad_for_norm(param)
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
@@ -954,6 +957,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Callable,
+        *,
+        main_params_on_cpu: bool = False,
     ):
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
@@ -984,7 +989,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Seed the fp32 master from the high-precision pre-quantization init
                             # for fp8 params (not the lossy fp8 dequant), matching DistOpt so
                             # fp8_param_gather ON/OFF hold an identical master at iter 0.
-                            if hasattr(param, 'get_high_precision_init_val'):
+                            if main_params_on_cpu:
+                                if param.dtype != torch.bfloat16 or is_float8tensor(param):
+                                    raise ValueError("CPU master initialization requires ordinary BF16 parameters")
+                                main_param = torch.empty_like(
+                                    param, device="cpu", dtype=torch.float32, pin_memory=True
+                                )
+                                main_param.copy_(param.detach())
+                            elif hasattr(param, 'get_high_precision_init_val'):
                                 main_param = (
                                     param.get_high_precision_init_val()
                                     .detach()
