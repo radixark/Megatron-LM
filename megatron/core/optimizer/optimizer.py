@@ -310,6 +310,9 @@ class MegatronOptimizer(ABC):
         """Stage optimizer-owned model params before an explicit DDP param sync."""
         return
 
+    def _get_param_grad_for_norm(self, param):
+        return param.grad
+
     def _filter_grads_for_norm(
         self,
         params: List[torch.nn.Parameter],
@@ -345,7 +348,7 @@ class MegatronOptimizer(ABC):
                 # Megatron-FSDP gradients are DTensors.
                 grad = param.grad._local_tensor if param.grad is not None else None
             else:
-                grad = param.grad
+                grad = self._get_param_grad_for_norm(param)
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
