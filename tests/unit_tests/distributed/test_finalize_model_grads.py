@@ -195,3 +195,34 @@ class TestAllReduceLNGrads:
         embd_group = parallel_state.get_embedding_group()
 
         _allreduce_word_embedding_grads([self.model], self.transformer_config, embd_group, pp_group)
+
+
+def test_dense_grad_buckets_preserve_views_and_bound_coalescing(monkeypatch):
+    import importlib
+
+    module = importlib.import_module('megatron.core.distributed.finalize_model_grads')
+    grads = [torch.arange(6.0), torch.arange(12.0).reshape(3, 4).t(), torch.arange(3.0)]
+    originals = [g.clone() for g in grads]
+    pointers = [g.data_ptr() for g in grads]
+    sizes = []
+    flatten = module._flatten_dense_tensors
+
+    def measured_flatten(bucket):
+        sizes.append(sum(g.numel() * g.element_size() for g in bucket))
+        return flatten(bucket)
+
+    def reduce(tensor, op, group):
+        assert op == dist.ReduceOp.SUM and group == 'tp-test'
+        tensor.mul_(2)
+
+    monkeypatch.setattr(module, '_flatten_dense_tensors', measured_flatten)
+    monkeypatch.setattr(module.torch.distributed, 'all_reduce', reduce)
+    module._allreduce_dense_grad_buckets(grads, dist.ReduceOp.SUM, 'tp-test', bucket_bytes=32)
+    assert max(sizes) <= max(32, max(g.numel() * g.element_size() for g in grads))
+    assert len(sizes) > 1
+    for got, before, pointer in zip(grads, originals, pointers):
+        assert got.data_ptr() == pointer
+        torch.testing.assert_close(got, before * 2, rtol=0, atol=0)
+    sizes.clear()
+    module._allreduce_dense_grad_buckets([], dist.ReduceOp.SUM, 'tp-test')
+    assert sizes == []

@@ -449,6 +449,7 @@ def unpermute(
     fused: bool = False,
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -474,10 +475,14 @@ def unpermute(
             Tensor of per-expert cumulative padding offsets used to remove padding added
             during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
             and is required when unpermuting padded outputs. Defaults to None.
+        deterministic (bool): Use stable token grouping and ordered sums instead of
+            atomic accumulation. Requires the unfused path.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
+    if deterministic and fused:
+        raise ValueError("Stable ordered combine requires unfused unpermute")
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
@@ -520,6 +525,15 @@ def unpermute(
         # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
+
+    if deterministic:
+        # Stable token grouping preserves expert order and avoids scatter-add atomics.
+        if sorted_indices.numel() == 0:
+            return (permuted_tokens.new_zeros(restore_shape) + permuted_tokens.sum() * 0).to(input_dtype)
+        order = torch.argsort(sorted_indices, stable=True)
+        lengths = torch.bincount(sorted_indices, minlength=restore_shape[0])
+        ordered_tokens = permuted_tokens.index_select(0, order)
+        return torch.segment_reduce(ordered_tokens, 'sum', lengths=lengths).to(input_dtype)
 
     # Create an output tensor filled with zeros
     output_tokens = torch.zeros(

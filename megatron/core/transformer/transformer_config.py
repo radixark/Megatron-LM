@@ -970,6 +970,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_combine_in_fp32: bool = False
     """Apply routing probs and accumulate expert outputs in fp32 with one final round."""
 
+    moe_deterministic_combine: bool = False
+    """Sum unfused AlltoAll expert contributions in a stable order, without atomics."""
+
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
     The routing decision is based on the sum of the routing scores and the expert bias.
@@ -3727,6 +3730,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.moe_router_dtype == 'fp32'
             ), "moe_combine_in_fp32 needs --moe-router-dtype fp32 (probs reach combine un-rounded)"
+        if self.moe_deterministic_combine:
+            assert self.moe_combine_in_fp32 and self.moe_token_dispatcher_type == 'alltoall', (
+                "moe_deterministic_combine requires unfused AlltoAll FP32 combine"
+            )
 
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (

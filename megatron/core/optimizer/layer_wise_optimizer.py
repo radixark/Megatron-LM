@@ -471,7 +471,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         'LayerWiseDistributedOptimizer expects base torch optimizers, '
                         f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
-                optimizers[i] = Float16OptimizerWithFloat16Params(
+                wrapper_cls = Float16OptimizerWithFloat16Params
+                if config.chunked_muon_master_weights:
+                    # Import here because the dedicated wrapper reuses optimizer.py classes.
+                    from .chunked_muon_optimizer import ChunkedMuonOptimizer
+
+                    wrapper_cls = ChunkedMuonOptimizer
+                optimizers[i] = wrapper_cls(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
                 # Non-DistOpt LayerWise child has no byte-shard param buffer, so tag it to route
@@ -990,6 +996,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for p in params:
                     torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
 
+    def get_grads_for_grad_norm(self, grad_norm_group=None):
+        return [
+            grad
+            for optimizer in self.chained_optimizers
+            for grad in optimizer.get_grads_for_grad_norm(grad_norm_group)
+        ]
+
     @torch.no_grad()
     def get_grad_norm(self):
         # similar to dist opt, always aggregate globally
@@ -1117,6 +1130,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # so a sibling DistributedOptimizer's own ``start_param_sync`` call
                 # is not duplicated for the same buckets.
                 self.start_param_sync_for_bucket_group_subset()
+            elif self.config.chunked_muon_master_weights:
+                # Keep parameter synchronization bounded too: the legacy all-gather
+                # flattens a full dense-DP replica in addition to the model/grad buffers.
+                self.broadcast_params()
             else:
                 self.allgather_params()
 
