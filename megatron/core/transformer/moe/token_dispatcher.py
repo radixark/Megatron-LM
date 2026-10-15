@@ -928,6 +928,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             probs=combine_probs,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+            deterministic=self.config.moe_deterministic_combine,
         )
 
         # Reshape the output tensor
