@@ -974,15 +974,7 @@ def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
                             v, torch.Tensor
                         ), f"Non-tensor in saved state key '{k}': {type(v)}"
 
-    # Test 3: load_parameter_state_from_dp_reshardable should not crash
-    # Add 'padding' key required by the load path (normally added by fully_reshardable save)
-    for key, value in saved_state.items():
-        if key in metadata_keys:
-            continue
-        for dtype, buckets_state in value.items():
-            for bucket_state in buckets_state:
-                for param_dict in bucket_state:
-                    param_dict['padding'] = False
+    # Test 3: load_parameter_state_from_dp_reshardable accepts the getter's output as-is
     distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
 
     # Test 4: Inject non-tensor entries directly into the saved state and verify load handles them
