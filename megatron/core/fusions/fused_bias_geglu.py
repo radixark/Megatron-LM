@@ -1,5 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Dict, Tuple
+
 import torch
 
 from megatron.core.jit import jit_fuser
@@ -407,6 +409,27 @@ class WeightedBiasQuickGeGLUFunction(torch.autograd.Function):
         return input_grad, bias_grad, weights_grad, None, None
 
 
+_LINEAR_OFFSET_TENSORS: Dict[Tuple[float, torch.dtype, torch.device], torch.Tensor] = {}
+
+
+def _linear_offset_tensor(
+    linear_offset: float, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Return a cached scalar tensor holding ``linear_offset``.
+
+    Building it with ``torch.tensor`` on every call is a blocking host-to-device copy that
+    makes the host wait for the GPU stream to drain, once per MLP forward (and again under
+    activation recompute). The autograd functions only read the tensor, so sharing it across
+    calls is safe.
+    """
+    key = (float(linear_offset), dtype, device)
+    offset = _LINEAR_OFFSET_TENSORS.get(key)
+    if offset is None:
+        offset = torch.tensor(linear_offset, dtype=dtype, device=device)
+        _LINEAR_OFFSET_TENSORS[key] = offset
+    return offset
+
+
 def weighted_bias_quick_geglu_impl(
     input, bias, weights, fp8_input_store=False, linear_offset=0.0, clamp_value=None
 ):
@@ -431,7 +454,7 @@ def weighted_bias_quick_geglu_impl(
             -1,
         )
     input = input.view(-1, ori_shape[-1])
-    linear_offset = torch.tensor(linear_offset, dtype=input.dtype, device=input.device)
+    linear_offset = _linear_offset_tensor(linear_offset, input.dtype, input.device)
     if bias is not None:
         output = WeightedBiasQuickGeGLUFunction.apply(
             input, bias, weights, fp8_input_store, linear_offset
