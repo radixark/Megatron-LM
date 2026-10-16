@@ -2,6 +2,7 @@
 
 import os
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -339,6 +340,29 @@ class TinyModel(nn.Module):
 
     def forward(self, x):
         return self.fc1(x)
+
+
+class WideStackModel(nn.Module):
+    """Residual stack whose 512x512 matrices each fill a 1 MiB FP32 optimizer-state chunk."""
+
+    def __init__(self, hidden_size=512, num_layers=24):
+        super().__init__()
+        self.layers = nn.ModuleList(nn.Linear(hidden_size, hidden_size) for _ in range(num_layers))
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = x + F.relu(layer(x))
+        return x
+
+
+def _layer_wise_children(optimizer):
+    """Return the wrapped children of every LayerWise optimizer in an outer chain."""
+    return [
+        child
+        for chained in optimizer.chained_optimizers
+        if isinstance(chained, LayerWiseDistributedOptimizer)
+        for child in chained.chained_optimizers
+    ]
 
 
 def test_layerwise_step_hook_is_noop_without_chunked_offload():
@@ -832,9 +856,10 @@ class TestLayerWiseOptimizer:
             torch.testing.assert_close(offloaded_param, reference_param, rtol=1e-4, atol=1e-5)
 
     def test_chunked_muon_master_weights_match_full_window_offload(self):
-        """CPU Muon masters updated chunk by chunk match the full-window offload update."""
+        """Chunk-by-chunk CPU Muon masters match the full-window offload at every step."""
 
         offload_kwargs = dict(
+            model_class=WideStackModel,
             clip_grad=0.0,
             use_param_layout=True,
             chunked_optimizer_state_offload=True,
@@ -847,17 +872,24 @@ class TestLayerWiseOptimizer:
         reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
             copy_from=model, **offload_kwargs
         )
-        chunked_children = [
-            child
-            for layerwise_optimizer in optimizer.chained_optimizers
-            if isinstance(layerwise_optimizer, LayerWiseDistributedOptimizer)
-            for child in layerwise_optimizer.chained_optimizers
-        ]
+        chunked_children = _layer_wise_children(optimizer)
+        reference_children = _layer_wise_children(reference_optimizer)
         assert chunked_children
         assert all(isinstance(child, ChunkedMuonOptimizer) for child in chunked_children)
+        local_chunks = max(
+            (
+                len(child._optimizer_state_offloader.chunks)
+                for child in chunked_children
+                if child._optimizer_state_offloader is not None
+            ),
+            default=0,
+        )
+        max_chunks = torch.tensor(local_chunks, device='cuda')
+        torch.distributed.all_reduce(max_chunks, op=torch.distributed.ReduceOp.MAX)
+        assert max_chunks.item() >= 2
 
         for _ in range(3):
-            inputs = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+            inputs = torch.randn(16, 512, dtype=torch.bfloat16, device='cuda')
             for current_model, current_optimizer in (
                 (model, optimizer),
                 (reference_model, reference_optimizer),
@@ -870,14 +902,72 @@ class TestLayerWiseOptimizer:
             reference_update_successful, reference_grad_norm, _ = reference_optimizer.step()
             assert update_successful and reference_update_successful
             assert grad_norm == reference_grad_norm
-            for child in chunked_children:
-                if not child.is_stub_optimizer:
-                    for group in child.fp32_from_float16_groups:
-                        for master in group:
-                            assert master.device.type == 'cpu'
 
-        for param, reference_param in zip(model.parameters(), reference_model.parameters()):
-            torch.testing.assert_close(param, reference_param, rtol=0, atol=0)
+            reference_optimizer.offload_optimizer_state_for_forward()
+            torch.cuda.synchronize()
+            for param, reference_param in zip(model.parameters(), reference_model.parameters()):
+                torch.testing.assert_close(param, reference_param, rtol=0, atol=0)
+            for child, reference_child in zip(chunked_children, reference_children):
+                if child.is_stub_optimizer:
+                    continue
+                for masters, reference_masters in zip(
+                    child.fp32_from_float16_groups, reference_child.fp32_from_float16_groups
+                ):
+                    for master, reference_master in zip(masters, reference_masters):
+                        assert master.device.type == 'cpu'
+                        torch.testing.assert_close(master, reference_master.cpu(), rtol=0, atol=0)
+                        reference_state = reference_child.optimizer.state[reference_master]
+                        for key, value in child.optimizer.state[master].items():
+                            if isinstance(value, torch.Tensor):
+                                torch.testing.assert_close(
+                                    value.cpu(), reference_state[key].cpu(), rtol=0, atol=0
+                                )
+
+    def test_chunked_muon_master_weights_sync_params_with_broadcast(self):
+        """Without the layer-wise param layout, updated Muon params reach every DP rank."""
+
+        model, optimizer, pg_collection = self.create_model_and_optimizer(
+            clip_grad=0.0,
+            use_param_layout=True,
+            chunked_optimizer_state_offload=True,
+            optimizer_state_offload_chunk_size_mb=1,
+            chunked_muon_master_weights=True,
+            grad_reduce_in_fp32=True,
+        )
+        layerwise_optimizer = next(
+            child
+            for child in optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        assert not layerwise_optimizer.use_buffer_param_sync
+        dp_size = get_pg_size(pg_collection.dp_cp)
+        assert dp_size > 1
+        initial_params = [param.detach().clone() for param in model.parameters()]
+
+        with (
+            mock.patch.object(
+                layerwise_optimizer, 'broadcast_params', wraps=layerwise_optimizer.broadcast_params
+            ) as broadcast_params,
+            mock.patch.object(layerwise_optimizer, 'allgather_params') as allgather_params,
+        ):
+            for _ in range(2):
+                optimizer.offload_optimizer_state_for_forward()
+                optimizer.zero_grad()
+                model(torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')).sum().backward()
+                optimizer.prefetch_optimizer_state_for_gradient_finalization()
+                assert optimizer.step()[0]
+
+        assert broadcast_params.call_count == 2
+        allgather_params.assert_not_called()
+        assert any(
+            not torch.equal(param, initial)
+            for param, initial in zip(model.parameters(), initial_params)
+        )
+        for param in model.parameters():
+            replicas = [torch.empty_like(param) for _ in range(dp_size)]
+            torch.distributed.all_gather(replicas, param.detach(), group=pg_collection.dp_cp)
+            for replica in replicas[1:]:
+                torch.testing.assert_close(replica, replicas[0], rtol=0, atol=0)
 
     def test_split_layerwise_and_distopt_share_offload_streams(self):
         """Muon children and sibling Adam DistOpt serialize copies on one stream pair."""
