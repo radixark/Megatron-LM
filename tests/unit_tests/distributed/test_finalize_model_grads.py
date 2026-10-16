@@ -208,7 +208,7 @@ def test_dense_grad_buckets_preserve_views_and_bound_coalescing(monkeypatch):
     flatten = module._flatten_dense_tensors
 
     def measured_flatten(bucket):
-        sizes.append(sum(g.numel() * g.element_size() for g in bucket))
+        sizes.append(sum(g.numel() for g in bucket))
         return flatten(bucket)
 
     def reduce(tensor, op, group):
@@ -217,8 +217,8 @@ def test_dense_grad_buckets_preserve_views_and_bound_coalescing(monkeypatch):
 
     monkeypatch.setattr(module, '_flatten_dense_tensors', measured_flatten)
     monkeypatch.setattr(module.torch.distributed, 'all_reduce', reduce)
-    module._allreduce_dense_grad_buckets(grads, dist.ReduceOp.SUM, 'tp-test', bucket_bytes=32)
-    assert max(sizes) <= max(32, max(g.numel() * g.element_size() for g in grads))
+    module._allreduce_dense_grad_buckets(grads, dist.ReduceOp.SUM, 'tp-test', bucket_size=8)
+    assert max(sizes) <= max(8, max(g.numel() for g in grads))
     assert len(sizes) > 1
     for got, before, pointer in zip(grads, originals, pointers):
         assert got.data_ptr() == pointer
@@ -226,6 +226,11 @@ def test_dense_grad_buckets_preserve_views_and_bound_coalescing(monkeypatch):
     sizes.clear()
     module._allreduce_dense_grad_buckets([], dist.ReduceOp.SUM, 'tp-test')
     assert sizes == []
+    # Without a bucket size, every gradient is reduced in one coalesced buffer, as before.
+    module._allreduce_dense_grad_buckets(grads, dist.ReduceOp.SUM, 'tp-test')
+    assert sizes == [sum(g.numel() for g in grads)]
+    for got, before in zip(grads, originals):
+        torch.testing.assert_close(got, before * 4, rtol=0, atol=0)
 
 
 def test_dense_grad_buckets_reduce_mixed_dtypes_in_the_promoted_dtype(monkeypatch):
@@ -241,7 +246,7 @@ def test_dense_grad_buckets_reduce_mixed_dtypes_in_the_promoted_dtype(monkeypatc
 
     monkeypatch.setattr(module.torch.distributed, 'all_reduce', reduce)
     # Each gradient fills its own bucket, so the BF16 one is reduced without the FP32 one.
-    module._allreduce_dense_grad_buckets(grads, dist.ReduceOp.SUM, 'tp-test', bucket_bytes=16)
+    module._allreduce_dense_grad_buckets(grads, dist.ReduceOp.SUM, 'tp-test', bucket_size=4)
     assert reduced_dtypes == [torch.float32, torch.float32]
     for grad, dtype in zip(grads, (torch.bfloat16, torch.float32)):
         assert grad.dtype == dtype

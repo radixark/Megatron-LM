@@ -373,12 +373,13 @@ def _update_router_expert_bias(
         expert_bias.copy_(updated_expert_bias)
 
 
-def _allreduce_dense_grad_buckets(grads, op, group, bucket_bytes=256 * 1024**2):
-    """Bound coalescing storage by a bucket or the largest individual gradient.
+def _allreduce_dense_grad_buckets(grads, op, group, bucket_size=None):
+    """All-reduce ``grads`` in place, at most ``bucket_size`` elements per collective.
 
-    Every bucket reduces in the dtype that one flatten of all ``grads`` would promote to, so
-    bucket boundaries do not change the reduction precision of mixed-dtype gradients. Promoting
-    a bucket keeps its converted copies alive next to the coalesced buffer, up to twice the bound.
+    ``None`` reduces every gradient in one coalesced buffer. Every bucket reduces in the dtype
+    that one flatten of all ``grads`` would promote to, so bucket boundaries do not change the
+    reduction precision of mixed-dtype gradients; a promoted bucket briefly keeps its unpromoted
+    flatten as well.
     """
     if not grads:
         return
@@ -387,19 +388,18 @@ def _allreduce_dense_grad_buckets(grads, op, group, bucket_bytes=256 * 1024**2):
     size = 0
 
     def reduce_bucket():
-        coalesced = _flatten_dense_tensors([grad.to(dtype) for grad in bucket])
+        coalesced = _flatten_dense_tensors(bucket).to(dtype)
         torch.distributed.all_reduce(coalesced, op=op, group=group)
         for buf, synced in zip(bucket, _unflatten_dense_tensors(coalesced, bucket)):
             buf.copy_(synced)
 
     for grad in grads:
-        nbytes = grad.numel() * dtype.itemsize
-        if bucket and size + nbytes > bucket_bytes:
+        if bucket and bucket_size is not None and size + grad.numel() > bucket_size:
             reduce_bucket()
             bucket = []
             size = 0
         bucket.append(grad)
-        size += nbytes
+        size += grad.numel()
     if bucket:
         reduce_bucket()
 
@@ -473,7 +473,9 @@ def _allreduce_non_tensor_model_parallel_grads(
         [torch.distributed.ReduceOp.SUM, torch.distributed.ReduceOp.AVG],
     ):
         if grads:
-            _allreduce_dense_grad_buckets(grads, all_reduce_op, tp_group)
+            _allreduce_dense_grad_buckets(
+                grads, all_reduce_op, tp_group, ddp_config.non_tensor_parallel_grad_bucket_size
+            )
             for param, buf in zip(params, grads):
                 grad_attr = _get_main_grad_attr(param)
                 orig_grad = getattr(param, grad_attr)
