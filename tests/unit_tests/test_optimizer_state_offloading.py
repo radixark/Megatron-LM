@@ -284,6 +284,43 @@ def test_training_args_accept_deprecated_dist_muon_offload(monkeypatch):
     assert not validated_args.use_distributed_optimizer
 
 
+@pytest.mark.parametrize("qk_clip", [False, True])
+def test_training_args_reject_qk_clip_with_chunked_muon_master_weights(monkeypatch, qk_clip):
+    """QK clip rescales CPU-resident chunked Muon masters after the step, so it is rejected."""
+
+    monkeypatch.setattr(sys, 'argv', ['test_optimizer_state_offloading.py'])
+    args = parse_args()
+    args.num_layers = 2
+    args.vocab_size = 256
+    args.hidden_size = 64
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 128
+    args.seq_length = 128
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.optimizer = 'muon'
+    args.use_distributed_optimizer = True
+    args.bf16 = True
+    args.clip_grad = 0.0
+    args.chunked_optimizer_state_offload = True
+    args.optimizer_state_offload_chunk_size_mb = 256
+    args.chunked_muon_master_weights = True
+    args.no_load_optim = True
+    args.no_save_optim = True
+    args.ckpt_format = 'torch_dist'
+    args.qk_clip = qk_clip
+    args.qk_clip_alpha = 0.5
+    args.qk_clip_threshold = 100.0
+
+    if qk_clip:
+        with pytest.raises(AssertionError, match="does not support --qk-clip"):
+            validate_args(args)
+    else:
+        assert validate_args(args).chunked_muon_master_weights
+
+
 @pytest.mark.parametrize(
     ("ckpt_format", "async_save", "no_load_optim"),
     [("torch", False, True), ("torch_dist", True, False)],

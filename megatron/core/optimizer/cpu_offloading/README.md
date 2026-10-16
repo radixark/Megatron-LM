@@ -29,8 +29,9 @@ distributed-checkpoint state initialization.
 
 A chunk size of `0` restores all selected tensor state for one update and therefore does not bound
 the temporary tensor-state peak; argument validation emits a warning for this setting. A positive
-size bounds that tensor-state window, but never the full selected master-weight window described
-above. The fraction is an approximate byte fraction because a parameter and all of its optimizer
+size bounds that tensor-state window, but not the full selected master-weight window described
+above; [Chunked Muon master weights](#chunked-muon-master-weights) is the BF16 Muon exception.
+The fraction is an approximate byte fraction because a parameter and all of its optimizer
 state are an atomic bundle. Partial selection prioritizes bundles that actually include a separate
 master before state-only bundles; precision-aware FusedAdam can own a separate master for native
 FP32 DistributedOptimizer shards too.
@@ -99,3 +100,23 @@ The deprecated `--offload-optimizer-states` argument remains as a parser compati
 Configuration validation emits a visible `FutureWarning`, enables the new mode, and consumes the
 legacy field so copying the normalized configuration does not warn again. Its default-equivalent
 settings are chunk size `0` and fraction `1.0`, with the restrictions above.
+
+### Chunked Muon master weights
+
+For BF16 Muon with `LayerWiseDistributedOptimizer`, `--chunked-muon-master-weights` also bounds the
+master window. The FP32 masters are created in pinned CPU memory and stay there: each update chunk
+moves its own masters and Muon state to the GPU, steps with the model's FP32 `main_grad` buffers,
+writes the BF16 model parameters and moves the chunk back before the next chunk starts. Chunks run
+one at a time with a host synchronization after each, so this mode trades update time for memory.
+
+```bash
+--chunked-optimizer-state-offload
+--optimizer-state-offload-fraction 1.0
+--optimizer-state-offload-chunk-size-mb 256
+--chunked-muon-master-weights
+--no-load-optim --no-save-optim
+```
+
+It requires a positive chunk size and rejects gradient clipping, grad scaling, FP8, overlapped
+parameter gather, optimizer checkpoint load and save, `--qk-clip` (which rescales masters after the
+step) and `--rl-offload-optimizer-during-inference`.
