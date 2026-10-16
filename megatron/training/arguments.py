@@ -2047,6 +2047,8 @@ def validate_args(args, defaults={}):
         assert not args.rl_offload_optimizer_during_inference, (
             '--chunked-muon-master-weights does not support --rl-offload-optimizer-during-inference'
         )
+        # clip_qk() rescales main_param after the step, when the masters are back on CPU.
+        assert not args.qk_clip, '--chunked-muon-master-weights does not support --qk-clip'
         assert not getattr(args, 'stream_optimizer_state_to_disk', False), (
             '--chunked-muon-master-weights currently requires CPU placement'
         )

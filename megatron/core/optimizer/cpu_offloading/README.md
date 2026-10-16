@@ -132,4 +132,5 @@ one at a time with a host synchronization after each, so this mode trades update
 ```
 
 It requires a positive chunk size and rejects gradient clipping, grad scaling, FP8, overlapped
-parameter gather, optimizer checkpoint load and save, and `--rl-offload-optimizer-during-inference`.
+parameter gather, optimizer checkpoint load and save, `--qk-clip` (which rescales masters after the
+step) and `--rl-offload-optimizer-during-inference`.
