@@ -2411,15 +2411,7 @@ def load_checkpoint(
                 and not is_torch_dist
                 and ckpt_format not in ["torch_dcp", "fsdp_dtensor"]
             ):
-                # NOTE: this is a manual read of the tracker file.
-                # This code should not be reached when reading from a non_persistent checkpoint
-                assert not is_torch_dist
-                tracker_filename = get_checkpoint_tracker_filename(load_dir)
-                iteration, release = read_metadata(tracker_filename)
-                model_checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
-                optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(
-                    model_checkpoint_name
-                )
+                optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(checkpoint_name)
                 optimizer.load_parameter_state(
                     optim_checkpoint_name,
                     update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,

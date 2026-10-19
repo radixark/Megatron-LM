@@ -23,7 +23,9 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    get_checkpoint_name,
     get_checkpoint_tracker_filename,
+    get_distributed_optimizer_checkpoint_name,
     get_load_checkpoint_path_by_args,
     load_checkpoint,
     read_metadata,
@@ -413,8 +415,9 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
+@pytest.mark.parametrize("ckpt_step", [None, 0, 123])
 def test_load_checkpoint(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, ckpt_step
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
@@ -431,7 +434,7 @@ def test_load_checkpoint(
         set_args(args)
 
         # Create and save a checkpoint first.
-        iteration = 123
+        iteration = ckpt_step if ckpt_step is not None else 123
         config = TransformerConfig(num_layers=1, kv_channels=1)
         model = MockModel(config)
 
@@ -443,14 +446,27 @@ def test_load_checkpoint(
             iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
 
+        args.ckpt_step = ckpt_step
+        if ckpt_step is not None:
+            if torch.distributed.get_rank() == 0:
+                with open(get_checkpoint_tracker_filename(ckpt_dir), "w") as f:
+                    f.write("456")
+            torch.distributed.barrier()
+
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
         new_optimizer = MockState({"optimizer": "dummy1"})
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
 
         # Load checkpoint
-        loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+        with mock.patch.object(new_optimizer, "load_parameter_state") as load_parameter_state:
+            loaded_iter, loaded_flops = load_checkpoint(
+                [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+            )
+
+        load_parameter_state.assert_called_once_with(
+            get_distributed_optimizer_checkpoint_name(get_checkpoint_name(ckpt_dir, iteration)),
+            update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,
         )
 
         assert loaded_iter == iteration
