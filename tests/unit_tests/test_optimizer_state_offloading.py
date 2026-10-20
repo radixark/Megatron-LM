@@ -22,6 +22,7 @@ from megatron.core.optimizer import (
 )
 from megatron.core.optimizer.cpu_offloading.chunked_optimizer_state_offload import (
     ChunkedOptimizerStateOffloader,
+    OptimizerStateChunk,
 )
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -697,6 +698,49 @@ def test_state_staging_views_are_aligned_and_non_overlapping():
 
     byte_ranges.sort()
     assert all(left[1] <= right[0] for left, right in zip(byte_ranges, byte_ranges[1:]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_mixed_dtype_chunks_reuse_one_staging_buffer_per_slot():
+    """FP32 chunks followed by BF16 chunks must not leave the FP32 storage allocated."""
+
+    params = [nn.Parameter(torch.zeros(1024, device="cuda")) for _ in range(4)]
+    optimizer = torch.optim.SGD(params, lr=0.1)
+    manager = ChunkedOptimizerStateOffloader(
+        optimizer=optimizer,
+        master_params=[],
+        chunk_size_bytes=0,
+        offload_fraction=1.0,
+        state_dtypes=(torch.float32,),
+    )
+    state_dtypes = (
+        {"exp_avg": torch.float32, "master_param": torch.float32},
+        {"exp_avg": torch.float32, "master_param": torch.float32},
+        {"exp_avg": torch.bfloat16, "exp_avg_sq": torch.bfloat16, "master_param": torch.int16},
+        {"exp_avg": torch.bfloat16, "exp_avg_sq": torch.bfloat16, "master_param": torch.int16},
+    )
+    for param, dtypes in zip(params, state_dtypes):
+        for key, dtype in dtypes.items():
+            cpu_state = torch.empty(param.shape, dtype=dtype, device="cpu", pin_memory=True)
+            optimizer.state[param][key] = cpu_state
+            manager._cpu_state[param][key] = cpu_state
+
+    fp32_storages = []
+    for param in params[:2]:
+        staging_views = manager._state_staging_views(OptimizerStateChunk((param,)))
+        fp32_storages.append({view.untyped_storage().data_ptr() for *_, view in staging_views})
+    for param, fp32_storage in zip(params[2:], fp32_storages):
+        staging_views = manager._state_staging_views(OptimizerStateChunk((param,)))
+        assert {view.untyped_storage().data_ptr() for *_, view in staging_views} == fp32_storage
+
+    largest_chunk_bytes = 2 * params[0].numel() * 4
+    assert all(len(slot.buffers) == 1 for slot in manager._state_staging_slots)
+    staging_bytes = sum(
+        buffer.numel() * buffer.element_size()
+        for slot in manager._state_staging_slots
+        for buffer in slot.buffers.values()
+    )
+    assert staging_bytes == 2 * largest_chunk_bytes
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")

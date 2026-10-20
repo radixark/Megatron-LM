@@ -55,8 +55,10 @@ next chunk, optimizer compute for the current chunk, and D2H for the previous ch
 The normal tensor-state staging bound is therefore about
 `2 * optimizer_state_offload_chunk_size_mb` per manager that is actively stepping, not one
 chunk; a single parameter's atomic tensor-state payload can exceed the target and produces a
-runtime warning. LayerWise has at most one non-empty Muon child, so its internal state manager uses
-the same two-slot bound. In the outer split Muon + Adam chain, however, a sibling
+runtime warning. Each window is one byte buffer per device shared by every state dtype, so
+chunks that mix FP32 and BF16 state or masters reuse it rather than adding to the bound.
+LayerWise has at most one non-empty Muon child, so its internal state manager uses the same
+two-slot bound. In the outer split Muon + Adam chain, however, a sibling
 `DistributedOptimizer` can retain its first prefetched chunk while the LayerWise manager owns two
 slots. The aggregate across those two managers can therefore still approach
 `3 * optimizer_state_offload_chunk_size_mb`; the 256 MiB example can hold about 768 MiB during
