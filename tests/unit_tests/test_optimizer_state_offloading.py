@@ -908,10 +908,10 @@ def test_mixed_dtype_chunks_reuse_one_staging_buffer_per_slot():
         assert {view.untyped_storage().data_ptr() for *_, view in staging_views} == fp32_storage
 
     largest_chunk_bytes = 2 * params[0].numel() * 4
-    assert all(len(slot.buffers) == 1 for slot in manager._state_staging_slots)
+    assert all(len(slot.buffers) == 1 for slot in manager.staging_pool.slots)
     staging_bytes = sum(
         buffer.numel() * buffer.element_size()
-        for slot in manager._state_staging_slots
+        for slot in manager.staging_pool.slots
         for buffer in slot.buffers.values()
     )
     assert staging_bytes == 2 * largest_chunk_bytes
@@ -1037,12 +1037,15 @@ def test_chained_managers_hand_staging_windows_over_while_d2h_drains():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_chained_manager_with_other_state_dtype_frees_predecessor_windows():
-    """A chain child whose state dtype differs must not keep its predecessor's windows alive
-    through its whole step just because the chain holds the shared pool."""
+def test_chained_manager_with_other_state_dtype_reuses_predecessor_windows():
+    """A chain child whose state dtype differs must reuse its predecessor's windows rather
+    than allocate its own next to them while the chain holds the shared pool."""
 
     def make_manager(dtype, streams=()):
-        params = [nn.Parameter(torch.randn(256 * 1024, device="cuda", dtype=dtype))]
+        # two one-chunk parameters, so each child fills both windows
+        params = [
+            nn.Parameter(torch.randn(256 * 1024, device="cuda", dtype=dtype)) for _ in range(2)
+        ]
         optimizer = torch.optim.Adam(params, lr=0.1)
         manager = ChunkedOptimizerStateOffloader(
             optimizer=optimizer,
@@ -1059,8 +1062,12 @@ def test_chained_manager_with_other_state_dtype_frees_predecessor_windows():
     bf16_manager.use_staging_pool(fp32_manager.staging_pool)
     pool = fp32_manager.staging_pool
 
-    def held_dtypes():
-        return {dtype for slot in pool.slots for _, dtype in slot.buffers}
+    def held_storages():
+        return [
+            (device, buffer.data_ptr())
+            for slot in pool.slots
+            for device, buffer in slot.buffers.items()
+        ]
 
     def step_chain():
         for params in (fp32_params, bf16_params):
@@ -1068,12 +1075,14 @@ def test_chained_manager_with_other_state_dtype_frees_predecessor_windows():
                 param.grad = torch.ones_like(param)
         with pool.hold():
             fp32_manager.step()
-            after_first = held_dtypes()
+            after_first = held_storages()
             bf16_manager.step()
-            return after_first, held_dtypes()
+            return after_first, held_storages()
 
     step_chain()  # The first update creates Adam state lazily, outside the staging windows.
-    assert step_chain() == ({torch.float32}, {torch.bfloat16})
+    after_first, after_second = step_chain()
+    assert len(after_first) == len(pool.slots)
+    assert after_second == after_first
     assert not pool.in_use
     for manager in (fp32_manager, bf16_manager):
         manager.synchronize_for_checkpoint()
