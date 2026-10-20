@@ -261,8 +261,8 @@ def get_load_checkpoint_path_by_args(args, load_arg="load"):
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
-    if getattr(args, "ckpt_step", None):
-        iteration = args.ckpt_step
+    if getattr(args, "ckpt_step", None) is not None:
+        iteration, release = args.ckpt_step, False
 
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
 
@@ -1666,8 +1666,10 @@ def _load_base_checkpoint(
         if args.non_persistent_global_ckpt_dir or load_dir is None
         else os.path.join(load_dir, _NON_PERSISTENT_CKPT_SUBDIR)
     )
-    non_persistent_iteration = _get_non_persistent_iteration(
-        non_persistent_global_dir, args, checkpointing_context
+    non_persistent_iteration = (
+        _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing_context)
+        if getattr(args, "ckpt_step", None) is None
+        else -1
     )
     iteration, release = -1, False
     tracker_filename = 'because load directory is not defined'
@@ -1677,8 +1679,8 @@ def _load_base_checkpoint(
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
-    if getattr(args, "ckpt_step", None):
-        iteration = args.ckpt_step
+    if getattr(args, "ckpt_step", None) is not None:
+        iteration, release = args.ckpt_step, False
 
     # Record the iteration loaded (stored separately from args to avoid
     # polluting checkpoints, since args is saved in checkpoints).
@@ -2048,7 +2050,11 @@ def load_checkpoint(
 
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
-    if pretrained_dir is not None and not checkpoint_exists(load_dir):
+    if (
+        pretrained_dir is not None
+        and getattr(args, "ckpt_step", None) is None
+        and not checkpoint_exists(load_dir)
+    ):
         print_rank_0(
             f'Checkpoint file not found in load directory {load_dir} attempting to finetune with checkpoint in {pretrained_dir}'
         )
@@ -2405,15 +2411,7 @@ def load_checkpoint(
                 and not is_torch_dist
                 and ckpt_format not in ["torch_dcp", "fsdp_dtensor"]
             ):
-                # NOTE: this is a manual read of the tracker file.
-                # This code should not be reached when reading from a non_persistent checkpoint
-                assert not is_torch_dist
-                tracker_filename = get_checkpoint_tracker_filename(load_dir)
-                iteration, release = read_metadata(tracker_filename)
-                model_checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
-                optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(
-                    model_checkpoint_name
-                )
+                optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(checkpoint_name)
                 optimizer.load_parameter_state(
                     optim_checkpoint_name,
                     update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,

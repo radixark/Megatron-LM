@@ -23,7 +23,10 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    get_checkpoint_name,
     get_checkpoint_tracker_filename,
+    get_distributed_optimizer_checkpoint_name,
+    get_load_checkpoint_path_by_args,
     load_checkpoint,
     read_metadata,
     save_checkpoint,
@@ -231,6 +234,83 @@ def create_ckpt_load_args(create_args):
     yield args
 
 
+@pytest.mark.parametrize(
+    "tracker, ckpt_step, directory",
+    [
+        ("123", 0, "iter_0000000"),
+        ("release", 7, "iter_0000007"),
+        (None, 7, "iter_0000007"),
+        ("123", None, "iter_0000123"),
+        ("release", None, "release"),
+    ],
+)
+def test_checkpoint_path_selection(tmp_path, tracker, ckpt_step, directory):
+    if tracker is not None:
+        (tmp_path / "latest_checkpointed_iteration.txt").write_text(tracker)
+    args = SimpleNamespace(load=str(tmp_path), ckpt_step=ckpt_step)
+
+    assert get_load_checkpoint_path_by_args(args) == str(tmp_path / directory)
+
+
+@pytest.mark.parametrize("tracker, ckpt_step", [("123", 0), ("release", 7), (None, 7)])
+def test_explicit_checkpoint_selection(tmp_path, create_args, tracker, ckpt_step):
+    if tracker is not None:
+        (tmp_path / "latest_checkpointed_iteration.txt").write_text(tracker)
+    checkpoint_file = tmp_path / f"iter_{ckpt_step:07d}" / "mp_rank_00" / "model_optim_rng.pt"
+    checkpoint_file.parent.mkdir(parents=True)
+    torch.save({"iteration": ckpt_step, "weight": torch.tensor([ckpt_step])}, checkpoint_file)
+    create_args.ckpt_step = ckpt_step
+
+    with mock.patch(
+        "megatron.training.checkpointing._get_non_persistent_iteration", return_value=200
+    ) as find_non_persistent:
+        state, path, release, ckpt_type = _load_base_checkpoint(tmp_path, create_args, rank0=True)
+
+    assert state["iteration"] == ckpt_step
+    assert torch.equal(state["weight"], torch.tensor([ckpt_step]))
+    assert path == str(checkpoint_file)
+    assert not release
+    assert ckpt_type == CheckpointType.LEGACY
+    find_non_persistent.assert_not_called()
+
+
+def test_automatic_checkpoint_selection_keeps_newer_non_persistent(tmp_path, create_args):
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("123")
+    with (
+        mock.patch(
+            "megatron.training.checkpointing._get_non_persistent_iteration", return_value=200
+        ),
+        mock.patch("megatron.training.checkpointing._load_non_persistent_base_checkpoint") as load,
+    ):
+        result = _load_base_checkpoint(tmp_path, create_args, rank0=True)
+
+    assert result is load.return_value
+    load.assert_called_once()
+    assert load.call_args.args[4] == 200
+
+
+@pytest.mark.parametrize("ckpt_step", [None, 0, 7])
+def test_explicit_checkpoint_selection_preserves_load_source(tmp_path, create_args, ckpt_step):
+    create_args.load = str(tmp_path / "run")
+    create_args.pretrained_checkpoint = str(tmp_path / "pretrained")
+    create_args.ckpt_step = ckpt_step
+    create_args.ckpt_format = "torch_dist"
+    (tmp_path / "pretrained").mkdir()
+    (tmp_path / "pretrained" / "latest_checkpointed_iteration.txt").write_text("123")
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing._load_base_checkpoint", side_effect=FileNotFoundError
+        ) as load,
+        pytest.raises(FileNotFoundError),
+    ):
+        load_checkpoint([], None, None)
+
+    expected = create_args.pretrained_checkpoint if ckpt_step is None else create_args.load
+    assert load.call_args.args[0] == expected
+    assert create_args.finetune == (ckpt_step is None)
+
+
 @pytest.fixture
 def init_model_parallel():
     """Init torch distributed."""
@@ -335,8 +415,9 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
+@pytest.mark.parametrize("ckpt_step", [None, 0, 123])
 def test_load_checkpoint(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, ckpt_step
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
@@ -353,7 +434,7 @@ def test_load_checkpoint(
         set_args(args)
 
         # Create and save a checkpoint first.
-        iteration = 123
+        iteration = ckpt_step if ckpt_step is not None else 123
         config = TransformerConfig(num_layers=1, kv_channels=1)
         model = MockModel(config)
 
@@ -365,14 +446,27 @@ def test_load_checkpoint(
             iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
 
+        args.ckpt_step = ckpt_step
+        if ckpt_step is not None:
+            if torch.distributed.get_rank() == 0:
+                with open(get_checkpoint_tracker_filename(ckpt_dir), "w") as f:
+                    f.write("456")
+            torch.distributed.barrier()
+
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
         new_optimizer = MockState({"optimizer": "dummy1"})
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
 
         # Load checkpoint
-        loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+        with mock.patch.object(new_optimizer, "load_parameter_state") as load_parameter_state:
+            loaded_iter, loaded_flops = load_checkpoint(
+                [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+            )
+
+        load_parameter_state.assert_called_once_with(
+            get_distributed_optimizer_checkpoint_name(get_checkpoint_name(ckpt_dir, iteration)),
+            update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,
         )
 
         assert loaded_iter == iteration
