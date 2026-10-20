@@ -957,6 +957,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Callable,
+        *,
+        main_params_on_cpu: bool = False,
     ):
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
@@ -984,10 +986,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
-                            # Seed the fp32 master from the high-precision pre-quantization init
-                            # for fp8 params (not the lossy fp8 dequant), matching DistOpt so
-                            # fp8_param_gather ON/OFF hold an identical master at iter 0.
-                            if hasattr(param, 'get_high_precision_init_val'):
+                            if main_params_on_cpu:
+                                if param.dtype != torch.bfloat16 or is_float8tensor(param):
+                                    raise ValueError("CPU masters require ordinary BF16 parameters")
+                                main_param = torch.empty_like(
+                                    param, device="cpu", dtype=torch.float32, pin_memory=True
+                                )
+                                main_param.copy_(param.detach())
+                            elif hasattr(param, 'get_high_precision_init_val'):
+                                # Seed the fp32 master from the high-precision pre-quantization
+                                # init for fp8 params (not the lossy fp8 dequant), matching DistOpt
+                                # so fp8_param_gather ON/OFF hold an identical master at iter 0.
                                 main_param = (
                                     param.get_high_precision_init_val()
                                     .detach()
