@@ -97,6 +97,7 @@ def test_allgather_params_accepts_empty_first_shard(monkeypatch):
     optimizer.dp_cp_params_list = [[], [param]]
     optimizer.expt_dp_params_list = None
     monkeypatch.setattr(layer_wise_optimizer_module, "get_pg_rank", lambda _: 0)
+    monkeypatch.setattr(layer_wise_optimizer_module, "get_pg_size", lambda _: 2)
 
     def fake_all_gather(output_list, src, group):
         assert src.numel() == 0
@@ -377,7 +378,9 @@ def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeyp
         use_layer_wise_param_layout=False,
     )
 
-    optimizer = LayerWiseDistributedOptimizer([object()], config)
+    pg_collection = SimpleNamespace(tp=object())
+
+    optimizer = LayerWiseDistributedOptimizer([object()], config, pg_collection)
 
     assert optimizer._managed_optimizer_state_offload_child_indices() == ()
     LayerWiseDistributedOptimizer._before_child_step(optimizer, 0)
