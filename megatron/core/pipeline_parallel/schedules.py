@@ -778,13 +778,11 @@ def forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-                    # Release the autograd graph head before the next forward_step.
-                    # Without this, the previous microbatch's output_tensor stays
-                    # live until the next iteration rebinds the variable, deferring
-                    # autograd-node teardown onto the next forward's dispatch path
-                    # and triggering PyTorch's "AccumulateGrad node's stream does
-                    # not match" warning. See issue #4124.
-                    del output_tensor
+                # Release before the next forward_step, including in forward-only
+                # mode: rebinding keeps the old output alive while evaluating the
+                # next forward. In training this also tears down the autograd graph
+                # before the next forward's dispatch path (see issue #4124).
+                del output_tensor
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
@@ -807,7 +805,7 @@ def forward_backward_no_pipelining(
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-            del output_tensor
+        del output_tensor
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -2510,6 +2508,9 @@ def forward_backward_pipelining_without_interleaving(
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+        else:
+            # send_forward has completed; no backward pass needs this output.
+            output_tensor = None
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -2552,6 +2553,8 @@ def forward_backward_pipelining_without_interleaving(
 
         if forward_only:
             p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
+            # Release before receiving or computing the next microbatch.
+            output_tensor = None
             if not last_iteration:
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
