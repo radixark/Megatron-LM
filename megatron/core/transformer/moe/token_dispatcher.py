@@ -354,6 +354,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                 self.local_map,
                 num_out_tokens=tokens_per_expert.sum().item(),
                 fused=self.config.moe_permute_fusion,
+                accumulate_in_fp32=self.config.moe_permute_accumulation_in_fp32,
             )
         )
 
@@ -378,6 +379,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.local_map,
             fused=self.config.moe_permute_fusion,
+            accumulate_in_fp32=self.config.moe_permute_accumulation_in_fp32,
         )
         return unpermuted_local_hidden
 
@@ -732,6 +734,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+            accumulate_in_fp32=self.config.moe_permute_accumulation_in_fp32,
         )
         return permutated_local_input_tokens, permuted_probs
 
@@ -957,6 +960,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             probs=combine_probs,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+            accumulate_in_fp32=self.config.moe_permute_accumulation_in_fp32,
         )
         # The combine was the last reader of this forward's routing tensors.
         self._release_routing_tensors()
@@ -1559,6 +1563,7 @@ class _DeepepManager(_DispatchManager):
             fused=self.permute_fusion,
             tokens_per_expert=self.tokens_per_expert,
             align_size=get_align_size_for_quantization(self.config),
+            accumulate_in_fp32=self.config.moe_permute_accumulation_in_fp32,
         )
         if self.router_dtype == "fp64":
             permuted_probs = permuted_probs.to(torch.float64)
@@ -1572,6 +1577,7 @@ class _DeepepManager(_DispatchManager):
             routing_map=self.dispatched_routing_map,
             fused=self.permute_fusion,
             pad_offsets=self.pad_offsets,
+            accumulate_in_fp32=self.config.moe_permute_accumulation_in_fp32,
         )
         return hidden_states
 

@@ -316,6 +316,7 @@ def permute(
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     align_size: int = 0,
+    accumulate_in_fp32: bool = False,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -434,8 +435,13 @@ def permute(
         if probs is not None:
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
+    input_dtype = tokens.dtype
+    # index_select backward sums the expert contributions for each token.
+    if accumulate_in_fp32 and tokens.requires_grad:
+        if input_dtype in (torch.float16, torch.bfloat16):
+            tokens = tokens.float()
     # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    permuted_input = tokens.index_select(0, sorted_indices).to(input_dtype)
 
     return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
@@ -449,6 +455,7 @@ def unpermute(
     fused: bool = False,
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
+    accumulate_in_fp32: bool = False,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -494,6 +501,9 @@ def unpermute(
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
+    # BF16/FP16 scatter accumulation amplifies the nondeterministic atomic-add order.
+    if accumulate_in_fp32 and input_dtype in (torch.float16, torch.bfloat16):
+        permuted_tokens = permuted_tokens.float()
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
