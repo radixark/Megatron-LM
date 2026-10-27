@@ -714,20 +714,17 @@ class AbsorbedMLASelfAttention(Attention):
 
         return q_absorbed, kv_compressed, q_compressed
 
-    def _get_absorbed_projection(self):
-        # Adapter wrappers may implement token-dependent projections instead of one weight.
-        if self._uses_combined_kv_up_projection:
-            return getattr(self.linear_kv_up_proj, "forward_absorbed", None)
+    def _get_absorbed_kv_up_adapter(self):
+        # Adapter wrappers apply token-dependent K/V projections instead of one folded weight.
+        if self._uses_combined_kv_up_projection and hasattr(self.linear_kv_up_proj, "absorb_query"):
+            return self.linear_kv_up_proj
         return None
 
     def _absorb_query(self, query: torch.Tensor) -> torch.Tensor:
-        projection = self._get_absorbed_projection()
-        if projection is not None:
-            return projection(
-                query,
-                qk_head_dim=self.config.qk_head_dim,
-                v_head_dim=self.config.v_head_dim,
-                transpose=True,
+        adapter = self._get_absorbed_kv_up_adapter()
+        if adapter is not None:
+            return adapter.absorb_query(
+                query, qk_head_dim=self.config.qk_head_dim, v_head_dim=self.config.v_head_dim
             )
         k_up_weight, _ = self._get_kv_up_weights()
         return torch.einsum("...nd,ndk->...nk", query, k_up_weight)
@@ -951,8 +948,8 @@ class AbsorbedMLASelfAttention(Attention):
         assert q_absorbed.is_contiguous()
         assert q_compressed.is_contiguous()
         assert kv_compressed.is_contiguous()
-        projection = self._get_absorbed_projection()
-        v_up_weight = self._get_v_up_weight() if projection is None else None
+        adapter = self._get_absorbed_kv_up_adapter()
+        v_up_weight = self._get_v_up_weight() if adapter is None else None
 
         # ==================================
         # Core attention computation
@@ -965,7 +962,7 @@ class AbsorbedMLASelfAttention(Attention):
                 q_compressed,
                 attention_mask,
                 v_up_weight,
-                return_latent=projection is not None,
+                return_latent=adapter is not None,
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
             )
@@ -978,7 +975,7 @@ class AbsorbedMLASelfAttention(Attention):
                 x=hidden_states,
                 qr=q_compressed,
                 up_v_weight=v_up_weight,
-                **({"return_latent": True} if projection is not None else {}),
+                **({"return_latent": True} if adapter is not None else {}),
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
                 attn_mask_type=self.attn_mask_type,
@@ -987,18 +984,17 @@ class AbsorbedMLASelfAttention(Attention):
         # ==================================
         # Apply V up projection
         # ==================================
-        if projection is not None:
+        if adapter is not None:
             core_attn_out = core_attn_out.view(
                 *core_attn_out.shape[:-1],
                 self.num_attention_heads_per_partition,
                 self.config.kv_lora_rank,
             )
             core_attn_out = (
-                projection(
+                adapter.expand_value(
                     core_attn_out,
                     qk_head_dim=self.config.qk_head_dim,
                     v_head_dim=self.config.v_head_dim,
-                    transpose=False,
                 )
                 .flatten(-2)
                 .contiguous()
