@@ -9,6 +9,7 @@ from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import (
     MoEModelTestContainer,
     permute_fusion_params,
+    record_permute_accumulation,
 )
 
 
@@ -52,6 +53,26 @@ class TestAlltoAllDispatcher:
             moe_permute_fusion=permute_fusion,
         )
         container.dispatcher_dropless_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (1, 1)])
+    def test_permute_accumulation_in_fp32(self, tp_size, ep_size, monkeypatch):
+        calls = record_permute_accumulation(monkeypatch)
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_permute_accumulation_in_fp32=True,
+            test_dtype=torch.bfloat16,
+        )
+        container.dispatcher_dropless_test()
+        assert calls and all(calls), calls
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

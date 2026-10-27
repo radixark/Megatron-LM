@@ -970,6 +970,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_combine_in_fp32: bool = False
     """Apply routing probs and accumulate expert outputs in fp32 with one final round."""
 
+    moe_permute_accumulation_in_fp32: bool = False
+    """Accumulate the unfused unpermute scatter-add and the permute backward in fp32 with one
+    final round, so the sums do not depend on the atomic-add order."""
+
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
     The routing decision is based on the sum of the routing scores and the expert bias.
@@ -3727,6 +3731,15 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.moe_router_dtype == 'fp32'
             ), "moe_combine_in_fp32 needs --moe-router-dtype fp32 (probs reach combine un-rounded)"
+        if self.moe_permute_accumulation_in_fp32:
+            assert not self.moe_permute_fusion, (
+                "moe_permute_accumulation_in_fp32 applies to the unfused permute; "
+                "disable --moe-permute-fusion"
+            )
+            assert self.moe_token_dispatcher_type != "flex" or self.moe_flex_dispatcher_backend in (
+                "deepep",
+                "deepepv2",
+            ), "moe_permute_accumulation_in_fp32: hybridep and ncclep permute in their own kernels"
 
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (

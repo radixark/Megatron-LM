@@ -170,6 +170,7 @@ class MoEModelTestContainer:
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
+            moe_permute_accumulation_in_fp32=kwargs.get("moe_permute_accumulation_in_fp32", False),
         )
 
         # init moe layer
@@ -429,6 +430,22 @@ class MoEModelTestContainer:
         Utils.destroy_model_parallel()
 
 
+def record_permute_accumulation(monkeypatch):
+    """Record the accumulate_in_fp32 argument of every dispatcher permute/unpermute call."""
+    from megatron.core.transformer.moe import token_dispatcher
+
+    calls = []
+    for name in ("permute", "unpermute"):
+        original = getattr(token_dispatcher, name)
+
+        def recorded(*args, _original=original, **kwargs):
+            calls.append(kwargs.get("accumulate_in_fp32", False))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(token_dispatcher, name, recorded)
+    return calls
+
+
 permute_fusion_params = [False]
 if is_te_min_version("2.1.0"):
     permute_fusion_params.append(True)
@@ -458,6 +475,25 @@ class TestAllgatherDispatcher:
         )
 
         container.dispatcher_dropless_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (1, 1)])
+    def test_permute_accumulation_in_fp32(self, tp_size, ep_size, monkeypatch):
+        calls = record_permute_accumulation(monkeypatch)
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="allgather",
+            moe_permute_accumulation_in_fp32=True,
+            test_dtype=torch.bfloat16,
+        )
+        container.dispatcher_dropless_test()
+        assert calls and all(calls), calls
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
