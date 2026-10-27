@@ -134,6 +134,7 @@ def _run_sparse_attention(
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
+    return_latent: bool = False,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
     if absorbed_mla:
@@ -142,7 +143,7 @@ def _run_sparse_attention(
             raise RuntimeError(
                 "Invalid kv_lora_rank for absorbed-MLA DSAttention sparse attention."
             )
-        if up_v_weight is None:
+        if up_v_weight is None and not return_latent:
             raise RuntimeError(
                 "Absorbed DSAttention requires up_v_weight for latent-to-value projection."
             )
@@ -177,7 +178,8 @@ def _run_sparse_attention(
                 key_positions=key_positions,
             )
         assert output is not None
-        output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
+        if not return_latent:
+            output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
         return output
 
@@ -1867,6 +1869,7 @@ class DSAttention(MegatronModule):
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
         up_v_weight: Optional[torch.Tensor] = None,
+        return_latent: bool = False,
     ):
         """
         Forward pass for Sparse Attention.
@@ -1882,6 +1885,7 @@ class DSAttention(MegatronModule):
             attn_mask_type: Type of attention mask.
             attention_bias: Optional attention bias.
             packed_seq_params: Packed sequence parameters.
+            return_latent: Leave absorbed V expansion to the calling attention module.
 
         Returns:
             output: Output tensor [sq, b, hidden_size]
@@ -1914,9 +1918,9 @@ class DSAttention(MegatronModule):
                 f"query_hdim={query.size(-1)}, key_hdim={key.size(-1)}, key_heads={key.size(2)}, "
                 f"expected_absorbed_dim={expected_absorbed_dim}"
             )
-        if up_v_weight is not None and not absorbed_mla:
+        if (up_v_weight is not None or return_latent) and not absorbed_mla:
             raise RuntimeError(
-                "DSAttention received up_v_weight but absorbed layout was not detected. "
+                "DSAttention requested absorbed V projection but absorbed layout was not detected. "
                 f"query_hdim={query.size(-1)}, key_hdim={key.size(-1)}, key_heads={key.size(2)}, "
                 f"expected_absorbed_dim={expected_absorbed_dim}"
             )
@@ -2266,7 +2270,7 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        if use_fused_kernels and not self.index_share and not return_latent:
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2466,6 +2470,7 @@ class DSAttention(MegatronModule):
         # Run sparse attention kernel
         # ===================================
         output = _run_sparse_attention(
+            return_latent=return_latent,
             absorbed_mla=absorbed_mla,
             query=query,
             key=key,
