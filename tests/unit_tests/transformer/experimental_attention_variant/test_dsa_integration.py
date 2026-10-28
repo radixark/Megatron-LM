@@ -347,6 +347,7 @@ def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group():
         pg_collection=pg_collection,
         get_query_key_value_tensors=get_query_key_value_tensors,
         _get_v_up_weight=lambda: v_up_weight,
+        _get_absorbed_kv_up_adapter=lambda: None,
         checkpoint_core_attention=False,
         core_attention=CoreAttention(),
         attn_mask_type=AttnMaskType.causal,

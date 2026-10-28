@@ -595,8 +595,6 @@ class AbsorbedMLASelfAttention(Attention):
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
-            k_up_weight, _ = self._get_kv_up_weights()
-
             if use_fused_rope:
                 # q_no_pe: [num_tokens, n, qk_head_dim]
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
@@ -606,7 +604,7 @@ class AbsorbedMLASelfAttention(Attention):
 
                 # Absorb k_up_weight into q_no_pe
                 # q_absorbed: [num_tokens, n, kv_lora_rank]
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
+                q_absorbed = self._absorb_query(q_no_pe)
                 assert q_absorbed.ndim == q.ndim
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
@@ -657,7 +655,7 @@ class AbsorbedMLASelfAttention(Attention):
 
                 # Absorb k_up_weight into q_no_pe
                 # q_absorbed: [num_tokens, n, kv_lora_rank]
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
+                q_absorbed = self._absorb_query(q_no_pe)
                 q_absorbed = q_absorbed.contiguous()
                 assert q_absorbed.ndim == q.ndim
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
@@ -715,6 +713,21 @@ class AbsorbedMLASelfAttention(Attention):
             )
 
         return q_absorbed, kv_compressed, q_compressed
+
+    def _get_absorbed_kv_up_adapter(self):
+        # Adapter wrappers apply token-dependent K/V projections instead of one folded weight.
+        if self._uses_combined_kv_up_projection and hasattr(self.linear_kv_up_proj, "absorb_query"):
+            return self.linear_kv_up_proj
+        return None
+
+    def _absorb_query(self, query: torch.Tensor) -> torch.Tensor:
+        adapter = self._get_absorbed_kv_up_adapter()
+        if adapter is not None:
+            return adapter.absorb_query(
+                query, qk_head_dim=self.config.qk_head_dim, v_head_dim=self.config.v_head_dim
+            )
+        k_up_weight, _ = self._get_kv_up_weights()
+        return torch.einsum("...nd,ndk->...nk", query, k_up_weight)
 
     def _get_v_up_weight(self) -> torch.Tensor:
         """Return V up-projection weight in per-head layout."""
@@ -827,6 +840,7 @@ class AbsorbedMLASelfAttention(Attention):
         q_compressed,
         attention_mask,
         up_v_weight,
+        return_latent=False,
         position_ids=None,
         attn_mask_type=None,
         packed_seq_params=None,
@@ -850,6 +864,7 @@ class AbsorbedMLASelfAttention(Attention):
                 x=hidden_states,
                 qr=q_compressed,
                 up_v_weight=up_v_weight,
+                **({"return_latent": True} if return_latent else {}),
                 position_ids=position_ids,
                 attn_mask_type=attn_mask_type,
                 packed_seq_params=packed_seq_params,
@@ -933,7 +948,8 @@ class AbsorbedMLASelfAttention(Attention):
         assert q_absorbed.is_contiguous()
         assert q_compressed.is_contiguous()
         assert kv_compressed.is_contiguous()
-        v_up_weight = self._get_v_up_weight()
+        adapter = self._get_absorbed_kv_up_adapter()
+        v_up_weight = self._get_v_up_weight() if adapter is None else None
 
         # ==================================
         # Core attention computation
@@ -946,6 +962,7 @@ class AbsorbedMLASelfAttention(Attention):
                 q_compressed,
                 attention_mask,
                 v_up_weight,
+                return_latent=adapter is not None,
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
             )
@@ -958,6 +975,7 @@ class AbsorbedMLASelfAttention(Attention):
                 x=hidden_states,
                 qr=q_compressed,
                 up_v_weight=v_up_weight,
+                **({"return_latent": True} if adapter is not None else {}),
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
                 attn_mask_type=self.attn_mask_type,
@@ -966,17 +984,33 @@ class AbsorbedMLASelfAttention(Attention):
         # ==================================
         # Apply V up projection
         # ==================================
-        core_consumed_v_up_projection = getattr(
-            self.core_attention, "consumes_absorbed_v_up_projection", False
-        )
-        core_attn_out = _apply_absorbed_v_up_projection(
-            core_attn_out,
-            v_up_weight,
-            self.num_attention_heads_per_partition,
-            self.config.kv_lora_rank,
-            self.config.v_head_dim,
-            core_consumed_v_up_projection,
-        )
+        if adapter is not None:
+            core_attn_out = core_attn_out.view(
+                *core_attn_out.shape[:-1],
+                self.num_attention_heads_per_partition,
+                self.config.kv_lora_rank,
+            )
+            core_attn_out = (
+                adapter.expand_value(
+                    core_attn_out,
+                    qk_head_dim=self.config.qk_head_dim,
+                    v_head_dim=self.config.v_head_dim,
+                )
+                .flatten(-2)
+                .contiguous()
+            )
+        else:
+            core_consumed_v_up_projection = getattr(
+                self.core_attention, "consumes_absorbed_v_up_projection", False
+            )
+            core_attn_out = _apply_absorbed_v_up_projection(
+                core_attn_out,
+                v_up_weight,
+                self.num_attention_heads_per_partition,
+                self.config.kv_lora_rank,
+                self.config.v_head_dim,
+                core_consumed_v_up_projection,
+            )
 
         core_attn_out = _restore_packed_thd_batch_dim(
             core_attn_out, hidden_states, packed_seq_params
