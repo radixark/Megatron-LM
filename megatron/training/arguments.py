@@ -4157,6 +4157,13 @@ def _add_distributed_args(parser):
         help='Bucket size for data-parallel communication',
     )
     group.add_argument(
+        '--non-tensor-parallel-grad-bucket-size',
+        type=int,
+        default=None,
+        help='Maximum number of gradient elements per all-reduce of the sequence-parallel and '
+        'TP-averaged gradients after backward. By default they are flattened into one buffer.',
+    )
+    group.add_argument(
         '--ddp-pad-buckets-for-high-nccl-busbw',
         action='store_true',
         default=False,
