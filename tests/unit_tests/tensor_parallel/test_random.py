@@ -6,6 +6,7 @@ import torch
 from megatron.core.tensor_parallel.random import (
     CheckpointFunction,
     CheckpointWithoutOutput,
+    CheckpointWithoutOutputFunction,
     CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
@@ -252,6 +253,20 @@ def test_nested_checkpoint_keeps_checkpointing_inside_the_outer_forward(monkeypa
     # forward and recompute have to take the same path.
     assert applied == ["outer", "inner", "inner"]
     assert torch.equal(x.grad, torch.full((4,), 3.0, device="cuda"))
+
+
+def test_checkpoint_without_output_without_grad_runs_function_directly(monkeypatch):
+    def fail(*args):
+        raise AssertionError("no_grad forward must not enter CheckpointWithoutOutputFunction")
+
+    monkeypatch.setattr(CheckpointWithoutOutputFunction, "apply", fail)
+    x = torch.ones(4, device="cuda")
+    ckpt = CheckpointWithoutOutput(fp8=True)
+    with torch.no_grad():
+        y = ckpt.checkpoint(lambda t: t * 2, x)
+        z = y + 1
+        ckpt.discard_output_and_register_recompute(z)
+    assert torch.equal(z, torch.full((4,), 3.0, device="cuda"))
 
 
 def test_te_checkpoint_without_grad_runs_function_directly(monkeypatch):

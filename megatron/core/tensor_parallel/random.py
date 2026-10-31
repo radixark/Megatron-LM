@@ -1074,7 +1074,11 @@ class CheckpointWithoutOutput(object):
         # per tracked state per checkpoint.
         self.rng_states = _get_all_rng_states()
 
-        outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
+        if no_backward_follows():
+            # nothing will recompute; the fp8 recompute context would buffer meta nothing pops
+            outputs = run_function(*args)
+        else:
+            outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
