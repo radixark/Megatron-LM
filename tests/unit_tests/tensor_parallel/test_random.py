@@ -283,6 +283,33 @@ def test_te_checkpoint_without_grad_runs_function_directly(monkeypatch):
     assert torch.equal(y, torch.full((4,), 2.0, device="cuda"))
 
 
+def test_checkpoint_nested_in_te_checkpoint_keeps_checkpointing(monkeypatch):
+    pytest.importorskip("transformer_engine.pytorch.distributed")
+    from megatron.core.extensions.transformer_engine import te_checkpoint
+
+    applied = []
+    apply = CheckpointFunction.apply
+
+    def counting_apply(function, *args):
+        applied.append(function.__name__)
+        return apply(function, *args)
+
+    monkeypatch.setattr(CheckpointFunction, "apply", counting_apply)
+
+    def inner(x):
+        return x * 3
+
+    def outer(x):
+        return checkpoint(inner, False, x) + 1
+
+    x = torch.ones(4, device="cuda", requires_grad=True)
+    te_checkpoint(outer, False, get_cuda_rng_tracker, None, x).sum().backward()
+
+    # TE runs outer's forward under no_grad; the inner checkpoint must still checkpoint there
+    assert applied == ["inner", "inner"]
+    assert torch.equal(x.grad, torch.full((4,), 3.0, device="cuda"))
+
+
 def test_checkpoint_without_output():
     def normal_forward(input):
         x = torch.nn.functional.gelu(input)
