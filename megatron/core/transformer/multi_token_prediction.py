@@ -1820,7 +1820,8 @@ def process_mtp_loss(
             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
 
-        if is_training:
+        # a train-mode forward under no_grad (e.g. scoring log probs) has no step to log for
+        if is_training and torch.is_grad_enabled():
             correct = None
             total = None
             if mtp_logits is not None and MTPLossLoggingHelper.should_collect_acceptance():

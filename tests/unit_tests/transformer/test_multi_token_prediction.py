@@ -710,6 +710,41 @@ class TestMultiTokenPrediction:
             assert f"mtp.layers.{i}.hnorm.weight" in sharded_state_dict.keys()
             assert f"mtp.layers.{i}.eh_proj.weight" in sharded_state_dict.keys()
 
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    def test_no_grad_train_mode_forward_logs_no_mtp_loss(self):
+        """A train-mode forward under no_grad (log-prob scoring) logs no MTP loss."""
+        args = self.create_test_args(
+            1, 1, self.seq_length, self.micro_batch_size, full_recompute=True
+        )
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        tokens, labels, loss_mask, attention_mask, position_ids = self.get_batch(
+            self.seq_length, self.micro_batch_size
+        ).values()
+        model_parallel_cuda_manual_seed(_SEED)
+        model_cfg = gpt_config_from_args(args)
+        gpt_model = model_cfg.get_builder_cls()(model_cfg).build_distributed_models(
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(), wrap_with_ddp=False
+        )
+        gpt_model[0].train()
+        inputs = dict(
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
+        with torch.no_grad():
+            gpt_model[0].forward(**inputs)
+        assert MTPLossLoggingHelper.tracker == {}
+
+        gpt_model[0].forward(**inputs)
+        assert MTPLossLoggingHelper.tracker
+
     @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),

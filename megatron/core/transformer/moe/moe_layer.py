@@ -576,9 +576,14 @@ class MoELayer(BaseMoELayer):
         global balanced count when the map is replicated on every rank.
 
         Recording is skipped when not in training mode (e.g. Megatron validation uses
-        model.eval()) so eval forwards do not pollute train-only overload stats.
+        model.eval()) or when grad is off (a no_grad train-mode forward, or a checkpointed
+        forward whose recompute records instead), so record_fwd always pairs with record_bwd.
         """
-        if not self.config.log_moe_overload_factor or not self.training:
+        if (
+            not self.config.log_moe_overload_factor
+            or not self.training
+            or not torch.is_grad_enabled()
+        ):
             return dispatched_input
         num_local_tokens = getattr(self, "_overload_log_num_local_tokens", None)
         if num_local_tokens is None:

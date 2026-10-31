@@ -627,6 +627,27 @@ def is_checkpointing():
     return IS_CHECKPOINTING
 
 
+# Checkpointed forwards on the stack; each runs under its own no_grad, which does not mean
+# that no backward follows.
+_CHECKPOINT_FORWARD_DEPTH = 0
+
+
+@contextlib.contextmanager
+def checkpoint_forward_region():
+    """Mark the original (not recompute) forward of a checkpointed region."""
+    global _CHECKPOINT_FORWARD_DEPTH
+    _CHECKPOINT_FORWARD_DEPTH += 1
+    try:
+        yield
+    finally:
+        _CHECKPOINT_FORWARD_DEPTH -= 1
+
+
+def no_backward_follows():
+    """True when grad is off outside any checkpointed forward, so nothing will recompute."""
+    return not torch.is_grad_enabled() and _CHECKPOINT_FORWARD_DEPTH == 0
+
+
 _R = TypeVar('_R')
 _Ts = TypeVarTuple('_Ts')
 
@@ -656,7 +677,7 @@ class CheckpointFunction(torch.autograd.Function):
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
 
-        with torch.no_grad():
+        with torch.no_grad(), checkpoint_forward_region():
             outputs = run_function(*args)
 
         # Divide hidden states across model parallel group and only keep
@@ -726,6 +747,8 @@ def checkpoint(
     # CheckpointWithoutOutput. The graph captures all ops directly; recomputation cannot
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
+        return function(*args)
+    if no_backward_follows():
         return function(*args)
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
@@ -811,7 +834,7 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
             ctx.fp8_recipe = None
             fwd_ctx = contextlib.nullcontext()
 
-        with torch.no_grad(), fwd_ctx:
+        with torch.no_grad(), fwd_ctx, checkpoint_forward_region():
             outputs = run_function(*args)
 
         # Save tensor and non-tensor arguments into ctx for recomputation
@@ -1040,17 +1063,21 @@ class CheckpointWithoutOutput(object):
         if is_graph_warmup():
             return run_function(*args)
 
-        self.run_function = run_function
+        if no_backward_follows():
+            # nothing will recompute; the fp8 recompute context would buffer meta nothing pops
+            outputs = run_function(*args)
+        else:
+            self.run_function = run_function
 
-        # Snapshot is per checkpoint, not per recompute group, and has to stay
-        # that way: each checkpoint's recompute must rewind to the offsets its
-        # own forward saw. Sharing one group-level snapshot would rewind every
-        # member to the first checkpoint's state, so any RNG the group consumed
-        # in between would replay the wrong draw. The cost is one clone_state()
-        # per tracked state per checkpoint.
-        self.rng_states = _get_all_rng_states()
+            # Snapshot is per checkpoint, not per recompute group, and has to stay
+            # that way: each checkpoint's recompute must rewind to the offsets its
+            # own forward saw. Sharing one group-level snapshot would rewind every
+            # member to the first checkpoint's state, so any RNG the group consumed
+            # in between would replay the wrong draw. The cost is one clone_state()
+            # per tracked state per checkpoint.
+            self.rng_states = _get_all_rng_states()
 
-        outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
+            outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)

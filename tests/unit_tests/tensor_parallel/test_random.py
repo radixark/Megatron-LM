@@ -4,11 +4,14 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
+    CheckpointFunction,
     CheckpointWithoutOutput,
+    CheckpointWithoutOutputFunction,
     CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
     get_cuda_rng_tracker,
+    is_checkpointing,
     model_parallel_cuda_manual_seed,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -208,6 +211,103 @@ def test_checkpoint():
     assert torch.equal(input1.grad, torch.ones((4, 4)).cuda())
 
     Utils.destroy_model_parallel()
+
+
+def test_checkpoint_without_grad_runs_function_directly():
+    seen = []
+
+    def forward(x):
+        seen.append(is_checkpointing())
+        return x * 2
+
+    x = torch.ones(4, device="cuda", requires_grad=True)
+    with torch.no_grad():
+        assert torch.equal(checkpoint(forward, False, x), torch.full((4,), 2.0, device="cuda"))
+    checkpoint(forward, False, x).sum().backward()
+
+    # no_grad: one plain call; with grad: the checkpointed pass and its backward recompute
+    assert seen == [False, True, True]
+    assert torch.equal(x.grad, torch.full((4,), 2.0, device="cuda"))
+
+
+def test_nested_checkpoint_keeps_checkpointing_inside_the_outer_forward(monkeypatch):
+    applied = []
+    apply = CheckpointFunction.apply
+
+    def counting_apply(function, *args):
+        applied.append(function.__name__)
+        return apply(function, *args)
+
+    monkeypatch.setattr(CheckpointFunction, "apply", counting_apply)
+
+    def inner(x):
+        return x * 3
+
+    def outer(x):
+        return checkpoint(inner, False, x) + 1
+
+    x = torch.ones(4, device="cuda", requires_grad=True)
+    checkpoint(outer, False, x).sum().backward()
+
+    # The outer forward's own no_grad must not turn the inner checkpoint into a plain call:
+    # forward and recompute have to take the same path.
+    assert applied == ["outer", "inner", "inner"]
+    assert torch.equal(x.grad, torch.full((4,), 3.0, device="cuda"))
+
+
+def test_checkpoint_without_output_without_grad_runs_function_directly(monkeypatch):
+    def fail(*args):
+        raise AssertionError("no_grad forward must not enter CheckpointWithoutOutputFunction")
+
+    monkeypatch.setattr(CheckpointWithoutOutputFunction, "apply", fail)
+    x = torch.ones(4, device="cuda")
+    ckpt = CheckpointWithoutOutput(fp8=True)
+    with torch.no_grad():
+        y = ckpt.checkpoint(lambda t: t * 2, x)
+        z = y + 1
+        ckpt.discard_output_and_register_recompute(z)
+    assert torch.equal(z, torch.full((4,), 3.0, device="cuda"))
+
+
+def test_te_checkpoint_without_grad_runs_function_directly(monkeypatch):
+    te_distributed = pytest.importorskip("transformer_engine.pytorch.distributed")
+    from megatron.core.extensions.transformer_engine import te_checkpoint
+
+    def fail(*args, **kwargs):
+        raise AssertionError("no_grad forward must not enter TE checkpoint")
+
+    monkeypatch.setattr(te_distributed, "checkpoint", fail)
+    x = torch.ones(4, device="cuda")
+    with torch.no_grad():
+        y = te_checkpoint(lambda t: t * 2, False, get_cuda_rng_tracker, None, x)
+    assert torch.equal(y, torch.full((4,), 2.0, device="cuda"))
+
+
+def test_checkpoint_nested_in_te_checkpoint_keeps_checkpointing(monkeypatch):
+    pytest.importorskip("transformer_engine.pytorch.distributed")
+    from megatron.core.extensions.transformer_engine import te_checkpoint
+
+    applied = []
+    apply = CheckpointFunction.apply
+
+    def counting_apply(function, *args):
+        applied.append(function.__name__)
+        return apply(function, *args)
+
+    monkeypatch.setattr(CheckpointFunction, "apply", counting_apply)
+
+    def inner(x):
+        return x * 3
+
+    def outer(x):
+        return checkpoint(inner, False, x) + 1
+
+    x = torch.ones(4, device="cuda", requires_grad=True)
+    te_checkpoint(outer, False, get_cuda_rng_tracker, None, x).sum().backward()
+
+    # TE runs outer's forward under no_grad; the inner checkpoint must still checkpoint there
+    assert applied == ["inner", "inner"]
+    assert torch.equal(x.grad, torch.full((4,), 3.0, device="cuda"))
 
 
 def test_checkpoint_without_output():
