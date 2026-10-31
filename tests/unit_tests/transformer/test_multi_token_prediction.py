@@ -731,15 +731,19 @@ class TestMultiTokenPrediction:
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(), wrap_with_ddp=False
         )
         gpt_model[0].train()
+        inputs = dict(
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
         with torch.no_grad():
-            gpt_model[0].forward(
-                input_ids=tokens,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                loss_mask=loss_mask,
-            )
+            gpt_model[0].forward(**inputs)
         assert MTPLossLoggingHelper.tracker == {}
+
+        gpt_model[0].forward(**inputs)
+        assert MTPLossLoggingHelper.tracker
 
     @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
