@@ -3213,6 +3213,10 @@ def te_checkpoint(
 
     from transformer_engine.pytorch.distributed import checkpoint
 
+    # Without grad no backward recomputes, so checkpointing would only leave recompute state behind.
+    if not torch.is_grad_enabled():
+        return forward_func(*args, **kwargs)
+
     if is_te_min_version("1.5.0"):
         return checkpoint(
             forward_func,

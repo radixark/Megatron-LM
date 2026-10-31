@@ -727,6 +727,9 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
+    # Without grad no backward recomputes, so checkpointing would only leave recompute state behind.
+    if not torch.is_grad_enabled():
+        return function(*args)
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
 
