@@ -3213,7 +3213,6 @@ def te_checkpoint(
             "Please install it with `pip install transformer-engine`."
         )
 
-    # Nothing will recompute, so checkpointing would only leave recompute state behind.
     if no_backward_follows():
         return forward_func(*args, **kwargs)
 

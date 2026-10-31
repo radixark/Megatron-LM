@@ -748,7 +748,6 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
-    # Nothing will recompute, so checkpointing would only leave recompute state behind.
     if no_backward_follows():
         return function(*args)
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
