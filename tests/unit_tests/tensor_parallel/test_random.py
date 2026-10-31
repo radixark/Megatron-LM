@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
+    CheckpointFunction,
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
     checkpoint,
@@ -226,6 +227,45 @@ def test_checkpoint_without_grad_runs_function_directly():
     # no_grad: one plain call; with grad: the checkpointed pass and its backward recompute
     assert seen == [False, True, True]
     assert torch.equal(x.grad, torch.full((4,), 2.0, device="cuda"))
+
+
+def test_nested_checkpoint_keeps_checkpointing_inside_the_outer_forward(monkeypatch):
+    applied = []
+    apply = CheckpointFunction.apply
+
+    def counting_apply(function, *args):
+        applied.append(function.__name__)
+        return apply(function, *args)
+
+    monkeypatch.setattr(CheckpointFunction, "apply", counting_apply)
+
+    def inner(x):
+        return x * 3
+
+    def outer(x):
+        return checkpoint(inner, False, x) + 1
+
+    x = torch.ones(4, device="cuda", requires_grad=True)
+    checkpoint(outer, False, x).sum().backward()
+
+    # The outer forward's own no_grad must not turn the inner checkpoint into a plain call:
+    # forward and recompute have to take the same path.
+    assert applied == ["outer", "inner", "inner"]
+    assert torch.equal(x.grad, torch.full((4,), 3.0, device="cuda"))
+
+
+def test_te_checkpoint_without_grad_runs_function_directly(monkeypatch):
+    te_distributed = pytest.importorskip("transformer_engine.pytorch.distributed")
+    from megatron.core.extensions.transformer_engine import te_checkpoint
+
+    def fail(*args, **kwargs):
+        raise AssertionError("no_grad forward must not enter TE checkpoint")
+
+    monkeypatch.setattr(te_distributed, "checkpoint", fail)
+    x = torch.ones(4, device="cuda")
+    with torch.no_grad():
+        y = te_checkpoint(lambda t: t * 2, False, get_cuda_rng_tracker, None, x)
+    assert torch.equal(y, torch.full((4,), 2.0, device="cuda"))
 
 
 def test_checkpoint_without_output():

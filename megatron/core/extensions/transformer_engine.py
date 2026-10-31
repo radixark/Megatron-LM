@@ -45,9 +45,11 @@ from megatron.core.tensor_parallel.layers import (
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import (
+    checkpoint_forward_region,
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
+    no_backward_follows,
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
@@ -3211,22 +3213,22 @@ def te_checkpoint(
             "Please install it with `pip install transformer-engine`."
         )
 
-    from transformer_engine.pytorch.distributed import checkpoint
-
-    # Without grad no backward recomputes, so checkpointing would only leave recompute state behind.
-    if not torch.is_grad_enabled():
+    # Nothing will recompute, so checkpointing would only leave recompute state behind.
+    if no_backward_follows():
         return forward_func(*args, **kwargs)
 
-    if is_te_min_version("1.5.0"):
-        return checkpoint(
-            forward_func,
-            *args,
-            distribute_saved_activations=distribute_saved_activations,
-            get_rng_state_tracker=get_rng_state_tracker,
-            tp_group=tp_group,
-            **kwargs,
-        )
-    else:
+    from transformer_engine.pytorch.distributed import checkpoint
+
+    with checkpoint_forward_region():
+        if is_te_min_version("1.5.0"):
+            return checkpoint(
+                forward_func,
+                *args,
+                distribute_saved_activations=distribute_saved_activations,
+                get_rng_state_tracker=get_rng_state_tracker,
+                tp_group=tp_group,
+                **kwargs,
+            )
         return checkpoint(
             forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args
         )
