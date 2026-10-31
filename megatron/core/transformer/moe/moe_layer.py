@@ -15,7 +15,6 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import split_along_nth_dim
-from megatron.core.tensor_parallel.random import no_backward_follows
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -577,10 +576,14 @@ class MoELayer(BaseMoELayer):
         global balanced count when the map is replicated on every rank.
 
         Recording is skipped when not in training mode (e.g. Megatron validation uses
-        model.eval()) or when no backward follows (a no_grad train-mode forward), so such
-        forwards do not pollute train-only overload stats.
+        model.eval()) or when grad is off (a no_grad train-mode forward, or a checkpointed
+        forward whose recompute records instead), so record_fwd always pairs with record_bwd.
         """
-        if not self.config.log_moe_overload_factor or not self.training or no_backward_follows():
+        if (
+            not self.config.log_moe_overload_factor
+            or not self.training
+            or not torch.is_grad_enabled()
+        ):
             return dispatched_input
         num_local_tokens = getattr(self, "_overload_log_num_local_tokens", None)
         if num_local_tokens is None:
@@ -754,11 +757,7 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    if (
-                        self.config.log_moe_overload_factor
-                        and self.training
-                        and not no_backward_follows()
-                    ):
+                    if self.config.log_moe_overload_factor and self.training:
                         self._overload_log_num_local_tokens = (
                             self._num_token_rows_from_moe_hidden_states(hidden_states)
                         )
