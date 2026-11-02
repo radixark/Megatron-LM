@@ -1178,6 +1178,37 @@ class TestMultiTokenPrediction:
         assert "loss_sums" in MTPLossLoggingHelper.tracker
         assert "acceptance_counts" not in MTPLossLoggingHelper.tracker
 
+    def test_process_mtp_loss_does_not_track_under_no_grad(self):
+        """A train-mode forward under no_grad (e.g. RL log probs) records no MTP loss."""
+        config = TransformerConfig(
+            hidden_size=8, num_layers=2, num_attention_heads=2, mtp_num_layers=1
+        )
+        hidden_states = torch.ones(2, 1, 5)
+        input_ids = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.long)
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return hidden.clone(), None
+
+        with torch.no_grad():
+            process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=None,
+                loss_mask=None,
+                output_layer=output_layer,
+                output_weight=None,
+                runtime_gather_output=None,
+                is_training=True,
+                compute_language_model_loss=lambda labels, logits: torch.ones_like(
+                    labels, dtype=torch.float32
+                ),
+                config=config,
+                cp_group=None,
+                packed_seq_params=None,
+                input_ids=input_ids,
+            )
+
+        assert "loss_sums" not in MTPLossLoggingHelper.tracker
+
     def test_process_mtp_loss_derives_labels_from_input_ids(self):
         """When labels is None (RL), labels are derived from input_ids by rolling left.
 
