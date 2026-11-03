@@ -9,6 +9,7 @@ from megatron.core.tensor_parallel.random import (
     checkpoint,
     convert_cuda_rng_state,
     get_cuda_rng_tracker,
+    is_checkpointing,
     model_parallel_cuda_manual_seed,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -208,6 +209,24 @@ def test_checkpoint():
     assert torch.equal(input1.grad, torch.ones((4, 4)).cuda())
 
     Utils.destroy_model_parallel()
+
+
+def test_checkpoint_no_grad_does_not_checkpoint():
+    seen = []
+
+    def test_forward(x):
+        seen.append(is_checkpointing())
+        return x * 2
+
+    x = torch.ones(4, device="cuda", requires_grad=True)
+    with torch.no_grad():
+        output = checkpoint(test_forward, False, x)
+    assert seen == [False]
+    assert torch.equal(output, torch.ones(4, device="cuda") * 2)
+
+    checkpoint(test_forward, False, x).sum().backward()
+    # forward, then the recompute in backward
+    assert seen == [False, True, True]
 
 
 def test_checkpoint_without_output():
