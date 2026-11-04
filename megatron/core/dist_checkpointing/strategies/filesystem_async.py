@@ -417,10 +417,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                     )
 
                 for write_item, tensor in tensor_data:
-                    assert tensor.is_cpu
                     local_results.append(
                         _write_item(
-                            *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
+                            *transform_list,
+                            stream,
+                            tensor.cpu(),
+                            write_item,
+                            storage_key,
+                            **extra_kwargs,
                         )
                     )
 
