@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint import CheckpointException
+from torch.distributed.checkpoint.api import _wrap_exception
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.planner import SavePlan, SavePlanner
@@ -238,11 +239,14 @@ def save_state_dict_async_finalize(
     if dist_wrapper.is_coordinator:
         node_failures = _get_failure_dict(all_results)
         if len(node_failures) == 0:
-            assert global_metadata is not None
-            write_start = time()
-            storage_writer.finish(global_metadata, all_results)
-            write_end = time()
-            logger.debug(f"{write_end}, metadata_write: {write_end - write_start}")
+            try:
+                assert global_metadata is not None
+                write_start = time()
+                storage_writer.finish(global_metadata, all_results)
+                write_end = time()
+                logger.debug(f"{write_end}, metadata_write: {write_end - write_start}")
+            except Exception as error:
+                node_failures = {dist_wrapper.coordinator_rank: _wrap_exception(error)}
     else:
         node_failures = {}
 
