@@ -1046,6 +1046,13 @@ class TransformerConfig(ModelParallelConfig):
     parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``
     and ``add_bias_linear=True``."""
 
+    moe_expert_fake_quant: Optional[str] = None
+    """Fake-quantize the grouped MoE expert weights for quantization-aware training. "mxfp4" rounds
+    the TE GroupedLinear expert weights in place onto the MXFP4 grid (E2M1 values in 1x32 blocks with
+    E8M0 scales) on the first microbatch of each forward-backward pass, through the Miles adapter
+    ``miles.utils.mxfp4_fake_qat``; the optimizer's fp32 master weights are not rounded. None disables
+    it."""
+
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
@@ -2252,6 +2259,11 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_ffn_hidden_size is set but num_moe_experts is None. "
                     "Please set num_moe_experts or remove moe_ffn_hidden_size."
                 )
+
+        if self.moe_expert_fake_quant not in (None, "mxfp4"):
+            raise ValueError(
+                f"moe_expert_fake_quant must be None or 'mxfp4', got {self.moe_expert_fake_quant!r}."
+            )
 
         if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
             if not self.moe_grouped_gemm:

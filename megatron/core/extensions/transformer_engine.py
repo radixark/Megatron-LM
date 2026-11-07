@@ -2357,6 +2357,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         def _get_weight_tensors(self):
             """Get the weight tensors of the module."""
             weight_tensors = super()._get_weight_tensors()
+            if self.config.moe_expert_fake_quant == "mxfp4":
+                from miles.utils.mxfp4_fake_qat import fake_quantize_mxfp4_weight_tensors
+
+                weight_tensors = fake_quantize_mxfp4_weight_tensors(self, weight_tensors)
             if os.getenv("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "0") == "1":
                 from miles.utils.nvfp4_fake_qat import maybe_fake_quantize_nvfp4_weight_tensors
 
