@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
+import os
 from collections import defaultdict
 from typing import Dict
 
@@ -117,6 +118,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def _register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
+                if os.getenv("OPEN_TRAINING_BF16_STOCHASTIC_ROUNDING_FLAG", "0") == "1":
+                    from miles.utils.bf16_stochastic_rounding import stochastic_round_copy_back
+
+                    return stochastic_round_copy_back(self, optimizer)
                 self._h2d_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
@@ -128,6 +133,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         def fp32_param_copy_back_gpu_hook_closure():
             def fp32_param_copy_back_gpu_hook(optimizer, args, kwargs):
+                if os.getenv("OPEN_TRAINING_BF16_STOCHASTIC_ROUNDING_FLAG", "0") == "1":
+                    from miles.utils.bf16_stochastic_rounding import stochastic_round_copy_back
+
+                    return stochastic_round_copy_back(self, optimizer)
                 for group in self.param_groups:
                     for param in group["params"]:
                         if param in self.gpu_params_map_cpu_copy:
