@@ -67,6 +67,11 @@ class DistributedDataParallelConfig:
        `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`
        will be determined at runtime."""
 
+    non_tensor_parallel_grad_bucket_size: Optional[int] = None
+    """Maximum number of gradient elements per all-reduce of the gradients that are reduced
+       across tensor-parallel ranks after backward (sequence-parallel or TP-averaged parameters).
+       If unspecified, they are all flattened into one buffer."""
+
     pad_buckets_for_high_nccl_busbw: bool = False
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
        ensure NCCL collectives have high bus bandwidth at large DP counts, since NCCL

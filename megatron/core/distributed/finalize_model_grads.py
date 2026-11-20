@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from functools import partial
+from functools import partial, reduce
 from typing import Callable, Dict, List, Optional, Union
 
 import torch
@@ -373,6 +373,37 @@ def _update_router_expert_bias(
         expert_bias.copy_(updated_expert_bias)
 
 
+def _allreduce_dense_grad_buckets(grads, op, group, bucket_size=None):
+    """All-reduce ``grads`` in place, at most ``bucket_size`` elements per collective.
+
+    ``None`` reduces every gradient in one coalesced buffer. Every bucket reduces in the dtype
+    that one flatten of all ``grads`` would promote to, so bucket boundaries do not change the
+    reduction precision of mixed-dtype gradients; a promoted bucket briefly keeps its unpromoted
+    flatten as well.
+    """
+    if not grads:
+        return
+    dtype = reduce(torch.promote_types, (grad.dtype for grad in grads))
+    bucket = []
+    size = 0
+
+    def reduce_bucket():
+        coalesced = _flatten_dense_tensors(bucket).to(dtype)
+        torch.distributed.all_reduce(coalesced, op=op, group=group)
+        for buf, synced in zip(bucket, _unflatten_dense_tensors(coalesced, bucket)):
+            buf.copy_(synced)
+
+    for grad in grads:
+        if bucket and bucket_size is not None and size + grad.numel() > bucket_size:
+            reduce_bucket()
+            bucket = []
+            size = 0
+        bucket.append(grad)
+        size += grad.numel()
+    if bucket:
+        reduce_bucket()
+
+
 def _allreduce_non_tensor_model_parallel_grads(
     model: List[torch.nn.Module],
     config: TransformerConfig,
@@ -442,12 +473,10 @@ def _allreduce_non_tensor_model_parallel_grads(
         [torch.distributed.ReduceOp.SUM, torch.distributed.ReduceOp.AVG],
     ):
         if grads:
-            coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)
-            for param, buf, synced in zip(
-                params, grads, _unflatten_dense_tensors(coalesced, grads)
-            ):
-                buf.copy_(synced)
+            _allreduce_dense_grad_buckets(
+                grads, all_reduce_op, tp_group, ddp_config.non_tensor_parallel_grad_bucket_size
+            )
+            for param, buf in zip(params, grads):
                 grad_attr = _get_main_grad_attr(param)
                 orig_grad = getattr(param, grad_attr)
                 if ddp_config.use_megatron_fsdp:

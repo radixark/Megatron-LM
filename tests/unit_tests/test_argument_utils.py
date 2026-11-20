@@ -922,6 +922,19 @@ class TestDDPConfigMapping:
         assert config.disable_grad_buffers_cpu_backup is True
         assert config.disable_param_buffers_cpu_backup is True
 
+    def test_non_tensor_parallel_grad_bucket_size_cli_flag_maps_to_ddp_config(self):
+        from megatron.training.arguments import _add_distributed_args
+        from megatron.training.training import get_megatron_ddp_config
+
+        parser = _add_distributed_args(ArgumentParser())
+        default = get_megatron_ddp_config(_make_ddp_args(**vars(parser.parse_args([]))))
+        parsed_args = parser.parse_args(["--non-tensor-parallel-grad-bucket-size", "4194304"])
+
+        config = get_megatron_ddp_config(_make_ddp_args(**vars(parsed_args)))
+
+        assert default.non_tensor_parallel_grad_bucket_size is None
+        assert config.non_tensor_parallel_grad_bucket_size == 4194304
+
 
 class TestCheckpointConfigMapping:
     """Test the boolean inversions and custom dest mappings for CheckpointConfig."""
