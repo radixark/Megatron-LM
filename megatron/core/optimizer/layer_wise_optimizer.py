@@ -990,6 +990,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for p in params:
                     torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
 
+    def get_grads_for_grad_norm(self, grad_norm_group=None):
+        return [
+            grad
+            for optimizer in self.chained_optimizers
+            for grad in optimizer.get_grads_for_grad_norm(grad_norm_group)
+        ]
+
     @torch.no_grad()
     def get_grad_norm(self):
         # similar to dist opt, always aggregate globally
