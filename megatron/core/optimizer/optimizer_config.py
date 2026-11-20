@@ -369,6 +369,9 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    chunked_muon_master_weights: bool = False
+    """Stage BF16 Muon masters per chunk; excludes optimizer checkpoint I/O."""
+
     chunked_optimizer_state_offload: bool = False
     """Keep selected optimizer tensor states and master weights on CPU between updates."""
 
