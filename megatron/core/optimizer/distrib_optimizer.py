@@ -5,6 +5,7 @@
 import gc
 import itertools
 import logging
+import os
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -2962,6 +2963,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if self._is_distopt_quantized_param(model_param) or is_nvfp4tensor(model_param):
                         # Quantized params are handled above.
                         continue
+                    elif os.getenv("OPEN_TRAINING_BF16_STOCHASTIC_ROUNDING_FLAG", "0") == "1":
+                        from miles.utils.bf16_stochastic_rounding import stochastic_round_main_param
+
+                        stochastic_round_main_param(self, shard_main_param, shard_model_param)
                     else:
                         shard_model_param.data.copy_(shard_main_param)
 
