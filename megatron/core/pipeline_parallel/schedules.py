@@ -1283,6 +1283,9 @@ def forward_backward_pipelining_with_interleaving(
         # Note: This is a simplified approach - proper VPP support may need more complex logic
         hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
+    if config.pipeline_hidden_size is not None:
+        hidden_dim = config.pipeline_hidden_size
+
     tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
@@ -2271,6 +2274,9 @@ def get_tensor_shapes(
 
         if use_nstream:
             hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
+
+    if config.pipeline_hidden_size is not None:
+        hidden_size = config.pipeline_hidden_size
 
     tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes

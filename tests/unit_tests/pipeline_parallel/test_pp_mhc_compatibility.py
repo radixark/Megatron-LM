@@ -269,6 +269,48 @@ class TestGetTensorShapesWithMHC:
         assert shapes == [(self.SEQ // 2, self.MBS, self.H * self.N_STREAMS)]
 
 
+class TestGetTensorShapesWithPipelineHiddenSize:
+    """An explicit pipeline_hidden_size sets the P2P width on every stage, overriding mHC."""
+
+    SEQ, MBS, H = 32, 2, 64
+
+    def _shapes(self, config, pp_rank, pp_size, is_recv):
+        tp, cp = _make_tp_cp_groups()
+        return get_tensor_shapes(
+            seq_length=self.SEQ,
+            micro_batch_size=self.MBS,
+            decoder_seq_length=None,
+            config=config,
+            tp_group=tp,
+            cp_group=cp,
+            pp_group=_make_pp_group(pp_rank, pp_size),
+            is_recv=is_recv,
+        )
+
+    def test_explicit_width_on_all_stages(self):
+        cfg = _make_config(hidden_size=self.H, pp_size=2, pipeline_hidden_size=2 * self.H)
+        for rank in range(2):
+            for is_recv in (True, False):
+                assert self._shapes(cfg, rank, 2, is_recv) == [(self.SEQ, self.MBS, 2 * self.H)]
+
+    def test_explicit_width_overrides_mhc(self):
+        cfg = _make_config(
+            hidden_size=self.H,
+            pp_size=4,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            pipeline_hidden_size=3 * self.H,
+        )
+        for rank in range(4):
+            for is_recv in (True, False):
+                assert self._shapes(cfg, rank, 4, is_recv) == [(self.SEQ, self.MBS, 3 * self.H)]
+
+    @pytest.mark.parametrize("width", [0, -1])
+    def test_non_positive_width_rejected(self, width):
+        with pytest.raises(ValueError, match="pipeline_hidden_size"):
+            _make_config(hidden_size=self.H, pp_size=2, pipeline_hidden_size=width)
+
+
 # ===========================================================================
 # 2. get_num_layers_to_build — mHC + standalone embedding/loss
 # ===========================================================================
