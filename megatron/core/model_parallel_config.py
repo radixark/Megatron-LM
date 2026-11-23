@@ -46,6 +46,13 @@ class ModelParallelConfig:
     pipeline_model_parallel_size: int = 1
     """Inter-layer model parallelism. Splits transformer layers across GPU ranks."""
 
+    pipeline_hidden_size: Optional[int] = None
+    """Explicit last dimension of fixed-shape pipeline activations.
+
+    Overrides the model/mHC width for specs that transport packed activation state.
+    The producer and consumer must implement the same encoding.
+    """
+
     virtual_pipeline_model_parallel_size: Optional[int] = None
     """Interleaved pipeline parallelism is used to improve performance by reducing the pipeline
        bubble.  Considers a transformer block as a list of smaller transformer (virtual) blocks.
@@ -494,6 +501,8 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.pipeline_hidden_size is not None and self.pipeline_hidden_size <= 0:
+            raise ValueError("pipeline_hidden_size must be positive when specified")
         if self.hybrid_context_parallel:
             warnings.warn(
                 "hybrid_context_parallel is deprecated and will be removed in a future release. "

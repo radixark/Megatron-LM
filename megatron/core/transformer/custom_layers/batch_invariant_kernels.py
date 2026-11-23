@@ -175,8 +175,55 @@ def get_compute_units():
     return NUM_SMS
 
 
+_batch_invariant_bmm_backend = None
+_batch_invariant_matmul_backend = None
+_batch_invariant_log_softmax_backend = None
+
+
+def configure_batch_invariant_log_softmax(backend):
+    """Bind a shared normalization program before enabling the ATen override."""
+    global _batch_invariant_log_softmax_backend
+    if not callable(backend):
+        raise TypeError("batch-invariant log-softmax backend must be callable")
+    if is_batch_invariant_mode_enabled() and backend is not _batch_invariant_log_softmax_backend:
+        raise RuntimeError("configure BI log-softmax before enabling batch-invariant mode")
+    _batch_invariant_log_softmax_backend = backend
+
+
+def configure_batch_invariant_matmul(backend):
+    """Bind the forward GEMM that the ATen/TE batch-invariant overrides call, before enabling them.
+
+    The override also covers ATen GEMMs reached in backward.
+    """
+    global _batch_invariant_matmul_backend
+    if not callable(backend):
+        raise TypeError("batch-invariant matmul backend must be callable")
+    if is_batch_invariant_mode_enabled() and backend is not _batch_invariant_matmul_backend:
+        raise RuntimeError("configure BI matmul before enabling batch-invariant mode")
+    _batch_invariant_matmul_backend = backend
+
+
+def configure_batch_invariant_bmm(backend):
+    """Optionally bind serving-owned batched GEMM before enabling BI overrides."""
+    global _batch_invariant_bmm_backend
+    if not callable(backend):
+        raise TypeError("batch-invariant bmm backend must be callable")
+    if is_batch_invariant_mode_enabled() and backend is not _batch_invariant_bmm_backend:
+        raise RuntimeError("configure BI bmm before enabling batch-invariant mode")
+    _batch_invariant_bmm_backend = backend
+
+
+def bmm_batch_invariant(a, b, *, out=None):
+    """Batched GEMM through the caller-provided batch-invariant backend."""
+    if _batch_invariant_bmm_backend is None:
+        raise RuntimeError("No batch-invariant bmm backend configured")
+    return _batch_invariant_bmm_backend(a, b, out=out)
+
+
 def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
     """Persistent matmul kernel used by batch-invariant GEMM."""
+    if _batch_invariant_matmul_backend is not None:
+        return _batch_invariant_matmul_backend(a, b, bias=bias)
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -316,6 +363,8 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Returns:
         Tensor with log_softmax applied along the specified dimension
     """
+    if _batch_invariant_log_softmax_backend is not None:
+        return _batch_invariant_log_softmax_backend(input, dim=dim)
     if dim != -1 and dim != input.ndim - 1:
         raise ValueError("This implementation only supports log_softmax along the last dimension")
     # Flatten all dimensions except the last one
@@ -479,12 +528,12 @@ def mean_dim(
 
 
 def mm_batch_invariant(a, b):
-    """Batch-invariant replacement for `aten::mm` using a persistent matmul kernel."""
+    """Batch-invariant replacement for `aten::mm`."""
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
-    """Batch-invariant replacement for `aten::addmm` using a persistent matmul kernel."""
+    """Batch-invariant replacement for `aten::addmm`."""
     return matmul_persistent(a, b, bias=bias)
 
 
@@ -731,7 +780,10 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         transa = layout[0].upper() == "T"
         transb = layout[1].upper() == "T"
 
-        opA = A.transpose(0, 1).contiguous() if transa else A.contiguous()  # [K, O] or [I, O]
+        if _batch_invariant_matmul_backend is not None:
+            opA = A.transpose(0, 1) if transa else A
+        else:
+            opA = A.transpose(0, 1).contiguous() if transa else A.contiguous()  # [K, O] or [I, O]
         opB = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [..., K]
 
         # Flatten opA to 2D if needed (weight tensors should be 2D, but validate)
@@ -751,7 +803,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             opB_2d = opB
 
         # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O)
-        base_2d = matmul_persistent(opB_2d, opA, bias=None)
+        base_2d = mm_batch_invariant(opB_2d, opA)
 
         # Reshape back to original leading dims with output features at the end
         out = base_2d.reshape(*leading_shape, base_2d.shape[-1])
@@ -972,6 +1024,8 @@ def enable_batch_invariant_mode():
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+    if _batch_invariant_bmm_backend is not None:
+        _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available
