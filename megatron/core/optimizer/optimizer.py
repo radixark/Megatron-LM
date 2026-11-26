@@ -5,6 +5,7 @@
 import copy
 import logging
 import math
+import os
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
@@ -1118,6 +1119,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             copy_back_gathered_bf16_into_fp8_param(
                                 model_param, main_param.detach().to(torch.bfloat16)
                             )
+                    elif os.getenv("OPEN_TRAINING_BF16_STOCHASTIC_ROUNDING_FLAG", "0") == "1":
+                        from miles.utils.bf16_stochastic_rounding import stochastic_round_main_param
+
+                        stochastic_round_main_param(self, main_param, model_param)
                     else:
                         other_model_data.append(model_param.data)
                         other_main_data.append(main_param.data)
