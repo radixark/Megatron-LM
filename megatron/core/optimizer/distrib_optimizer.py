@@ -2941,6 +2941,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             expanded_shard_fp32_from_fp8,
             expanded_shard_offsets_in_fp8,
             self.data_parallel_group,
+            rounding=self.config.fp8_param_rounding,
+            rounding_seed=self.config.fp8_param_rounding_seed,
         )
 
         # Utility method for copying group params.
